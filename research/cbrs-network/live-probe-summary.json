@@ -1,0 +1,126 @@
+{
+  "capturedAt": "2026-05-06T23:58:12.981Z",
+  "profilePath": "[TEMP_PROFILE_COPY]",
+  "loggedIn": false,
+  "routes": [
+    {
+      "route": "/",
+      "status": 200,
+      "error": null,
+      "url": "https://nuevo-portal.conservador.cl/",
+      "title": "Conservador de Bienes Raíces de Santiago | CBRS",
+      "hasAuthStorage": false,
+      "hasRecaptcha": false,
+      "textSignals": {
+        "loginRequired": true,
+        "noLoad": false,
+        "hasIndexText": true
+      }
+    },
+    {
+      "route": "/usuario/mi-cuenta",
+      "status": 200,
+      "error": null,
+      "url": "https://nuevo-portal.conservador.cl/login",
+      "title": "Inicie sesión | CBRS",
+      "hasAuthStorage": false,
+      "hasRecaptcha": false,
+      "textSignals": {
+        "loginRequired": true,
+        "noLoad": false,
+        "hasIndexText": false
+      }
+    },
+    {
+      "route": "/consultas-en-linea/indices/indice-del-registro-de-comercio",
+      "status": 200,
+      "error": null,
+      "url": "https://nuevo-portal.conservador.cl/consultas-en-linea/indices/indice-del-registro-de-comercio",
+      "title": "Índice del Registro de Comercio | CBRS",
+      "hasAuthStorage": false,
+      "hasRecaptcha": false,
+      "textSignals": {
+        "loginRequired": true,
+        "noLoad": false,
+        "hasIndexText": true
+      }
+    },
+    {
+      "route": "/consultas-en-linea/indices/indice-del-registro-de-propiedad",
+      "status": 200,
+      "error": null,
+      "url": "https://nuevo-portal.conservador.cl/consultas-en-linea/indices/indice-del-registro-de-propiedad",
+      "title": "Índice del Registro de Propiedad | CBRS",
+      "hasAuthStorage": false,
+      "hasRecaptcha": false,
+      "textSignals": {
+        "loginRequired": true,
+        "noLoad": false,
+        "hasIndexText": true
+      }
+    },
+    {
+      "route": "/verificacion-de-documentos",
+      "status": 200,
+      "error": null,
+      "url": "https://nuevo-portal.conservador.cl/verificacion-de-documentos",
+      "title": "Página no encontrada | CBRS",
+      "hasAuthStorage": false,
+      "hasRecaptcha": false,
+      "textSignals": {
+        "loginRequired": true,
+        "noLoad": false,
+        "hasIndexText": true
+      }
+    },
+    {
+      "route": "/verificacion_documentos",
+      "status": 200,
+      "error": null,
+      "url": "https://nuevo-portal.conservador.cl/verificacion_documentos",
+      "title": "Página no encontrada | CBRS",
+      "hasAuthStorage": false,
+      "hasRecaptcha": false,
+      "textSignals": {
+        "loginRequired": true,
+        "noLoad": false,
+        "hasIndexText": true
+      }
+    },
+    {
+      "route": "/consultas-en-linea",
+      "status": 200,
+      "error": null,
+      "url": "https://nuevo-portal.conservador.cl/consultas-en-linea",
+      "title": "Consultas en Línea | CBRS",
+      "hasAuthStorage": false,
+      "hasRecaptcha": false,
+      "textSignals": {
+        "loginRequired": true,
+        "noLoad": false,
+        "hasIndexText": true
+      }
+    },
+    {
+      "route": "/usuario/mi-cuenta/indice-propiedad-avanzado",
+      "status": 200,
+      "error": null,
+      "url": "https://nuevo-portal.conservador.cl/login",
+      "title": "Inicie sesión | CBRS",
+      "hasAuthStorage": false,
+      "hasRecaptcha": false,
+      "textSignals": {
+        "loginRequired": true,
+        "noLoad": false,
+        "hasIndexText": false
+      }
+    }
+  ],
+  "probes": [],
+  "notes": [
+    "Auth-gated direct probes skipped because the copied profile was not logged in."
+  ],
+  "authState": {
+    "present": false
+  }
+}

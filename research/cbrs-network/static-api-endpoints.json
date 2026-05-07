@@ -1,0 +1,350 @@
+[
+  {
+    "endpoint": "/api/v1/auth/refresh",
+    "count": 1
+  },
+  {
+    "endpoint": "/api/v1/home/start",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/account/activation",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/account/create",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/account/resend-activation-email",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/account/resetpass",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/account/resetpass-request",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/account/resetpass-verify",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/auth",
+    "count": 3
+  },
+  {
+    "endpoint": "/v1/auth_cbrs_refresh_token",
+    "count": 3
+  },
+  {
+    "endpoint": "/v1/auth_cbrs_remember",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/auth_cbrs_stay_signed_in",
+    "count": 5
+  },
+  {
+    "endpoint": "/v1/auth_cbrs_token",
+    "count": 8
+  },
+  {
+    "endpoint": "/v1/auth_remember",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/auth_stay_signed_in",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/auth_token_default",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/auth_token_impersonate",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/auth_user",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/auth/impersonate",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/auth/login",
+    "count": 2
+  },
+  {
+    "endpoint": "/v1/auth/logout",
+    "count": 2
+  },
+  {
+    "endpoint": "/v1/auth/refresh",
+    "count": 2
+  },
+  {
+    "endpoint": "/v1/auth/register",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/auth/social",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/auth/unimpersonate",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/auth/user",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/author",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/authorization",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/cart/price",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/cart/solicitarTxPagoDiferencia",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/cart/tx",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/comercio/indice/fnaTicket",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/comercio/indice/img",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/comercio/indice/img/",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/comercio/indice/imgTomo",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/comercio/indice/texto",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/comercio/validaPlazoSocial",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/consulta-en-linea/estado",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/consulta-en-linea/verifica-doc/obtenerDocumento",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/consulta-en-linea/verifica-doc/validaCodigo",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/documentos/consultar",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/extras/",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/fna",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/fna/verifica/",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/notarioElectronico",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/notarioElectronico/verifica",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/pago-complementario",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/pago/diferencia",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/pago/tx",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/planos/base-data",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/planos/buscar",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/planos/descargarResolucion",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/propiedad/indice/base",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/propiedad/indice/fna",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/propiedad/indice/img",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/propiedad/indice/texto",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/propiedad/indice/texto-extra-features",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/propiedad/inscripcionCalculaRequerimiento",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/propiedad/inscripcionPrice",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/reingreso/finalizar",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/reingreso/iniciar",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/status",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user_report",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user-agent",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/account/caratula",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/account/caratulas",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/account/cci/cantidadCaratulasEstadosPorUsuarioCciAndPeriodo",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/account/cci/cantidadCaratulasMensualPorUsuarioCciAndAnio",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/account/cci/obtenerCaratulasPorUsuarioCciPaginado",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/account/editarPassword",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/account/editarPerfil",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/account/estado-masivo",
+    "count": 2
+  },
+  {
+    "endpoint": "/v1/user/account/estado-masivo/deleteBulk",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/account/estado-masivo/exportar/",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/account/estado-masivo/save",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/account/operaciones-masivas/finalizar",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/account/operaciones-masivas/valida",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/account/tx",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/account/txs",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/me",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/receiver/email",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/receiver/emailCrud",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/receiver/ticket",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/receiver/ticketCrud",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/user/receiver/ticketToEdit",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/userSpaceOnUse",
+    "count": 1
+  },
+  {
+    "endpoint": "/v1/verificacion-funcionario",
+    "count": 2
+  }
+]

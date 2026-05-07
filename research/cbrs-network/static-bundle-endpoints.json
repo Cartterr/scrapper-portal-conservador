@@ -1,0 +1,350 @@
+{
+  "api": [
+    {
+      "value": "/api/v1/auth/refresh",
+      "count": 1
+    },
+    {
+      "value": "/api/v1/home/start",
+      "count": 1
+    }
+  ],
+  "urls": [
+    {
+      "value": "http://www.example.com",
+      "count": 1
+    },
+    {
+      "value": "http://www.w3.org/1998/Math/MathML",
+      "count": 1
+    },
+    {
+      "value": "http://www.w3.org/1999/xlink",
+      "count": 1
+    },
+    {
+      "value": "http://www.w3.org/2000/svg",
+      "count": 150
+    },
+    {
+      "value": "https://310313dd1dc70b821f6f6f1d36bcd063@o90030.ingest.sentry.io/4505749959278592",
+      "count": 1
+    },
+    {
+      "value": "https://analytics.conservador.cl",
+      "count": 1
+    },
+    {
+      "value": "https://analytics.conservador.cl/api/event",
+      "count": 1
+    },
+    {
+      "value": "https://challenges.cloudflare.com",
+      "count": 1
+    },
+    {
+      "value": "https://conservador.cl",
+      "count": 1
+    },
+    {
+      "value": "https://dummy.com",
+      "count": 3
+    },
+    {
+      "value": "https://github.com/nodeca/pako",
+      "count": 1
+    },
+    {
+      "value": "https://github.com/uuidjs/uuid#getrandomvalues-not-supported",
+      "count": 1
+    },
+    {
+      "value": "https://goo.gl/maps/mxYuYHgrqUoG9sCV6",
+      "count": 1
+    },
+    {
+      "value": "https://goo.gl/maps/vYnZL1FQAQVtMqay7",
+      "count": 1
+    },
+    {
+      "value": "https://plausible.io/api/event",
+      "count": 1
+    },
+    {
+      "value": "https://v3-migration.vuejs.org/breaking-changes/custom-elements-interop.html",
+      "count": 1
+    },
+    {
+      "value": "https://v3-migration.vuejs.org/breaking-changes/filters.html",
+      "count": 1
+    },
+    {
+      "value": "https://v3-migration.vuejs.org/breaking-changes/inline-template-attribute.html",
+      "count": 1
+    },
+    {
+      "value": "https://v3-migration.vuejs.org/breaking-changes/v-bind.html",
+      "count": 1
+    },
+    {
+      "value": "https://v3-migration.vuejs.org/breaking-changes/v-if-v-for.html",
+      "count": 1
+    },
+    {
+      "value": "https://v3-migration.vuejs.org/breaking-changes/v-model.html",
+      "count": 1
+    },
+    {
+      "value": "https://v3-migration.vuejs.org/breaking-changes/v-on-native-modifier-removed.html",
+      "count": 1
+    },
+    {
+      "value": "https://vuejs.org/error-reference/#compiler-${e}",
+      "count": 1
+    },
+    {
+      "value": "https://vuejs.org/error-reference/#runtime-${o}",
+      "count": 1
+    },
+    {
+      "value": "https://web.facebook.com/profile.php?id=100094457498092",
+      "count": 1
+    },
+    {
+      "value": "https://www.google.com/recaptcha/enterprise.js?render=${r}",
+      "count": 1
+    },
+    {
+      "value": "https://www.instagram.com/conservador.cl",
+      "count": 1
+    },
+    {
+      "value": "https://www.linkedin.com/company/conservador-de-bienes-ra%C3%ADces-de-santiago",
+      "count": 1
+    },
+    {
+      "value": "https://x.com/conservadorcl_",
+      "count": 1
+    }
+  ],
+  "services": [
+    {
+      "value": "analytics.conservador.cl",
+      "count": 2
+    },
+    {
+      "value": "challenges.cloudflare.com",
+      "count": 1
+    },
+    {
+      "value": "conservador.cl",
+      "count": 1
+    },
+    {
+      "value": "dummy.com",
+      "count": 3
+    },
+    {
+      "value": "github.com",
+      "count": 2
+    },
+    {
+      "value": "goo.gl",
+      "count": 2
+    },
+    {
+      "value": "o90030.ingest.sentry.io",
+      "count": 1
+    },
+    {
+      "value": "plausible.io",
+      "count": 1
+    },
+    {
+      "value": "v3-migration.vuejs.org",
+      "count": 7
+    },
+    {
+      "value": "vuejs.org",
+      "count": 2
+    },
+    {
+      "value": "web.facebook.com",
+      "count": 1
+    },
+    {
+      "value": "www.example.com",
+      "count": 1
+    },
+    {
+      "value": "www.google.com",
+      "count": 1
+    },
+    {
+      "value": "www.instagram.com",
+      "count": 1
+    },
+    {
+      "value": "www.linkedin.com",
+      "count": 1
+    },
+    {
+      "value": "www.w3.org",
+      "count": 152
+    },
+    {
+      "value": "x.com",
+      "count": 1
+    }
+  ],
+  "routes": [
+    {
+      "value": "/",
+      "count": 3
+    },
+    {
+      "value": "/:catchAll(.*)",
+      "count": 1
+    },
+    {
+      "value": "/activacion-de-cuenta",
+      "count": 1
+    },
+    {
+      "value": "/consultas-en-linea",
+      "count": 2
+    },
+    {
+      "value": "/consultas-en-linea/planos/viewer",
+      "count": 2
+    },
+    {
+      "value": "/crear-cuenta",
+      "count": 1
+    },
+    {
+      "value": "/informacion",
+      "count": 2
+    },
+    {
+      "value": "/login",
+      "count": 1
+    },
+    {
+      "value": "/pago-complementario",
+      "count": 1
+    },
+    {
+      "value": "/reenviar-correo-de-activacion-de-cuenta",
+      "count": 1
+    },
+    {
+      "value": "/restablecer-contrasena",
+      "count": 1
+    },
+    {
+      "value": "/solicitud-restablecer-contrasena",
+      "count": 1
+    },
+    {
+      "value": "/tramites-en-linea",
+      "count": 8
+    },
+    {
+      "value": "/tramites-en-linea/copias-y-certificados",
+      "count": 2
+    },
+    {
+      "value": "/usuario",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta",
+      "count": 3
+    },
+    {
+      "value": "/usuario/mi-cuenta/alzamiento-tgr",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta/caratulas",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta/caratulas-express",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta/caratulas/",
+      "count": 1
+    },
+    {
+      "value": "/usuario/mi-cuenta/caratulas/:numeroCaratula",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta/compras",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta/compras/",
+      "count": 1
+    },
+    {
+      "value": "/usuario/mi-cuenta/compras/:idTransaccion",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta/cuenta-corriente-integrada",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta/embargo-tgr",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta/estado-masivo",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta/folio-mercantil-electronico",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta/indice-propiedad-avanzado",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta/inscripcion-dga",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta/notificaciones-correo",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta/operaciones-masivas",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta/perfil",
+      "count": 2
+    },
+    {
+      "value": "/usuario/mi-cuenta/titulares-boleta",
+      "count": 2
+    },
+    {
+      "value": "/verificacion-funcionario",
+      "count": 1
+    },
+    {
+      "value": "#",
+      "count": 5
+    },
+    {
+      "value": "${mo.tramites.CYV_ESTADO_ENTREGA.path}",
+      "count": 1
+    }
+  ]
+}

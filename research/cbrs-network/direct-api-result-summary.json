@@ -1,0 +1,32 @@
+{
+  "search": {
+    "status": 200,
+    "count": 2,
+    "first": {
+      "id": "1895596",
+      "foja": 63244,
+      "num": 27964,
+      "ano": 2022,
+      "acto": "Transformación",
+      "nombreSociedad": "MBX GLOBAL SpA",
+      "hasTicket": true,
+      "ticketLength": 96
+    }
+  },
+  "ticketInfo": "{\"status\":200,\"data\":{\"foja\":63244,\"numero\":\"27964\",\"ano\":2022,\"isFna\":true,\"isTomo\":null,\"statusTomo\":null,\"numberOfPagesTomo\":null,\"messageTomo\":null,\"numberTomo\":null,\"ticket\":\"[TICKET_REDACTED]\"}}",
+  "refs": {
+    "status": 200,
+    "numberOfPages": 2,
+    "refsCount": 2,
+    "firstRef": {
+      "pageNumber": 1,
+      "hasDataRef": true,
+      "hasThumb": true
+    }
+  },
+  "imageProbe": {
+    "status": 200,
+    "contentType": "image/png",
+    "size": 102167
+  }
+}

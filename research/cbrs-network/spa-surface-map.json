@@ -1,0 +1,1584 @@
+{
+  "capturedAt": "2026-05-06T23:59:06.306Z",
+  "root": {
+    "url": "https://nuevo-portal.conservador.cl/",
+    "status": 200,
+    "contentSecurityPolicyMeta": "script-src 'self' https://analytics.conservador.cl https://challenges.cloudflare.com blob: www.google.com www.gstatic.com maps.google.cl 'sha256-gPjlli1HEdLlR0AZTY971/wQVOdSkl9mEinLnxrPpJw='; base-uri 'self';",
+    "hasIncapsulaResource": false
+  },
+  "assets": [
+    {
+      "ref": "/assets/chunk-D2IO8fGq.css",
+      "url": "https://nuevo-portal.conservador.cl/assets/chunk-D2IO8fGq.css",
+      "status": 200,
+      "bytes": 6726,
+      "fileName": "chunk-D2IO8fGq.css"
+    },
+    {
+      "ref": "/assets/chunk-G4IM3oeR.css",
+      "url": "https://nuevo-portal.conservador.cl/assets/chunk-G4IM3oeR.css",
+      "status": 200,
+      "bytes": 202047,
+      "fileName": "chunk-G4IM3oeR.css"
+    },
+    {
+      "ref": "/assets/index-CGq6gMXH.js",
+      "url": "https://nuevo-portal.conservador.cl/assets/index-CGq6gMXH.js",
+      "status": 200,
+      "bytes": 491573,
+      "fileName": "index-CGq6gMXH.js"
+    },
+    {
+      "ref": "/chunks/chunk-Ch-0qj0x.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-Ch-0qj0x.js",
+      "status": 200,
+      "bytes": 563656,
+      "fileName": "chunk-Ch-0qj0x.js"
+    },
+    {
+      "ref": "/css/base.css",
+      "url": "https://nuevo-portal.conservador.cl/css/base.css",
+      "status": 200,
+      "bytes": 731,
+      "fileName": "base.css"
+    },
+    {
+      "ref": "/chunks/chunk-B6LIEiuz.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-B6LIEiuz.js",
+      "status": 200,
+      "bytes": 4045,
+      "fileName": "chunk-B6LIEiuz.js"
+    },
+    {
+      "ref": "/chunks/chunk-Fzbz63HA.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-Fzbz63HA.js",
+      "status": 200,
+      "bytes": 17572,
+      "fileName": "chunk-Fzbz63HA.js"
+    },
+    {
+      "ref": "/chunks/chunk-DiwR-PbK.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DiwR-PbK.js",
+      "status": 200,
+      "bytes": 6819,
+      "fileName": "chunk-DiwR-PbK.js"
+    },
+    {
+      "ref": "/chunks/chunk-Dfn-6U69.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-Dfn-6U69.js",
+      "status": 200,
+      "bytes": 4404,
+      "fileName": "chunk-Dfn-6U69.js"
+    },
+    {
+      "ref": "/chunks/chunk-qRPDRL7r.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-qRPDRL7r.js",
+      "status": 200,
+      "bytes": 2419,
+      "fileName": "chunk-qRPDRL7r.js"
+    },
+    {
+      "ref": "/chunks/chunk-mJNEMbXL.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-mJNEMbXL.js",
+      "status": 200,
+      "bytes": 9591,
+      "fileName": "chunk-mJNEMbXL.js"
+    },
+    {
+      "ref": "/chunks/chunk-BrVOPAfN.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BrVOPAfN.js",
+      "status": 200,
+      "bytes": 3528,
+      "fileName": "chunk-BrVOPAfN.js"
+    },
+    {
+      "ref": "/chunks/chunk-BpwcNYww.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BpwcNYww.js",
+      "status": 200,
+      "bytes": 5074,
+      "fileName": "chunk-BpwcNYww.js"
+    },
+    {
+      "ref": "/chunks/chunk-foUT7Qeg.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-foUT7Qeg.js",
+      "status": 200,
+      "bytes": 29820,
+      "fileName": "chunk-foUT7Qeg.js"
+    },
+    {
+      "ref": "/chunks/chunk-C_EbqMRx.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-C_EbqMRx.js",
+      "status": 200,
+      "bytes": 5079,
+      "fileName": "chunk-C_EbqMRx.js"
+    },
+    {
+      "ref": "/chunks/chunk-RcdGXYff.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-RcdGXYff.js",
+      "status": 200,
+      "bytes": 10763,
+      "fileName": "chunk-RcdGXYff.js"
+    },
+    {
+      "ref": "/chunks/chunk-B2UtSp3u.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-B2UtSp3u.js",
+      "status": 200,
+      "bytes": 25073,
+      "fileName": "chunk-B2UtSp3u.js"
+    },
+    {
+      "ref": "/chunks/chunk-DNpV6eIO.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DNpV6eIO.js",
+      "status": 200,
+      "bytes": 13684,
+      "fileName": "chunk-DNpV6eIO.js"
+    },
+    {
+      "ref": "/chunks/chunk-MZCpKcaI.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-MZCpKcaI.js",
+      "status": 200,
+      "bytes": 12752,
+      "fileName": "chunk-MZCpKcaI.js"
+    },
+    {
+      "ref": "/chunks/chunk-0SifN97X.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-0SifN97X.js",
+      "status": 200,
+      "bytes": 10861,
+      "fileName": "chunk-0SifN97X.js"
+    },
+    {
+      "ref": "/chunks/chunk-DntRx-Ay.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DntRx-Ay.js",
+      "status": 200,
+      "bytes": 9933,
+      "fileName": "chunk-DntRx-Ay.js"
+    },
+    {
+      "ref": "/chunks/chunk-k1zLhlXq.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-k1zLhlXq.js",
+      "status": 200,
+      "bytes": 18718,
+      "fileName": "chunk-k1zLhlXq.js"
+    },
+    {
+      "ref": "/chunks/chunk-SZRxuOR2.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-SZRxuOR2.js",
+      "status": 200,
+      "bytes": 23885,
+      "fileName": "chunk-SZRxuOR2.js"
+    },
+    {
+      "ref": "/chunks/chunk-BQROlDUp.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BQROlDUp.js",
+      "status": 200,
+      "bytes": 15195,
+      "fileName": "chunk-BQROlDUp.js"
+    },
+    {
+      "ref": "/chunks/chunk-rZuRIRTc.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-rZuRIRTc.js",
+      "status": 200,
+      "bytes": 20310,
+      "fileName": "chunk-rZuRIRTc.js"
+    },
+    {
+      "ref": "/chunks/chunk-Cy1SzbHD.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-Cy1SzbHD.js",
+      "status": 200,
+      "bytes": 2977,
+      "fileName": "chunk-Cy1SzbHD.js"
+    },
+    {
+      "ref": "/chunks/chunk-L_ZhbArT.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-L_ZhbArT.js",
+      "status": 200,
+      "bytes": 3283,
+      "fileName": "chunk-L_ZhbArT.js"
+    },
+    {
+      "ref": "/chunks/chunk-BweL8edy.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BweL8edy.js",
+      "status": 200,
+      "bytes": 10865,
+      "fileName": "chunk-BweL8edy.js"
+    },
+    {
+      "ref": "/chunks/chunk-BTC-9xfW.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BTC-9xfW.js",
+      "status": 200,
+      "bytes": 19321,
+      "fileName": "chunk-BTC-9xfW.js"
+    },
+    {
+      "ref": "/chunks/chunk-BoJtdUe_.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BoJtdUe_.js",
+      "status": 200,
+      "bytes": 45501,
+      "fileName": "chunk-BoJtdUe_.js"
+    },
+    {
+      "ref": "/chunks/chunk-DYEG0ceE.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DYEG0ceE.js",
+      "status": 200,
+      "bytes": 7866,
+      "fileName": "chunk-DYEG0ceE.js"
+    },
+    {
+      "ref": "/chunks/chunk-Brf7En45.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-Brf7En45.js",
+      "status": 200,
+      "bytes": 4387,
+      "fileName": "chunk-Brf7En45.js"
+    },
+    {
+      "ref": "/chunks/chunk-D63eQxi7.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-D63eQxi7.js",
+      "status": 200,
+      "bytes": 4377,
+      "fileName": "chunk-D63eQxi7.js"
+    },
+    {
+      "ref": "/chunks/chunk-Dfw3eGgb.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-Dfw3eGgb.js",
+      "status": 200,
+      "bytes": 685,
+      "fileName": "chunk-Dfw3eGgb.js"
+    },
+    {
+      "ref": "/chunks/chunk-DIS12yjF.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DIS12yjF.js",
+      "status": 200,
+      "bytes": 2835,
+      "fileName": "chunk-DIS12yjF.js"
+    },
+    {
+      "ref": "/chunks/chunk-C9Af28oU.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-C9Af28oU.js",
+      "status": 200,
+      "bytes": 2853,
+      "fileName": "chunk-C9Af28oU.js"
+    },
+    {
+      "ref": "/chunks/chunk-C5EI3Do0.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-C5EI3Do0.js",
+      "status": 200,
+      "bytes": 3911,
+      "fileName": "chunk-C5EI3Do0.js"
+    },
+    {
+      "ref": "/chunks/chunk-Cmr78BPM.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-Cmr78BPM.js",
+      "status": 200,
+      "bytes": 3162,
+      "fileName": "chunk-Cmr78BPM.js"
+    },
+    {
+      "ref": "/chunks/chunk-CUHfqQLT.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CUHfqQLT.js",
+      "status": 200,
+      "bytes": 3170,
+      "fileName": "chunk-CUHfqQLT.js"
+    },
+    {
+      "ref": "/chunks/chunk-QTFh-FlX.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-QTFh-FlX.js",
+      "status": 200,
+      "bytes": 3375,
+      "fileName": "chunk-QTFh-FlX.js"
+    },
+    {
+      "ref": "/chunks/chunk-DSAVfQU0.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DSAVfQU0.js",
+      "status": 200,
+      "bytes": 3374,
+      "fileName": "chunk-DSAVfQU0.js"
+    },
+    {
+      "ref": "/chunks/chunk-py5Hcfz3.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-py5Hcfz3.js",
+      "status": 200,
+      "bytes": 4571,
+      "fileName": "chunk-py5Hcfz3.js"
+    },
+    {
+      "ref": "/chunks/chunk-BYJZLmEP.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BYJZLmEP.js",
+      "status": 200,
+      "bytes": 41383,
+      "fileName": "chunk-BYJZLmEP.js"
+    },
+    {
+      "ref": "/chunks/chunk-DdZ_8ouB.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DdZ_8ouB.js",
+      "status": 200,
+      "bytes": 4093,
+      "fileName": "chunk-DdZ_8ouB.js"
+    },
+    {
+      "ref": "/chunks/chunk-C8BIOVV5.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-C8BIOVV5.js",
+      "status": 200,
+      "bytes": 3296,
+      "fileName": "chunk-C8BIOVV5.js"
+    },
+    {
+      "ref": "/chunks/chunk-qbX0HweG.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-qbX0HweG.js",
+      "status": 200,
+      "bytes": 3334,
+      "fileName": "chunk-qbX0HweG.js"
+    },
+    {
+      "ref": "/chunks/chunk-BWi6DTut.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BWi6DTut.js",
+      "status": 200,
+      "bytes": 3342,
+      "fileName": "chunk-BWi6DTut.js"
+    },
+    {
+      "ref": "/chunks/chunk-DYtUGxMM.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DYtUGxMM.js",
+      "status": 200,
+      "bytes": 3171,
+      "fileName": "chunk-DYtUGxMM.js"
+    },
+    {
+      "ref": "/chunks/chunk-DEPnDF4T.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DEPnDF4T.js",
+      "status": 200,
+      "bytes": 3298,
+      "fileName": "chunk-DEPnDF4T.js"
+    },
+    {
+      "ref": "/chunks/chunk-wIXgMAYx.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-wIXgMAYx.js",
+      "status": 200,
+      "bytes": 3315,
+      "fileName": "chunk-wIXgMAYx.js"
+    },
+    {
+      "ref": "/chunks/chunk-jMvgmv_7.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-jMvgmv_7.js",
+      "status": 200,
+      "bytes": 64220,
+      "fileName": "chunk-jMvgmv_7.js"
+    },
+    {
+      "ref": "/chunks/chunk-CFcFh1-k.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CFcFh1-k.js",
+      "status": 200,
+      "bytes": 681,
+      "fileName": "chunk-CFcFh1-k.js"
+    },
+    {
+      "ref": "/chunks/chunk-BwsgD_g6.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BwsgD_g6.js",
+      "status": 200,
+      "bytes": 3102,
+      "fileName": "chunk-BwsgD_g6.js"
+    },
+    {
+      "ref": "/chunks/chunk-BMGfyvHz.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BMGfyvHz.js",
+      "status": 200,
+      "bytes": 3016,
+      "fileName": "chunk-BMGfyvHz.js"
+    },
+    {
+      "ref": "/chunks/chunk-BlTaqKAj.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BlTaqKAj.js",
+      "status": 200,
+      "bytes": 3019,
+      "fileName": "chunk-BlTaqKAj.js"
+    },
+    {
+      "ref": "/chunks/chunk-BK2gvn3c.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BK2gvn3c.js",
+      "status": 200,
+      "bytes": 684,
+      "fileName": "chunk-BK2gvn3c.js"
+    },
+    {
+      "ref": "/chunks/chunk-BC2atPtz.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BC2atPtz.js",
+      "status": 200,
+      "bytes": 10376,
+      "fileName": "chunk-BC2atPtz.js"
+    },
+    {
+      "ref": "/chunks/chunk-DFkAjUT3.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DFkAjUT3.js",
+      "status": 200,
+      "bytes": 3294,
+      "fileName": "chunk-DFkAjUT3.js"
+    },
+    {
+      "ref": "/chunks/chunk-CYHJ2LhL.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CYHJ2LhL.js",
+      "status": 200,
+      "bytes": 3335,
+      "fileName": "chunk-CYHJ2LhL.js"
+    },
+    {
+      "ref": "/chunks/chunk-C_nV-wV1.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-C_nV-wV1.js",
+      "status": 200,
+      "bytes": 3311,
+      "fileName": "chunk-C_nV-wV1.js"
+    },
+    {
+      "ref": "/chunks/chunk--8ozPj6j.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk--8ozPj6j.js",
+      "status": 200,
+      "bytes": 3309,
+      "fileName": "chunk--8ozPj6j.js"
+    },
+    {
+      "ref": "/chunks/chunk-Bk2eo86g.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-Bk2eo86g.js",
+      "status": 200,
+      "bytes": 3831,
+      "fileName": "chunk-Bk2eo86g.js"
+    },
+    {
+      "ref": "/chunks/chunk-YgUnXhSo.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-YgUnXhSo.js",
+      "status": 200,
+      "bytes": 3287,
+      "fileName": "chunk-YgUnXhSo.js"
+    },
+    {
+      "ref": "/chunks/chunk-CV2v3Ra2.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CV2v3Ra2.js",
+      "status": 200,
+      "bytes": 3315,
+      "fileName": "chunk-CV2v3Ra2.js"
+    },
+    {
+      "ref": "/chunks/chunk-D9UNHTR5.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-D9UNHTR5.js",
+      "status": 200,
+      "bytes": 3322,
+      "fileName": "chunk-D9UNHTR5.js"
+    },
+    {
+      "ref": "/chunks/chunk-p_sCPLDi.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-p_sCPLDi.js",
+      "status": 200,
+      "bytes": 3229,
+      "fileName": "chunk-p_sCPLDi.js"
+    },
+    {
+      "ref": "/chunks/chunk-Cquucqsu.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-Cquucqsu.js",
+      "status": 200,
+      "bytes": 3115,
+      "fileName": "chunk-Cquucqsu.js"
+    },
+    {
+      "ref": "/chunks/chunk-Bvy-0mXc.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-Bvy-0mXc.js",
+      "status": 200,
+      "bytes": 3736,
+      "fileName": "chunk-Bvy-0mXc.js"
+    },
+    {
+      "ref": "/chunks/chunk-CCIADid3.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CCIADid3.js",
+      "status": 200,
+      "bytes": 3656,
+      "fileName": "chunk-CCIADid3.js"
+    },
+    {
+      "ref": "/chunks/chunk-CQ5JaPQN.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CQ5JaPQN.js",
+      "status": 200,
+      "bytes": 3942,
+      "fileName": "chunk-CQ5JaPQN.js"
+    },
+    {
+      "ref": "/chunks/chunk-BjBl0dA8.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BjBl0dA8.js",
+      "status": 200,
+      "bytes": 3038,
+      "fileName": "chunk-BjBl0dA8.js"
+    },
+    {
+      "ref": "/chunks/chunk-CHHCef8o.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CHHCef8o.js",
+      "status": 200,
+      "bytes": 721,
+      "fileName": "chunk-CHHCef8o.js"
+    },
+    {
+      "ref": "/chunks/chunk-BIdSQ2ff.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BIdSQ2ff.js",
+      "status": 200,
+      "bytes": 20346,
+      "fileName": "chunk-BIdSQ2ff.js"
+    },
+    {
+      "ref": "/chunks/chunk-B9UQjqSr.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-B9UQjqSr.js",
+      "status": 200,
+      "bytes": 5630,
+      "fileName": "chunk-B9UQjqSr.js"
+    },
+    {
+      "ref": "/chunks/chunk-BjMdKzpa.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BjMdKzpa.js",
+      "status": 200,
+      "bytes": 716,
+      "fileName": "chunk-BjMdKzpa.js"
+    },
+    {
+      "ref": "/chunks/chunk-NtYqGvW4.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-NtYqGvW4.js",
+      "status": 200,
+      "bytes": 1143,
+      "fileName": "chunk-NtYqGvW4.js"
+    },
+    {
+      "ref": "/chunks/chunk-DTCUBtGR.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DTCUBtGR.js",
+      "status": 200,
+      "bytes": 10111,
+      "fileName": "chunk-DTCUBtGR.js"
+    },
+    {
+      "ref": "/chunks/chunk-w1sUqXLY.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-w1sUqXLY.js",
+      "status": 200,
+      "bytes": 4456,
+      "fileName": "chunk-w1sUqXLY.js"
+    },
+    {
+      "ref": "/chunks/chunk-CiJbYwNq.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CiJbYwNq.js",
+      "status": 200,
+      "bytes": 4539,
+      "fileName": "chunk-CiJbYwNq.js"
+    },
+    {
+      "ref": "/chunks/chunk-Cq5sI5xE.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-Cq5sI5xE.js",
+      "status": 200,
+      "bytes": 722,
+      "fileName": "chunk-Cq5sI5xE.js"
+    },
+    {
+      "ref": "/chunks/chunk-C00JVk0x.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-C00JVk0x.js",
+      "status": 200,
+      "bytes": 24772,
+      "fileName": "chunk-C00JVk0x.js"
+    },
+    {
+      "ref": "/chunks/chunk-98t8bHXx.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-98t8bHXx.js",
+      "status": 200,
+      "bytes": 12021,
+      "fileName": "chunk-98t8bHXx.js"
+    },
+    {
+      "ref": "/chunks/chunk-BJjx7YJE.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BJjx7YJE.js",
+      "status": 200,
+      "bytes": 7041,
+      "fileName": "chunk-BJjx7YJE.js"
+    },
+    {
+      "ref": "/chunks/chunk-B7XapurE.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-B7XapurE.js",
+      "status": 200,
+      "bytes": 10312,
+      "fileName": "chunk-B7XapurE.js"
+    },
+    {
+      "ref": "/chunks/chunk-1_ndvVeB.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-1_ndvVeB.js",
+      "status": 200,
+      "bytes": 714,
+      "fileName": "chunk-1_ndvVeB.js"
+    },
+    {
+      "ref": "/chunks/chunk-CWjO5WsQ.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CWjO5WsQ.js",
+      "status": 200,
+      "bytes": 717,
+      "fileName": "chunk-CWjO5WsQ.js"
+    },
+    {
+      "ref": "/chunks/chunk-CvhvyQFR.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CvhvyQFR.js",
+      "status": 200,
+      "bytes": 6010,
+      "fileName": "chunk-CvhvyQFR.js"
+    },
+    {
+      "ref": "/chunks/chunk-vgau9_Sx.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-vgau9_Sx.js",
+      "status": 200,
+      "bytes": 3251,
+      "fileName": "chunk-vgau9_Sx.js"
+    },
+    {
+      "ref": "/chunks/chunk-DRI00U6f.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DRI00U6f.js",
+      "status": 200,
+      "bytes": 2884,
+      "fileName": "chunk-DRI00U6f.js"
+    },
+    {
+      "ref": "/chunks/chunk-XvJ2dB9p.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-XvJ2dB9p.js",
+      "status": 200,
+      "bytes": 2603,
+      "fileName": "chunk-XvJ2dB9p.js"
+    },
+    {
+      "ref": "/chunks/chunk-BN3tboDY.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BN3tboDY.js",
+      "status": 200,
+      "bytes": 977,
+      "fileName": "chunk-BN3tboDY.js"
+    },
+    {
+      "ref": "/chunks/chunk-zJe0K0Ks.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-zJe0K0Ks.js",
+      "status": 200,
+      "bytes": 972,
+      "fileName": "chunk-zJe0K0Ks.js"
+    },
+    {
+      "ref": "/chunks/chunk-Dr0kse6N.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-Dr0kse6N.js",
+      "status": 200,
+      "bytes": 972,
+      "fileName": "chunk-Dr0kse6N.js"
+    },
+    {
+      "ref": "/chunks/chunk-C9nORPQL.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-C9nORPQL.js",
+      "status": 200,
+      "bytes": 966,
+      "fileName": "chunk-C9nORPQL.js"
+    },
+    {
+      "ref": "/chunks/chunk-BIpIq-9R.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BIpIq-9R.js",
+      "status": 200,
+      "bytes": 717,
+      "fileName": "chunk-BIpIq-9R.js"
+    },
+    {
+      "ref": "/chunks/chunk-gnbvcS72.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-gnbvcS72.js",
+      "status": 200,
+      "bytes": 2067,
+      "fileName": "chunk-gnbvcS72.js"
+    },
+    {
+      "ref": "/chunks/chunk-BqQD3K-i.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BqQD3K-i.js",
+      "status": 200,
+      "bytes": 30931,
+      "fileName": "chunk-BqQD3K-i.js"
+    },
+    {
+      "ref": "/chunks/chunk-Cma-u-aN.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-Cma-u-aN.js",
+      "status": 200,
+      "bytes": 5072,
+      "fileName": "chunk-Cma-u-aN.js"
+    },
+    {
+      "ref": "/chunks/chunk-CwgjbLFN.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CwgjbLFN.js",
+      "status": 200,
+      "bytes": 8853,
+      "fileName": "chunk-CwgjbLFN.js"
+    },
+    {
+      "ref": "/chunks/chunk-40aRHzxC.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-40aRHzxC.js",
+      "status": 200,
+      "bytes": 10960,
+      "fileName": "chunk-40aRHzxC.js"
+    },
+    {
+      "ref": "/chunks/chunk-6ZA6QatG.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-6ZA6QatG.js",
+      "status": 200,
+      "bytes": 716,
+      "fileName": "chunk-6ZA6QatG.js"
+    },
+    {
+      "ref": "/chunks/chunk-C-Ut_QIY.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-C-Ut_QIY.js",
+      "status": 200,
+      "bytes": 1853,
+      "fileName": "chunk-C-Ut_QIY.js"
+    },
+    {
+      "ref": "/chunks/chunk-Csy2lt1i.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-Csy2lt1i.js",
+      "status": 200,
+      "bytes": 717,
+      "fileName": "chunk-Csy2lt1i.js"
+    },
+    {
+      "ref": "/chunks/chunk-BcN_im9g.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BcN_im9g.js",
+      "status": 200,
+      "bytes": 697,
+      "fileName": "chunk-BcN_im9g.js"
+    },
+    {
+      "ref": "/chunks/chunk-BLm_6H7B.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BLm_6H7B.js",
+      "status": 200,
+      "bytes": 12603,
+      "fileName": "chunk-BLm_6H7B.js"
+    },
+    {
+      "ref": "/chunks/chunk-DlFk5nQa.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DlFk5nQa.js",
+      "status": 200,
+      "bytes": 16438,
+      "fileName": "chunk-DlFk5nQa.js"
+    },
+    {
+      "ref": "/chunks/chunk-BHd6JOfJ.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BHd6JOfJ.js",
+      "status": 200,
+      "bytes": 12737,
+      "fileName": "chunk-BHd6JOfJ.js"
+    },
+    {
+      "ref": "/chunks/chunk-DjnenD9y.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DjnenD9y.js",
+      "status": 200,
+      "bytes": 9068,
+      "fileName": "chunk-DjnenD9y.js"
+    },
+    {
+      "ref": "/chunks/chunk-BnKQTe9R.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BnKQTe9R.js",
+      "status": 200,
+      "bytes": 3070,
+      "fileName": "chunk-BnKQTe9R.js"
+    },
+    {
+      "ref": "/chunks/chunk-O264n5vB.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-O264n5vB.js",
+      "status": 200,
+      "bytes": 5595,
+      "fileName": "chunk-O264n5vB.js"
+    },
+    {
+      "ref": "/chunks/chunk-OjrQxAt_.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-OjrQxAt_.js",
+      "status": 200,
+      "bytes": 10353,
+      "fileName": "chunk-OjrQxAt_.js"
+    },
+    {
+      "ref": "/chunks/chunk-OOhvVS29.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-OOhvVS29.js",
+      "status": 200,
+      "bytes": 570,
+      "fileName": "chunk-OOhvVS29.js"
+    },
+    {
+      "ref": "/chunks/chunk-DbOYckQG.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DbOYckQG.js",
+      "status": 200,
+      "bytes": 4920,
+      "fileName": "chunk-DbOYckQG.js"
+    },
+    {
+      "ref": "/chunks/chunk-DZH2YsbA.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DZH2YsbA.js",
+      "status": 200,
+      "bytes": 5753,
+      "fileName": "chunk-DZH2YsbA.js"
+    },
+    {
+      "ref": "/chunks/chunk-CX8NzE7k.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CX8NzE7k.js",
+      "status": 200,
+      "bytes": 64,
+      "fileName": "chunk-CX8NzE7k.js"
+    },
+    {
+      "ref": "/chunks/chunk-F5rk0qMA.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-F5rk0qMA.js",
+      "status": 200,
+      "bytes": 1212,
+      "fileName": "chunk-F5rk0qMA.js"
+    },
+    {
+      "ref": "/chunks/chunk-DWET7TVQ.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DWET7TVQ.js",
+      "status": 200,
+      "bytes": 855,
+      "fileName": "chunk-DWET7TVQ.js"
+    },
+    {
+      "ref": "/chunks/chunk-CfOOACeE.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CfOOACeE.js",
+      "status": 200,
+      "bytes": 595,
+      "fileName": "chunk-CfOOACeE.js"
+    },
+    {
+      "ref": "/chunks/chunk-BCo6x5W8.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BCo6x5W8.js",
+      "status": 200,
+      "bytes": 91,
+      "fileName": "chunk-BCo6x5W8.js"
+    },
+    {
+      "ref": "/chunks/chunk-BIo6OIaS.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BIo6OIaS.js",
+      "status": 200,
+      "bytes": 4683,
+      "fileName": "chunk-BIo6OIaS.js"
+    },
+    {
+      "ref": "/chunks/chunk-B9XWo08-.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-B9XWo08-.js",
+      "status": 200,
+      "bytes": 520,
+      "fileName": "chunk-B9XWo08-.js"
+    },
+    {
+      "ref": "/chunks/chunk-C4577GRA.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-C4577GRA.js",
+      "status": 200,
+      "bytes": 284,
+      "fileName": "chunk-C4577GRA.js"
+    },
+    {
+      "ref": "/chunks/chunk-D5CcEAzz.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-D5CcEAzz.js",
+      "status": 200,
+      "bytes": 4399,
+      "fileName": "chunk-D5CcEAzz.js"
+    },
+    {
+      "ref": "/chunks/chunk-CyfjZSpT.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CyfjZSpT.js",
+      "status": 200,
+      "bytes": 261,
+      "fileName": "chunk-CyfjZSpT.js"
+    },
+    {
+      "ref": "/chunks/chunk-DuEuCiHV.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DuEuCiHV.js",
+      "status": 200,
+      "bytes": 2806,
+      "fileName": "chunk-DuEuCiHV.js"
+    },
+    {
+      "ref": "/chunks/chunk-CrIx9XmI.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CrIx9XmI.js",
+      "status": 200,
+      "bytes": 4045,
+      "fileName": "chunk-CrIx9XmI.js"
+    },
+    {
+      "ref": "/chunks/chunk-St2gWMbK.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-St2gWMbK.js",
+      "status": 200,
+      "bytes": 35256,
+      "fileName": "chunk-St2gWMbK.js"
+    },
+    {
+      "ref": "/chunks/chunk-D0v35Oib.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-D0v35Oib.js",
+      "status": 200,
+      "bytes": 15337,
+      "fileName": "chunk-D0v35Oib.js"
+    },
+    {
+      "ref": "/chunks/chunk-B4O3a43e.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-B4O3a43e.js",
+      "status": 200,
+      "bytes": 8748,
+      "fileName": "chunk-B4O3a43e.js"
+    },
+    {
+      "ref": "/chunks/chunk-C5hY5hSD.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-C5hY5hSD.js",
+      "status": 200,
+      "bytes": 6787,
+      "fileName": "chunk-C5hY5hSD.js"
+    },
+    {
+      "ref": "/chunks/chunk-ETPBc_Cx.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-ETPBc_Cx.js",
+      "status": 200,
+      "bytes": 10825,
+      "fileName": "chunk-ETPBc_Cx.js"
+    },
+    {
+      "ref": "/chunks/chunk-OXaCfVId.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-OXaCfVId.js",
+      "status": 200,
+      "bytes": 1738,
+      "fileName": "chunk-OXaCfVId.js"
+    },
+    {
+      "ref": "/chunks/chunk-BVygHvFE.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BVygHvFE.js",
+      "status": 200,
+      "bytes": 315,
+      "fileName": "chunk-BVygHvFE.js"
+    },
+    {
+      "ref": "/chunks/chunk-C-vj-4y7.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-C-vj-4y7.js",
+      "status": 200,
+      "bytes": 5487,
+      "fileName": "chunk-C-vj-4y7.js"
+    },
+    {
+      "ref": "/chunks/chunk-DW8iQE47.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DW8iQE47.js",
+      "status": 200,
+      "bytes": 201,
+      "fileName": "chunk-DW8iQE47.js"
+    },
+    {
+      "ref": "/chunks/chunk-C0pCCnZe.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-C0pCCnZe.js",
+      "status": 200,
+      "bytes": 6278,
+      "fileName": "chunk-C0pCCnZe.js"
+    },
+    {
+      "ref": "/chunks/chunk-msRIr96r.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-msRIr96r.js",
+      "status": 200,
+      "bytes": 175191,
+      "fileName": "chunk-msRIr96r.js"
+    },
+    {
+      "ref": "/chunks/chunk-HHHupafo.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-HHHupafo.js",
+      "status": 200,
+      "bytes": 632,
+      "fileName": "chunk-HHHupafo.js"
+    },
+    {
+      "ref": "/chunks/chunk-mi8GT8VC.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-mi8GT8VC.js",
+      "status": 200,
+      "bytes": 1990,
+      "fileName": "chunk-mi8GT8VC.js"
+    },
+    {
+      "ref": "/chunks/chunk-DlsDCFvH.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DlsDCFvH.js",
+      "status": 200,
+      "bytes": 4922,
+      "fileName": "chunk-DlsDCFvH.js"
+    },
+    {
+      "ref": "/chunks/chunk-B_cnNpEG.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-B_cnNpEG.js",
+      "status": 200,
+      "bytes": 2914,
+      "fileName": "chunk-B_cnNpEG.js"
+    },
+    {
+      "ref": "/chunks/chunk-CwWKOzU3.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CwWKOzU3.js",
+      "status": 200,
+      "bytes": 10088,
+      "fileName": "chunk-CwWKOzU3.js"
+    },
+    {
+      "ref": "/chunks/chunk-CCEoknLX.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-CCEoknLX.js",
+      "status": 200,
+      "bytes": 10792,
+      "fileName": "chunk-CCEoknLX.js"
+    },
+    {
+      "ref": "/chunks/chunk-XWHz0veX.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-XWHz0veX.js",
+      "status": 200,
+      "bytes": 18357,
+      "fileName": "chunk-XWHz0veX.js"
+    },
+    {
+      "ref": "/chunks/chunk-hVW8xcfB.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-hVW8xcfB.js",
+      "status": 200,
+      "bytes": 156509,
+      "fileName": "chunk-hVW8xcfB.js"
+    },
+    {
+      "ref": "/chunks/chunk-bbipH1-x.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-bbipH1-x.js",
+      "status": 200,
+      "bytes": 203,
+      "fileName": "chunk-bbipH1-x.js"
+    },
+    {
+      "ref": "/chunks/chunk-BxmLuCw5.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BxmLuCw5.js",
+      "status": 200,
+      "bytes": 773,
+      "fileName": "chunk-BxmLuCw5.js"
+    },
+    {
+      "ref": "/chunks/chunk-B3EiQAPe.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-B3EiQAPe.js",
+      "status": 200,
+      "bytes": 19008,
+      "fileName": "chunk-B3EiQAPe.js"
+    },
+    {
+      "ref": "/chunks/chunk-BFcSYmSc.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BFcSYmSc.js",
+      "status": 200,
+      "bytes": 1571,
+      "fileName": "chunk-BFcSYmSc.js"
+    },
+    {
+      "ref": "/chunks/chunk-DRG80Dcj.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-DRG80Dcj.js",
+      "status": 200,
+      "bytes": 1281,
+      "fileName": "chunk-DRG80Dcj.js"
+    },
+    {
+      "ref": "/chunks/chunk-3h_nFuKs.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-3h_nFuKs.js",
+      "status": 200,
+      "bytes": 1155,
+      "fileName": "chunk-3h_nFuKs.js"
+    },
+    {
+      "ref": "/chunks/chunk-BSCFk0oP.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BSCFk0oP.js",
+      "status": 200,
+      "bytes": 276,
+      "fileName": "chunk-BSCFk0oP.js"
+    },
+    {
+      "ref": "/chunks/chunk-mFPfmgiH.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-mFPfmgiH.js",
+      "status": 200,
+      "bytes": 7679,
+      "fileName": "chunk-mFPfmgiH.js"
+    },
+    {
+      "ref": "/chunks/chunk-BnUjm_JW.js",
+      "url": "https://nuevo-portal.conservador.cl/chunks/chunk-BnUjm_JW.js",
+      "status": 200,
+      "bytes": 5038,
+      "fileName": "chunk-BnUjm_JW.js"
+    }
+  ],
+  "endpointCount": 68,
+  "endpointsByCategory": {
+    "auth": [
+      "/api/v1/auth/refresh",
+      "/v1/auth/login",
+      "/v1/auth/logout",
+      "/v1/auth/refresh"
+    ],
+    "startup": [
+      "/api/v1/home/start"
+    ],
+    "other": [
+      "/v1/account/activation",
+      "/v1/account/create",
+      "/v1/account/resend-activation-email",
+      "/v1/account/resetpass",
+      "/v1/account/resetpass-request",
+      "/v1/account/resetpass-verify",
+      "/v1/cart/price",
+      "/v1/cart/solicitarTxPagoDiferencia",
+      "/v1/cart/tx",
+      "/v1/extras/",
+      "/v1/notarioElectronico",
+      "/v1/pago-complementario",
+      "/v1/pago/diferencia",
+      "/v1/pago/tx",
+      "/v1/planos/base-data",
+      "/v1/planos/buscar",
+      "/v1/planos/descargarResolucion",
+      "/v1/planos/verPlano",
+      "/v1/planos/verPlano?key=",
+      "/v1/reingreso/finalizar",
+      "/v1/reingreso/iniciar",
+      "/v1/status",
+      "/v1/verificacion-funcionario"
+    ],
+    "commerce": [
+      "/v1/comercio/indice/fnaTicket",
+      "/v1/comercio/indice/img",
+      "/v1/comercio/indice/img/",
+      "/v1/comercio/indice/imgTomo",
+      "/v1/comercio/indice/texto",
+      "/v1/comercio/validaPlazoSocial"
+    ],
+    "online-query": [
+      "/v1/consulta-en-linea/estado",
+      "/v1/consulta-en-linea/verifica-doc/obtenerDocumento",
+      "/v1/consulta-en-linea/verifica-doc/validaCodigo"
+    ],
+    "documents": [
+      "/v1/documentos/consultar"
+    ],
+    "fna-verification": [
+      "/v1/fna/verifica/"
+    ],
+    "electronic-notary": [
+      "/v1/notarioElectronico/verifica"
+    ],
+    "property": [
+      "/v1/propiedad/indice/base",
+      "/v1/propiedad/indice/fna",
+      "/v1/propiedad/indice/img",
+      "/v1/propiedad/indice/texto",
+      "/v1/propiedad/indice/texto-extra-features",
+      "/v1/propiedad/inscripcionCalculaRequerimiento",
+      "/v1/propiedad/inscripcionPrice"
+    ],
+    "user": [
+      "/v1/user/account/caratula",
+      "/v1/user/account/caratulas",
+      "/v1/user/account/cci/cantidadCaratulasEstadosPorUsuarioCciAndPeriodo",
+      "/v1/user/account/cci/cantidadCaratulasMensualPorUsuarioCciAndAnio",
+      "/v1/user/account/cci/obtenerCaratulasPorUsuarioCciPaginado",
+      "/v1/user/account/editarPassword",
+      "/v1/user/account/editarPerfil",
+      "/v1/user/account/estado-masivo",
+      "/v1/user/account/estado-masivo/deleteBulk",
+      "/v1/user/account/estado-masivo/exportar/",
+      "/v1/user/account/estado-masivo/save",
+      "/v1/user/account/operaciones-masivas/finalizar",
+      "/v1/user/account/operaciones-masivas/valida",
+      "/v1/user/account/tx",
+      "/v1/user/account/txs",
+      "/v1/user/me",
+      "/v1/user/receiver/email",
+      "/v1/user/receiver/emailCrud",
+      "/v1/user/receiver/ticket",
+      "/v1/user/receiver/ticketCrud",
+      "/v1/user/receiver/ticketToEdit"
+    ]
+  },
+  "endpointDetails": [
+    {
+      "endpoint": "/api/v1/auth/refresh",
+      "category": "auth"
+    },
+    {
+      "endpoint": "/api/v1/home/start",
+      "category": "startup"
+    },
+    {
+      "endpoint": "/v1/account/activation",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/account/create",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/account/resend-activation-email",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/account/resetpass",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/account/resetpass-request",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/account/resetpass-verify",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/auth/login",
+      "category": "auth"
+    },
+    {
+      "endpoint": "/v1/auth/logout",
+      "category": "auth"
+    },
+    {
+      "endpoint": "/v1/auth/refresh",
+      "category": "auth"
+    },
+    {
+      "endpoint": "/v1/cart/price",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/cart/solicitarTxPagoDiferencia",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/cart/tx",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/comercio/indice/fnaTicket",
+      "category": "commerce"
+    },
+    {
+      "endpoint": "/v1/comercio/indice/img",
+      "category": "commerce"
+    },
+    {
+      "endpoint": "/v1/comercio/indice/img/",
+      "category": "commerce"
+    },
+    {
+      "endpoint": "/v1/comercio/indice/imgTomo",
+      "category": "commerce"
+    },
+    {
+      "endpoint": "/v1/comercio/indice/texto",
+      "category": "commerce"
+    },
+    {
+      "endpoint": "/v1/comercio/validaPlazoSocial",
+      "category": "commerce"
+    },
+    {
+      "endpoint": "/v1/consulta-en-linea/estado",
+      "category": "online-query"
+    },
+    {
+      "endpoint": "/v1/consulta-en-linea/verifica-doc/obtenerDocumento",
+      "category": "online-query"
+    },
+    {
+      "endpoint": "/v1/consulta-en-linea/verifica-doc/validaCodigo",
+      "category": "online-query"
+    },
+    {
+      "endpoint": "/v1/documentos/consultar",
+      "category": "documents"
+    },
+    {
+      "endpoint": "/v1/extras/",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/fna/verifica/",
+      "category": "fna-verification"
+    },
+    {
+      "endpoint": "/v1/notarioElectronico",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/notarioElectronico/verifica",
+      "category": "electronic-notary"
+    },
+    {
+      "endpoint": "/v1/pago-complementario",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/pago/diferencia",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/pago/tx",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/planos/base-data",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/planos/buscar",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/planos/descargarResolucion",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/planos/verPlano",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/planos/verPlano?key=",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/propiedad/indice/base",
+      "category": "property"
+    },
+    {
+      "endpoint": "/v1/propiedad/indice/fna",
+      "category": "property"
+    },
+    {
+      "endpoint": "/v1/propiedad/indice/img",
+      "category": "property"
+    },
+    {
+      "endpoint": "/v1/propiedad/indice/texto",
+      "category": "property"
+    },
+    {
+      "endpoint": "/v1/propiedad/indice/texto-extra-features",
+      "category": "property"
+    },
+    {
+      "endpoint": "/v1/propiedad/inscripcionCalculaRequerimiento",
+      "category": "property"
+    },
+    {
+      "endpoint": "/v1/propiedad/inscripcionPrice",
+      "category": "property"
+    },
+    {
+      "endpoint": "/v1/reingreso/finalizar",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/reingreso/iniciar",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/status",
+      "category": "other"
+    },
+    {
+      "endpoint": "/v1/user/account/caratula",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/account/caratulas",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/account/cci/cantidadCaratulasEstadosPorUsuarioCciAndPeriodo",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/account/cci/cantidadCaratulasMensualPorUsuarioCciAndAnio",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/account/cci/obtenerCaratulasPorUsuarioCciPaginado",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/account/editarPassword",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/account/editarPerfil",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/account/estado-masivo",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/account/estado-masivo/deleteBulk",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/account/estado-masivo/exportar/",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/account/estado-masivo/save",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/account/operaciones-masivas/finalizar",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/account/operaciones-masivas/valida",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/account/tx",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/account/txs",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/me",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/receiver/email",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/receiver/emailCrud",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/receiver/ticket",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/receiver/ticketCrud",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/user/receiver/ticketToEdit",
+      "category": "user"
+    },
+    {
+      "endpoint": "/v1/verificacion-funcionario",
+      "category": "other"
+    }
+  ],
+  "routeCount": 32,
+  "routeDetails": [
+    {
+      "route": "/carro"
+    },
+    {
+      "route": "/consultas-en-linea"
+    },
+    {
+      "route": "/consultas-en-linea/planos/viewer"
+    },
+    {
+      "route": "/informacion"
+    },
+    {
+      "route": "/pago-complementario"
+    },
+    {
+      "route": "/registro"
+    },
+    {
+      "route": "/tramites-en-linea"
+    },
+    {
+      "route": "/tramites-en-linea/copias-y-certificados"
+    },
+    {
+      "route": "/usuario"
+    },
+    {
+      "route": "/usuario/mi-cuenta"
+    },
+    {
+      "route": "/usuario/mi-cuenta/alzamiento-tgr"
+    },
+    {
+      "route": "/usuario/mi-cuenta/caratulas"
+    },
+    {
+      "route": "/usuario/mi-cuenta/caratulas-express"
+    },
+    {
+      "route": "/usuario/mi-cuenta/caratulas/"
+    },
+    {
+      "route": "/usuario/mi-cuenta/caratulas/:numeroCaratula"
+    },
+    {
+      "route": "/usuario/mi-cuenta/caratulas/${s.value}"
+    },
+    {
+      "route": "/usuario/mi-cuenta/compras"
+    },
+    {
+      "route": "/usuario/mi-cuenta/compras/"
+    },
+    {
+      "route": "/usuario/mi-cuenta/compras/:idTransaccion"
+    },
+    {
+      "route": "/usuario/mi-cuenta/cuenta-corriente-integrada"
+    },
+    {
+      "route": "/usuario/mi-cuenta/embargo-tgr"
+    },
+    {
+      "route": "/usuario/mi-cuenta/estado-masivo"
+    },
+    {
+      "route": "/usuario/mi-cuenta/folio-mercantil-electronico"
+    },
+    {
+      "route": "/usuario/mi-cuenta/indice-propiedad-avanzado"
+    },
+    {
+      "route": "/usuario/mi-cuenta/inscripcion-dga"
+    },
+    {
+      "route": "/usuario/mi-cuenta/notificaciones-correo"
+    },
+    {
+      "route": "/usuario/mi-cuenta/operaciones-masivas"
+    },
+    {
+      "route": "/usuario/mi-cuenta/perfil"
+    },
+    {
+      "route": "/usuario/mi-cuenta/titulares-boleta"
+    },
+    {
+      "route": "/verificacion_documentos"
+    },
+    {
+      "route": "/verificacion-de-documentos"
+    },
+    {
+      "route": "/verificacion-funcionario"
+    }
+  ],
+  "externalHosts": [
+    "http://www.conservadores.cl",
+    "http://www.example.com",
+    "http://www.w3.org",
+    "https://310313dd1dc70b821f6f6f1d36bcd063",
+    "https://analytics.conservador.cl",
+    "https://cbrs-masivo.netlify.app",
+    "https://conservador.cl",
+    "https://conservadores.cl",
+    "https://dummy.com",
+    "https://github.com",
+    "https://goo.gl",
+    "https://maps.app.goo.gl",
+    "https://plausible.io",
+    "https://policies.google.com",
+    "https://raw.githubusercontent.com",
+    "https://tgr.cl",
+    "https://v3-migration.vuejs.org",
+    "https://via.placeholder.com",
+    "https://vuejs.org",
+    "https://wa.me",
+    "https://web.facebook.com",
+    "https://www.google.com",
+    "https://www.instagram.com",
+    "https://www.linkedin.com",
+    "https://www.poderjudicialtv.cl",
+    "https://www.tgr.cl",
+    "https://x.com",
+    "https://zeus.sii.cl"
+  ],
+  "note": "Raw downloaded bundles were used only in a temporary directory for extraction and were removed after writing this summary."
+}
