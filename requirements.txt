@@ -1,0 +1,8 @@
+playwright
+python-dotenv
+curl_cffi
+beautifulsoup4
+supabase
+tqdm
+httpx[http2]
+Pillow
