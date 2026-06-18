@@ -13,6 +13,7 @@ from cbrs.soak import (
     load_soak_config,
     next_interval_seconds,
     run_soak,
+    _heartbeat_while_cycle_runs,
 )
 from cbrs.soak_dashboard import start_dashboard
 from cbrs.validation import ValidationRunResult
@@ -124,6 +125,56 @@ def test_status_counts_only_latest_run(tmp_path: Path) -> None:
     assert status["run"]["run_id"] == second.run_id
     assert status["stats"]["total_cycles"] == 1
     assert len(status["artifacts"]) == 1
+
+
+def test_success_rate_ignores_current_running_cycle(tmp_path: Path) -> None:
+    settings = load_settings(
+        {
+            "CBRS_PROFILE_DIR": ".cbrs/chrome-profile",
+            "CBRS_OUTPUT_DIR": "outputs",
+        },
+        root=tmp_path,
+    )
+    store = SoakStore(tmp_path / ".cbrs" / "soak" / "soak.sqlite3")
+    config = _fast_config()
+    run_id = "run-success-rate"
+    store.create_run(run_id=run_id, dry_run=False, config=config, dashboard_url=None)
+    store.start_cycle(
+        cycle_id="cycle-1",
+        run_id=run_id,
+        sequence=1,
+        target=config.targets[0],
+    )
+    store.finish_cycle("cycle-1", status="passed", started_at_monotonic=0, result_count=1)
+    store.start_cycle(
+        cycle_id="cycle-2",
+        run_id=run_id,
+        sequence=2,
+        target=config.targets[0],
+    )
+
+    status = dashboard_status(store)
+
+    assert status["stats"]["total_cycles"] == 2
+    assert status["stats"]["success_rate"] == 1.0
+    assert status["stats"]["consecutive_successes"] == 1
+
+
+def test_cycle_heartbeat_updates_run_while_cycle_is_active(tmp_path: Path) -> None:
+    store = SoakStore(tmp_path / ".cbrs" / "soak" / "soak.sqlite3")
+    config = _fast_config()
+    run_id = "run-heartbeat"
+    store.create_run(run_id=run_id, dry_run=False, config=config, dashboard_url=None)
+    before = store.latest_run()["heartbeat_at"]
+    import time
+
+    time.sleep(1.05)
+
+    with _heartbeat_while_cycle_runs(store, run_id, interval_seconds=0.01):
+        time.sleep(0.04)
+
+    after = store.latest_run()["heartbeat_at"]
+    assert after > before
 
 
 def test_safety_stop_blocks_future_cycles_and_redacts_error(tmp_path: Path) -> None:

@@ -4,7 +4,9 @@ import json
 import random
 import secrets
 import sqlite3
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -524,22 +526,23 @@ def run_soak(
                 data={"target_label": target.label, "target_kind": target.kind},
             )
 
-            result = (
-                _dry_run_validation(settings, target, output_dir)
-                if dry_run
-                else validation_runner(
-                    settings=settings,
-                    search_kind=target.kind,
-                    query=target.query,
-                    foja=target.foja,
-                    numero=target.numero,
-                    ano=target.ano,
-                    download_first=True,
-                    output_dir=output_dir,
-                    keep_images=False,
-                    headless=headless,
+            with _heartbeat_while_cycle_runs(store, run_id):
+                result = (
+                    _dry_run_validation(settings, target, output_dir)
+                    if dry_run
+                    else validation_runner(
+                        settings=settings,
+                        search_kind=target.kind,
+                        query=target.query,
+                        foja=target.foja,
+                        numero=target.numero,
+                        ano=target.ano,
+                        download_first=True,
+                        output_dir=output_dir,
+                        keep_images=False,
+                        headless=headless,
+                    )
                 )
-            )
             cycle_status = _cycle_status(result)
             store.finish_cycle(
                 cycle_id,
@@ -652,8 +655,12 @@ def dashboard_status(store: SoakStore) -> dict[str, Any]:
     failed = sum(1 for cycle in cycles if cycle["status"] == "failed")
     blocked = sum(1 for cycle in cycles if cycle["status"] == "blocked")
     total = len(cycles)
+    completed_cycles = [
+        cycle for cycle in cycles if cycle["status"] in {"passed", "failed", "blocked"}
+    ]
+    completed_total = len(completed_cycles)
     consecutive_successes = 0
-    for cycle in cycles:
+    for cycle in completed_cycles:
         if cycle["status"] == "passed":
             consecutive_successes += 1
         else:
@@ -669,7 +676,7 @@ def dashboard_status(store: SoakStore) -> dict[str, Any]:
             "passed_cycles": passed,
             "failed_cycles": failed,
             "safety_stops": blocked,
-            "success_rate": round(passed / total, 4) if total else None,
+            "success_rate": round(passed / completed_total, 4) if completed_total else None,
             "consecutive_successes": consecutive_successes,
             "downloads": sum(int(cycle["download_count"] or 0) for cycle in cycles),
             "heartbeat_age_seconds": heartbeat_age,
@@ -800,6 +807,28 @@ def _cycle_status(result: ValidationRunResult) -> str:
     if result.exit_code == 2:
         return "blocked"
     return "failed"
+
+
+@contextmanager
+def _heartbeat_while_cycle_runs(
+    store: SoakStore,
+    run_id: str,
+    *,
+    interval_seconds: float = 30.0,
+):
+    stop_event = threading.Event()
+
+    def heartbeat() -> None:
+        while not stop_event.wait(interval_seconds):
+            store.update_run(run_id, status="running", next_cycle_at="")
+
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        thread.join(timeout=2.0)
 
 
 def _sleep_with_heartbeat(
