@@ -82,18 +82,6 @@ python -m cbrs soak stop
 - Detiene el flujo ante señales de seguridad como límite diario, CAPTCHA,
   errores WAF, drift de egreso o falta de sesión.
 
-## Caveats
-
-- El portal impone límites diarios de consulta; cuando responde `err-limite`, el
-  sistema se pausa y no sigue consultando.
-- El login es manual; no se guardan credenciales ni se automatiza el ingreso.
-- La confiabilidad depende de mantener el mismo perfil de navegador y un egreso
-  estable/autorizado.
-- El monitor local no aumenta tráfico por sí solo, pero el runner de soak sí
-  ejecuta ciclos reales cuando está activo.
-- No hay rotación de cuentas, rotación de IP, resolución externa de CAPTCHA ni
-  reintentos agresivos.
-
 ## Mejoras Sobre los Scripts Originales
 
 - Se reemplazó el flujo basado en credenciales y rotación por login manual con
@@ -110,6 +98,18 @@ python -m cbrs soak stop
 - Se añadió cobertura de pruebas para configuración, seguridad, preflight,
   validación, PDFs, runtime de navegador y soak.
 
+## Caveats
+
+- El portal impone límites diarios de consulta; cuando responde `err-limite`, el
+  sistema se pausa y no sigue consultando.
+- El login es manual; no se guardan credenciales ni se automatiza el ingreso.
+- La confiabilidad depende de mantener el mismo perfil de navegador y un egreso
+  estable/autorizado.
+- El monitor local no aumenta tráfico por sí solo, pero el runner de soak sí
+  ejecuta ciclos reales cuando está activo.
+- No hay rotación de cuentas, rotación de IP, resolución externa de CAPTCHA ni
+  reintentos agresivos.
+
 ## Áreas a Explorar
 
 - Confirmar con CBRS o el cliente un modelo oficial de acceso, cuota o
@@ -120,3 +120,4 @@ python -m cbrs soak stop
 - Evaluar egreso dedicado/cliente si la red actual no es el ambiente final.
 - Separar un modo de prueba completamente offline con fixtures para demos sin
   tocar el portal real.
+
