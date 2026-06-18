@@ -367,6 +367,12 @@ def test_dashboard_root_contains_screenshot_evidence_ui(tmp_path: Path) -> None:
     assert "iconLibrary" in html
     assert "Resumen de resultados" in html
     assert "Línea de ciclos" in html
+    assert "Estado en vivo" in html
+    assert "Próximo ciclo en" in html
+    assert "liveNextCountdown" in html
+    assert "updateStatusBadges" in html
+    assert "en espera ·" in html
+    assert "waitProgressBar" in html
     assert "safetyAlert" in html
     assert "Parada crítica de seguridad" in html
     assert "donut" in html

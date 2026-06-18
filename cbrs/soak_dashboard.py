@@ -333,6 +333,58 @@ def _dashboard_html() -> str:
       max-width: 850px;
     }
     .snapshot-subtitle { color: var(--muted); max-width: 720px; font-size: 15px; line-height: 1.45; }
+    .live-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+      max-width: 820px;
+    }
+    .live-pill {
+      background: rgba(255,255,255,.82);
+      border: 1px solid rgba(215,222,232,.95);
+      border-radius: 8px;
+      padding: 10px;
+      min-width: 0;
+    }
+    .live-pill.primary {
+      background: linear-gradient(135deg, rgba(255, 244, 222, .96), rgba(255,255,255,.9));
+      border-color: rgba(183, 110, 0, .35);
+    }
+    .live-pill .label {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 750;
+      text-transform: uppercase;
+    }
+    .live-pill .value {
+      margin-top: 5px;
+      font-size: 18px;
+      line-height: 1.15;
+      font-weight: 850;
+      overflow-wrap: anywhere;
+    }
+    .live-pill .subvalue {
+      margin-top: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      min-height: 15px;
+    }
+    .live-progress {
+      height: 7px;
+      margin-top: 9px;
+      border-radius: 99px;
+      background: #eef2f7;
+      overflow: hidden;
+    }
+    .live-progress span {
+      display: block;
+      height: 100%;
+      width: 0%;
+      border-radius: inherit;
+      background: var(--warn);
+      transition: width .3s ease;
+    }
     .proof-strip {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -512,11 +564,11 @@ def _dashboard_html() -> str:
     @media (max-width: 900px) {
       header { align-items: flex-start; flex-direction: column; }
       .hero, .visual-grid { grid-template-columns: 1fr; }
-      .kpi-grid, .proof-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .kpi-grid, .proof-strip, .live-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 560px) {
       main { padding: 14px; }
-      .kpi-grid, .proof-strip { grid-template-columns: 1fr; }
+      .kpi-grid, .proof-strip, .live-strip { grid-template-columns: 1fr; }
       .donut-wrap { grid-template-columns: 1fr; }
       table { display: block; overflow-x: auto; white-space: nowrap; }
     }
@@ -554,6 +606,24 @@ def _dashboard_html() -> str:
             <div class="snapshot-title">Evidencia actual</div>
             <h2 id="headline">Cargando evidencia de la prueba</h2>
             <div id="headlineSub" class="snapshot-subtitle">El panel está cargando el estado más reciente.</div>
+            <div class="live-strip">
+              <div class="live-pill">
+                <div class="label">Estado en vivo</div>
+                <div id="liveStateValue" class="value">-</div>
+                <div id="liveStateNote" class="subvalue">-</div>
+              </div>
+              <div class="live-pill primary">
+                <div class="label">Próximo ciclo en</div>
+                <div id="liveNextCountdown" class="value">-</div>
+                <div id="liveNextAt" class="subvalue">-</div>
+                <div class="live-progress"><span id="waitProgressBar"></span></div>
+              </div>
+              <div class="live-pill">
+                <div class="label">Latido</div>
+                <div id="liveHeartbeat" class="value">-</div>
+                <div id="liveHeartbeatNote" class="subvalue">-</div>
+              </div>
+            </div>
           </div>
           <span id="heroStatus" class="status">cargando</span>
         </div>
@@ -656,6 +726,17 @@ def _dashboard_html() -> str:
       return `${s}s`;
     };
     const localTime = (value) => value ? new Date(value).toLocaleString() : "-";
+    const parseTime = (value) => value ? new Date(value).getTime() : null;
+    const secondsUntil = (value) => {
+      const target = parseTime(value);
+      if (!target) return null;
+      return Math.max(0, Math.ceil((target - Date.now()) / 1000));
+    };
+    const secondsSinceClient = (value) => {
+      const target = parseTime(value);
+      if (!target) return null;
+      return Math.max(0, Math.floor((Date.now() - target) / 1000));
+    };
     const fileName = (path) => path ? path.split(/[\\\\/]/).pop() : "";
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
       "&": "&amp;",
@@ -703,6 +784,8 @@ def _dashboard_html() -> str:
     const statusBadge = (status) => `<span class="badge ${status || ""}">${escapeHtml(statusLabel(status))}</span>`;
     const pct = (value) => value === null || value === undefined ? "-" : `${Math.round(value * 100)}%`;
     const latestCycle = (cycles) => (cycles || [])[0] || null;
+    const latestCompletedCycle = (cycles) => (cycles || []).find((cycle) => ["passed", "failed", "blocked"].includes(cycle.status)) || null;
+    const activeCycle = (cycles) => (cycles || []).find((cycle) => ["running", "waiting"].includes(cycle.status)) || null;
     const statusCounts = (cycles) => {
       const counts = { passed: 0, failed: 0, blocked: 0, running: 0, waiting: 0 };
       for (const cycle of cycles || []) counts[cycle.status] = (counts[cycle.status] || 0) + 1;
@@ -713,6 +796,90 @@ def _dashboard_html() -> str:
       if (data.status === "blocked" || data.status === "stale") return "bad";
       if (data.status === "waiting") return "warn";
       return "ok";
+    };
+    let currentStatusData = null;
+    const waitProgressPercent = (data) => {
+      const run = data.run || {};
+      if (data.status !== "waiting" || !run.next_cycle_at) return data.status === "running" ? 100 : 0;
+      const completed = latestCompletedCycle(data.cycles || []);
+      const startMs = parseTime((completed || {}).finished_at || run.started_at);
+      const endMs = parseTime(run.next_cycle_at);
+      if (!startMs || !endMs || endMs <= startMs) return 0;
+      return Math.max(0, Math.min(100, ((Date.now() - startMs) / (endMs - startMs)) * 100));
+    };
+    const updateStatusBadges = (data, label) => {
+      for (const id of ["status", "heroStatus"]) {
+        const element = document.getElementById(id);
+        element.textContent = label;
+        element.className = `status ${data.status || ""}`;
+      }
+    };
+    const renderRealtime = () => {
+      const data = currentStatusData;
+      if (!data) return;
+      const stats = data.stats || {};
+      const run = data.run || {};
+      const cycles = data.cycles || [];
+      const active = activeCycle(cycles);
+      const completed = latestCompletedCycle(cycles);
+      const nextSeconds = secondsUntil(run.next_cycle_at);
+      const heartbeatSeconds = secondsSinceClient(run.heartbeat_at);
+      const cycleAge = active ? secondsSinceClient(active.started_at) : null;
+      const uptimeSeconds = secondsSinceClient(run.started_at) ?? stats.uptime_seconds;
+
+      let headline = screenshotHeadline(data);
+      let subtitle = data.run
+        ? `La última ejecución tiene ${stats.total_cycles || 0} ciclo(s), ${stats.downloads || 0} PDF(s) generado(s) y ${stats.safety_stops || 0} parada(s) de seguridad.`
+        : "Abre el panel ahora e inicia la prueba continua cuando estés listo.";
+      let liveState = statusLabel(data.status);
+      let liveStateNote = active ? `ciclo #${active.sequence}` : completed ? `último ciclo #${completed.sequence}` : "-";
+      let nextCountdown = "-";
+      let nextAt = run.next_cycle_at ? localTime(run.next_cycle_at) : "-";
+      let badgeLabel = statusLabel(data.status);
+      let proofNext = nextAt;
+
+      if (data.status === "waiting" && nextSeconds !== null) {
+        headline = `En espera: próximo ciclo en ${fmtSeconds(nextSeconds)}`;
+        subtitle = completed
+          ? `Último ciclo ${statusLabel(completed.status)}. La próxima consulta está programada para ${localTime(run.next_cycle_at)}.`
+          : `La próxima consulta está programada para ${localTime(run.next_cycle_at)}.`;
+        liveState = "en espera";
+        liveStateNote = completed ? `último ciclo #${completed.sequence} ${statusLabel(completed.status)}` : "sin ciclo previo";
+        nextCountdown = fmtSeconds(nextSeconds);
+        badgeLabel = `en espera · ${fmtSeconds(nextSeconds)}`;
+        proofNext = `${fmtSeconds(nextSeconds)} (${localTime(run.next_cycle_at)})`;
+      } else if (data.status === "running" && active) {
+        headline = `Ejecutando ciclo #${active.sequence}`;
+        subtitle = `Ciclo activo hace ${fmtSeconds(cycleAge)}. El latido confirma que el proceso sigue vivo.`;
+        liveState = "ejecutando";
+        liveStateNote = `ciclo #${active.sequence} activo hace ${fmtSeconds(cycleAge)}`;
+        nextCountdown = "en curso";
+        nextAt = "se calculará al finalizar";
+        badgeLabel = `ejecutando · ${fmtSeconds(cycleAge)}`;
+        proofNext = "se calculará al finalizar";
+      } else if (data.status === "blocked") {
+        nextCountdown = "pausado";
+        nextAt = "requiere revisión";
+        proofNext = "requiere revisión";
+      } else if (data.status === "stopped" || data.status === "completed") {
+        nextCountdown = "-";
+        nextAt = "sin próximo ciclo";
+        proofNext = "sin próximo ciclo";
+      }
+
+      document.getElementById("headline").textContent = headline;
+      document.getElementById("headlineSub").textContent = subtitle;
+      document.getElementById("liveStateValue").textContent = liveState;
+      document.getElementById("liveStateNote").textContent = liveStateNote;
+      document.getElementById("liveNextCountdown").textContent = nextCountdown;
+      document.getElementById("liveNextAt").textContent = nextAt;
+      document.getElementById("liveHeartbeat").textContent = heartbeatSeconds === null ? "-" : `hace ${fmtSeconds(heartbeatSeconds)}`;
+      document.getElementById("liveHeartbeatNote").textContent = heartbeatSeconds !== null && heartbeatSeconds <= 45 ? "proceso vivo" : "revisar si no cambia";
+      document.getElementById("waitProgressBar").style.width = `${waitProgressPercent(data).toFixed(1)}%`;
+      document.getElementById("alive").textContent = fmtSeconds(uptimeSeconds);
+      document.getElementById("aliveNote").textContent = heartbeatSeconds === null ? "Latido no disponible" : `Último latido hace ${fmtSeconds(heartbeatSeconds)}`;
+      document.getElementById("nextCycleProof").textContent = proofNext || "-";
+      updateStatusBadges(data, badgeLabel);
     };
     const screenshotHeadline = (data) => {
       const stats = data.stats || {};
@@ -800,6 +967,7 @@ def _dashboard_html() -> str:
     async function refresh() {
       const response = await fetch("/api/status", { cache: "no-store" });
       const data = await response.json();
+      currentStatusData = data;
       const status = document.getElementById("status");
       status.textContent = statusLabel(data.status);
       status.className = `status ${data.status || ""}`;
@@ -811,14 +979,9 @@ def _dashboard_html() -> str:
       const stopButton = document.getElementById("stopButton");
       stopButton.disabled = !canStop;
       renderAlert(data);
-      document.getElementById("alive").textContent = fmtSeconds(stats.uptime_seconds);
       document.getElementById("success").textContent = pct(stats.success_rate);
       document.getElementById("downloads").textContent = stats.downloads ?? "-";
       document.getElementById("safetyStops").textContent = stats.safety_stops ?? "-";
-      document.getElementById("headline").textContent = screenshotHeadline(data);
-      document.getElementById("headlineSub").textContent = data.run
-        ? `La última ejecución tiene ${stats.total_cycles || 0} ciclo(s), ${stats.downloads || 0} PDF(s) generado(s) y ${stats.safety_stops || 0} parada(s) de seguridad.`
-        : "Abre el panel ahora e inicia la prueba continua cuando estés listo.";
       document.getElementById("runId").textContent = data.run ? data.run.run_id : "-";
       document.getElementById("startedAt").textContent = data.run ? localTime(data.run.started_at) : "-";
       const last = latestCycle(data.cycles);
@@ -831,7 +994,6 @@ def _dashboard_html() -> str:
       document.getElementById("downloadIcon").innerHTML = icon("download");
       document.getElementById("shieldIcon").className = `icon ${(stats.safety_stops || 0) ? "bad" : "ok"}`;
       document.getElementById("shieldIcon").innerHTML = (stats.safety_stops || 0) ? icon("alert") : icon("shield");
-      document.getElementById("aliveNote").textContent = `Edad del latido ${fmtSeconds(stats.heartbeat_age_seconds)}`;
       document.getElementById("successNote").textContent = `${stats.passed_cycles || 0} correctos / ${stats.total_cycles || 0} total`;
       document.getElementById("downloadsNote").textContent = `${stats.downloads || 0} enlace(s) de archivo en la última ejecución`;
       document.getElementById("safetyNote").textContent = (stats.safety_stops || 0) ? "Revisar el motivo antes de continuar" : "Sin paradas críticas en la última ejecución";
@@ -867,9 +1029,11 @@ def _dashboard_html() -> str:
         <td>${escapeHtml(levelLabel(event.level))}</td>
         <td>${escapeHtml(eventMessageLabel(event.message))}</td>
       </tr>`).join("");
+      renderRealtime();
     }
     document.getElementById("stopButton").addEventListener("click", requestStop);
     refresh();
+    setInterval(renderRealtime, 1000);
     setInterval(refresh, 5000);
   </script>
 </body>
