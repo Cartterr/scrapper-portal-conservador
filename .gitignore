@@ -1,0 +1,13 @@
+.cbrs/
+.env
+.env.local
+output/
+*.har
+*.jwt
+*.cookie
+*.cookies
+*.session.json
+*.storage_state.json
+__pycache__/
+.pytest_cache/
+.pytest_tmp/

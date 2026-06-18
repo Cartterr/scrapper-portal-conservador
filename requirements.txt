@@ -1,8 +1,5 @@
-playwright
+playwright==1.60.0
 python-dotenv
 curl_cffi
-beautifulsoup4
-supabase
-tqdm
-httpx[http2]
 Pillow
+pytest

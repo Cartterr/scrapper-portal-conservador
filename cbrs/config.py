@@ -1,101 +1,189 @@
+from __future__ import annotations
+
 import os
-import re
-import shutil
-import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping
 
 from dotenv import dotenv_values
 
-# Load .env with override so USER isn't shadowed by system env
-_env = dotenv_values()
+DEFAULT_BASE_URL = "https://nuevo-portal.conservador.cl"
+COMMERCE_ROUTE = "/consultas-en-linea/indices/indice-del-registro-de-comercio"
+DEFAULT_RECAPTCHA_SITEKEY = "6Le-eiksAAAAANU-0ITcjxvGfFoHsz40juvUVI_-"
 
-BASE_URL = "https://nuevo-portal.conservador.cl"
-
-# reCAPTCHA Enterprise
-RECAPTCHA_SITEKEY = "6Le-eiksAAAAANU-0ITcjxvGfFoHsz40juvUVI_-"
-
-# CapSolver (optional — for HTTP-only scraping experiments)
-CAPSOLVER_API_KEY = _env.get("CAPSOLVER_API_KEY") or os.getenv("CAPSOLVER_API_KEY")
-
-
-# --- Chrome version detection ---
-# Detect the real Chrome version so Playwright UA, curl_cffi impersonation,
-# and sec-ch-ua headers all stay consistent with navigator.userAgentData.
-
-def _detect_chrome_major() -> int:
-    """Return the major version of the system Chrome, or 120 as fallback."""
-    chrome = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
-    if chrome:
-        try:
-            out = subprocess.run(
-                [chrome, "--version"], capture_output=True, text=True, timeout=5
-            )
-            m = re.search(r"(\d+)\.", out.stdout)
-            if m:
-                return int(m.group(1))
-        except Exception:
-            pass
-    return 120
-
-
-def _best_curl_cffi_impersonate(major: int) -> str:
-    """Pick the highest curl_cffi chrome impersonation <= the real version."""
-    from curl_cffi.requests import Session
-
-    # Versions curl_cffi is known to support (sorted ascending)
-    candidates = [116, 119, 120, 123, 124, 126, 127, 128, 130, 131]
-    best = 120
-    for v in candidates:
-        if v <= major:
-            try:
-                Session(impersonate=f"chrome{v}").close()
-                best = v
-            except Exception:
-                pass
-    return f"chrome{best}"
-
-
-CHROME_MAJOR = _detect_chrome_major()
-CURL_CFFI_IMPERSONATE = _best_curl_cffi_impersonate(CHROME_MAJOR)
-
-# Credentials (prefer .env values, fall back to os.environ)
-USER_EMAIL = _env.get("USER") or os.getenv("USER")
-USER_PASSWORD = _env.get("PASSWORD") or os.getenv("PASSWORD")
-
-# Multi-account support: parse USER_N / PASSWORD_N pairs from .env
-ACCOUNTS: list[dict] = []
-for i in range(1, 100):
-    email = _env.get(f"USER_{i}") or os.getenv(f"USER_{i}")
-    password = _env.get(f"PASSWORD_{i}") or os.getenv(f"PASSWORD_{i}")
-    if email and password:
-        ACCOUNTS.append({"email": email, "password": password})
-    else:
-        break
-
-# Fallback: if no numbered accounts, use the single USER/PASSWORD
-if not ACCOUNTS and USER_EMAIL and USER_PASSWORD:
-    ACCOUNTS.append({"email": USER_EMAIL, "password": USER_PASSWORD})
-
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    f"Chrome/{CHROME_MAJOR}.0.0.0 Safari/537.36"
+MIN_SAFE_DELAY_SECONDS = 3.5
+DEFAULT_REQUEST_DELAY_SECONDS = 5.0
+DEFAULT_BROWSER_BACKEND = "chrome"
+DEFAULT_HEADLESS = False
+DEFAULT_WINDOW_MODE = "normal"
+DEFAULT_EXPECTED_EGRESS_COUNTRY = "CL"
+ALLOWED_EGRESS_MODES = frozenset(
+    {
+        "client_vpn",
+        "client_office",
+        "dedicated_static_isp",
+    }
 )
+PERSONAL_DIRECT_EGRESS_MODE = "personal_direct"
+CLOAK_REQUIRED_VERSION = "0.3.31"
 
 
-# --- Proxy configuration ---
+@dataclass(frozen=True)
+class Settings:
+    base_url: str
+    commerce_route: str
+    recaptcha_sitekey: str
+    browser_backend: str
+    browser_executable_path: Path | None
+    headless: bool
+    window_mode: str
+    egress_mode: str
+    allow_personal_egress: bool
+    expected_egress_country: str
+    profile_dir: Path
+    cloak_cache_dir: Path
+    cloak_fingerprint_seed: str | None
+    cloak_proxy_url: str | None
+    allow_cloak_auto_update: bool
+    output_dir: Path
+    request_delay_seconds: float
+    use_curl_cffi_for_images: bool
+    curl_cffi_impersonate: str
 
-def get_proxy_config() -> dict | None:
-    """Load 2captcha proxy config from env. Returns Playwright proxy dict or None."""
-    host = _env.get("PROXY_2CAPTCHA_HOST") or os.getenv("PROXY_2CAPTCHA_HOST")
-    if not host:
+    @property
+    def commerce_url(self) -> str:
+        return f"{self.base_url}{self.commerce_route}"
+
+    def delay_seconds(self) -> float:
+        return self.request_delay_seconds
+
+
+def _merged_env(dotenv_path: str | Path = ".env") -> dict[str, str]:
+    file_values = {
+        key: value
+        for key, value in dotenv_values(dotenv_path).items()
+        if value is not None
+    }
+    return {**os.environ, **file_values}
+
+
+def _empty_to_none(value: str | None) -> str | None:
+    if value is None:
         return None
-    port = _env.get("PROXY_2CAPTCHA_PORT") or os.getenv("PROXY_2CAPTCHA_PORT", "8080")
-    protocol = _env.get("PROXY_2CAPTCHA_PROTOCOL") or os.getenv("PROXY_2CAPTCHA_PROTOCOL", "http")
-    username = _env.get("PROXY_2CAPTCHA_USER") or os.getenv("PROXY_2CAPTCHA_USER")
-    password = _env.get("PROXY_2CAPTCHA_PASS") or os.getenv("PROXY_2CAPTCHA_PASS")
-    proxy = {"server": f"{protocol}://{host}:{port}"}
-    if username:
-        proxy["username"] = username
-    if password:
-        proxy["password"] = password
-    return proxy
+    value = value.strip()
+    if not value or value.lower() in {"none", "null", "false"}:
+        return None
+    return value
+
+
+def _bool(value: str | None, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _float(value: str | None, *, default: float) -> float:
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid numeric setting: {value!r}") from exc
+
+
+def _path(value: str | None, *, default: str, root: Path) -> Path:
+    raw = value or default
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve()
+
+
+def _request_delay_seconds(env: Mapping[str, str]) -> float:
+    fixed_delay = env.get("CBRS_REQUEST_DELAY_SECONDS")
+    if fixed_delay not in (None, ""):
+        return max(
+            _float(fixed_delay, default=DEFAULT_REQUEST_DELAY_SECONDS),
+            MIN_SAFE_DELAY_SECONDS,
+        )
+
+    # Backward-compatible deterministic handling for old range settings:
+    # use the slower configured value inside the range.
+    legacy_values = [
+        _float(value, default=DEFAULT_REQUEST_DELAY_SECONDS)
+        for value in (
+            env.get("CBRS_REQUEST_DELAY_MIN_SECONDS"),
+            env.get("CBRS_REQUEST_DELAY_MAX_SECONDS"),
+        )
+        if value not in (None, "")
+    ]
+    return max(
+        legacy_values or [DEFAULT_REQUEST_DELAY_SECONDS],
+        key=float,
+    )
+
+
+def load_settings(
+    env: Mapping[str, str] | None = None,
+    *,
+    root: Path | None = None,
+) -> Settings:
+    root = (root or Path.cwd()).resolve()
+    env = dict(_merged_env(root / ".env") if env is None else env)
+    request_delay = max(_request_delay_seconds(env), MIN_SAFE_DELAY_SECONDS)
+    browser_backend = env.get("CBRS_BROWSER_BACKEND", DEFAULT_BROWSER_BACKEND).strip().lower()
+    default_profile_dir = (
+        ".cbrs/cloak-profile"
+        if browser_backend == "cloak"
+        else ".cbrs/chrome-profile"
+    )
+
+    return Settings(
+        base_url=env.get("CBRS_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
+        commerce_route=env.get("CBRS_COMMERCE_ROUTE", COMMERCE_ROUTE),
+        recaptcha_sitekey=env.get("CBRS_RECAPTCHA_SITEKEY", DEFAULT_RECAPTCHA_SITEKEY),
+        browser_backend=browser_backend,
+        browser_executable_path=(
+            _path(env.get("CBRS_BROWSER_EXECUTABLE_PATH"), default="", root=root)
+            if _empty_to_none(env.get("CBRS_BROWSER_EXECUTABLE_PATH"))
+            else None
+        ),
+        headless=_bool(env.get("CBRS_HEADLESS"), default=DEFAULT_HEADLESS),
+        window_mode=env.get("CBRS_WINDOW_MODE", DEFAULT_WINDOW_MODE).strip().lower(),
+        egress_mode=env.get("CBRS_EGRESS_MODE", "").strip().lower(),
+        allow_personal_egress=_bool(env.get("CBRS_ALLOW_PERSONAL_EGRESS")),
+        expected_egress_country=env.get(
+            "CBRS_EXPECTED_EGRESS_COUNTRY",
+            DEFAULT_EXPECTED_EGRESS_COUNTRY,
+        ).strip().upper(),
+        profile_dir=_path(
+            (
+                env.get("CBRS_CLOAK_PROFILE_DIR")
+                if browser_backend == "cloak"
+                else env.get("CBRS_PROFILE_DIR")
+            ),
+            default=default_profile_dir,
+            root=root,
+        ),
+        cloak_cache_dir=_path(
+            env.get("CBRS_CLOAK_CACHE_DIR"),
+            default=".cbrs/cloak-cache",
+            root=root,
+        ),
+        cloak_fingerprint_seed=_empty_to_none(env.get("CBRS_CLOAK_FINGERPRINT_SEED")),
+        cloak_proxy_url=_empty_to_none(env.get("CBRS_CLOAK_PROXY_URL")),
+        allow_cloak_auto_update=_bool(env.get("CBRS_ALLOW_CLOAK_AUTO_UPDATE")),
+        output_dir=_path(env.get("CBRS_OUTPUT_DIR"), default="output", root=root),
+        request_delay_seconds=request_delay,
+        use_curl_cffi_for_images=_bool(env.get("CBRS_USE_CURL_CFFI_FOR_IMAGES")),
+        curl_cffi_impersonate=env.get("CBRS_CURL_CFFI_IMPERSONATE", "chrome120"),
+    )
+
+
+SETTINGS = load_settings()
+
+# Backwards-compatible constants for small scripts/importers.
+BASE_URL = SETTINGS.base_url
+RECAPTCHA_SITEKEY = SETTINGS.recaptcha_sitekey
+PROFILE_DIR = SETTINGS.profile_dir
+OUTPUT_DIR = SETTINGS.output_dir
