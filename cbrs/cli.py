@@ -54,8 +54,9 @@ def display_results(results: list[dict]) -> None:
     print()
 
 
-def prompt_selection(results: list[dict]) -> list[int]:
-    display_results(results)
+def prompt_selection(results: list[dict], *, show_results: bool = True) -> list[int]:
+    if show_results:
+        display_results(results)
     if not results:
         return []
     if len(results) == 1:
@@ -244,12 +245,15 @@ def cmd_init(args: argparse.Namespace) -> None:
     from .scraper import CBRSScraper
 
     _require_preflight()
-    print("Opening CBRS in a persistent Chrome/Edge profile.")
-    print("Log in manually in the browser window; no raw cookies will be exported.")
+    print("Opening CBRS login page...")
+    print("Please log in manually in the browser window.")
+    print("The persistent profile will be reused automatically after login.")
+    print("No raw cookies or session JSON will be exported.\n")
+    print("Waiting for login...")
     timeout = args.timeout if args.timeout > 0 else None
     with CBRSScraper(headless=False) as scraper:
         scraper.init_session(timeout_seconds=timeout)
-    print("Login detected. Persistent profile is ready.")
+    print("\nSession ready! You can now run 'python -m cbrs search' or 'python -m cbrs download'.")
 
 
 def cmd_search(args: argparse.Namespace, scraper: CBRSScraper) -> None:
@@ -268,7 +272,12 @@ def cmd_download(args: argparse.Namespace, scraper: CBRSScraper) -> None:
         indices = prompt_selection(results)
     else:
         results = scraper.search_by_fna(args.foja, args.numero, args.ano)
-        indices = list(range(len(results))) if len(results) <= 1 else prompt_selection(results)
+        display_results(results)
+        indices = (
+            prompt_selection(results, show_results=False)
+            if len(results) > 1
+            else list(range(len(results)))
+        )
 
     if not results or not indices:
         print("Nothing to download.")
@@ -386,7 +395,7 @@ def cmd_soak(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cbrs",
-        description="CBRS Commerce Registry operator tool",
+        description="CBRS Commerce Registry Scraper",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     parser.add_argument(
@@ -398,6 +407,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--headed",
         action="store_true",
         help="Temporarily show the browser for automated commands",
+    )
+    parser.add_argument(
+        "--no-headless",
+        action="store_true",
+        dest="headed",
+        help="Legacy alias from the original scripts; same as --headed",
+    )
+    parser.add_argument(
+        "--use-proxy",
+        action="store_true",
+        help="Legacy original-scripts flag; unsupported by the production fixed-trust runtime",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -545,6 +565,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.headless and args.headed:
         parser.error("--headless and --headed cannot be used together")
+    if args.use_proxy:
+        parser.error(
+            "--use-proxy is not supported by this production runtime; "
+            "configure an approved fixed egress path with CBRS_EGRESS_MODE instead"
+        )
     configure_logging(args.verbose)
     validate_fna_args(args, parser)
 

@@ -4,6 +4,64 @@ Automatización controlada para consultar el Índice del Registro de Comercio de
 portal CBRS, validar el flujo real con una sesión persistente y guardar PDFs para
 revisión local.
 
+## Quickstart
+
+```powershell
+cd V:\scrapper\scrapper-portal-conservador
+python -m pip install -r requirements.txt
+```
+
+Configura `.env` con el egreso autorizado. Para producción usa un egreso del
+cliente o dedicado:
+
+```dotenv
+CBRS_EGRESS_MODE=client_office
+CBRS_EXPECTED_EGRESS_COUNTRY=CL
+CBRS_REQUEST_DELAY_SECONDS=5.0
+CBRS_PROFILE_DIR=.cbrs/chrome-profile
+CBRS_OUTPUT_DIR=outputs
+```
+
+Para una prueba local explícita desde tu conexión actual:
+
+```dotenv
+CBRS_EGRESS_MODE=personal_direct
+CBRS_ALLOW_PERSONAL_EGRESS=1
+CBRS_EXPECTED_EGRESS_COUNTRY=CL
+```
+
+Inicializa y valida el entorno:
+
+```powershell
+python -m cbrs doctor
+python -m cbrs preflight --approve-egress-baseline
+python -m cbrs init --timeout 600
+```
+
+Flujo normal, parecido a los scripts originales:
+
+```powershell
+python -m cbrs search --query "BANCO DE CHILE"
+python -m cbrs download --query "BANCO DE CHILE" --output outputs
+
+python -m cbrs search --foja 9441 --numero 4580 --ano 1980
+python -m cbrs download --foja 9441 --numero 4580 --ano 1980 --output outputs
+```
+
+El comando `download` muestra los resultados y pide seleccionar `1,3` o `all`,
+igual que el flujo original. También se mantiene el alias legado
+`--no-headless`; el flag antiguo `--use-proxy` existe solo para fallar con un
+mensaje claro porque el runtime productivo usa egreso fijo, no proxy rotativo.
+
+Validación y monitor local:
+
+```powershell
+python -m cbrs validate --query "BANCO DE CHILE" --download-first
+python -m cbrs soak dashboard
+python -m cbrs soak run --dashboard
+python -m cbrs soak stop
+```
+
 ## Stack
 
 - Python 3.14.

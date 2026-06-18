@@ -22,6 +22,14 @@ def test_headed_overrides_default_headless() -> None:
     assert _runtime_headless(args) is False
 
 
+def test_no_headless_legacy_alias_enables_headed() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--no-headless", "search", "--query", "BANCO DE CHILE"])
+
+    assert args.headed is True
+    assert _runtime_headless(args) is False
+
+
 def test_headless_flag_enables_headless() -> None:
     parser = build_parser()
     args = parser.parse_args(["--headless", "search", "--query", "BANCO DE CHILE"])
@@ -38,6 +46,17 @@ def test_headless_and_headed_are_mutually_exclusive(capsys) -> None:
         raise AssertionError("Expected conflicting headless flags to fail")
 
     assert "--headless and --headed cannot be used together" in capsys.readouterr().err
+
+
+def test_use_proxy_legacy_flag_fails_with_fixed_trust_message(capsys) -> None:
+    try:
+        main(["--use-proxy", "doctor"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("Expected legacy proxy flag to fail")
+
+    assert "--use-proxy is not supported" in capsys.readouterr().err
 
 
 def test_soak_run_parser_supports_dashboard_dry_run() -> None:
