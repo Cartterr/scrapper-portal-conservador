@@ -38,6 +38,12 @@ def test_classifies_imperva_html() -> None:
     assert classify_response(200, {}, html) == StopReason.WAF_CHALLENGE
 
 
+def test_classifies_visible_captcha_html() -> None:
+    html = '<html><body><div class="g-recaptcha" data-sitekey="site"></div></body></html>'
+
+    assert classify_response(200, {}, html) == StopReason.CAPTCHA_REJECTED
+
+
 def test_allows_success_json_from_imperva_cdn() -> None:
     body = {"token": "ok", "refreshToken": None, "user": None}
 

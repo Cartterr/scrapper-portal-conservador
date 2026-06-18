@@ -663,6 +663,7 @@ def dashboard_status(store: SoakStore) -> dict[str, Any]:
         "schema": "cbrs-soak-status-v1",
         "status": status,
         "run": dict(run),
+        "alert": _active_alert(status=status, run=run, cycles=cycles),
         "stats": {
             "total_cycles": total,
             "passed_cycles": passed,
@@ -679,6 +680,51 @@ def dashboard_status(store: SoakStore) -> dict[str, Any]:
         "artifacts": artifacts,
         "control": store.control_state(),
     }
+
+
+def _active_alert(
+    *,
+    status: str,
+    run: dict[str, Any],
+    cycles: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if status != "blocked":
+        return None
+
+    blocked_cycle = next(
+        (cycle for cycle in cycles if cycle.get("status") == "blocked"),
+        None,
+    )
+    reason = (
+        (blocked_cycle or {}).get("safety_stop")
+        or run.get("blocked_reason")
+        or (blocked_cycle or {}).get("error")
+        or "safety_stop"
+    )
+    reason_text = str(reason)
+    title = "Portal safety stop"
+    summary = "The soak runner paused immediately. No further portal actions will run until operator review and restart."
+    if reason_text == "captcha_rejected":
+        title = "CAPTCHA challenge detected"
+        summary = "CBRS returned a CAPTCHA-related signal. The indefinite test is paused and will not continue portal traffic."
+    elif reason_text in {"waf_challenge", "unexpected_html"}:
+        title = "Portal challenge detected"
+        summary = "CBRS or its WAF returned a challenge page. The indefinite test is paused before any more portal actions."
+    elif reason_text == "rate_limit":
+        title = "Rate limit safety stop"
+        summary = "CBRS returned a rate-limit signal. The indefinite test is paused and will not retry automatically."
+
+    return redact(
+        {
+            "active": True,
+            "severity": "critical",
+            "title": title,
+            "message": summary,
+            "reason": reason_text,
+            "cycle_sequence": (blocked_cycle or {}).get("sequence"),
+            "cycle_id": (blocked_cycle or {}).get("cycle_id"),
+        }
+    )
 
 
 def _parse_targets(raw_targets: Any) -> Iterable[SoakTarget]:

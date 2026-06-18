@@ -169,6 +169,48 @@ def test_safety_stop_blocks_future_cycles_and_redacts_error(tmp_path: Path) -> N
     assert "[REDACTED_IP]" in serialized
 
 
+def test_captcha_safety_stop_pauses_and_exposes_alert(tmp_path: Path) -> None:
+    settings = load_settings(
+        {
+            "CBRS_PROFILE_DIR": ".cbrs/chrome-profile",
+            "CBRS_OUTPUT_DIR": "outputs",
+        },
+        root=tmp_path,
+    )
+    store = SoakStore(tmp_path / ".cbrs" / "soak" / "soak.sqlite3")
+
+    def fake_runner(**_: object) -> ValidationRunResult:
+        report_path = tmp_path / ".cbrs" / "logs" / "validation-captcha.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("{}", encoding="utf-8")
+        return ValidationRunResult(
+            exit_code=2,
+            status="safety_stop",
+            report={},
+            report_path=report_path,
+            preflight_report_path=None,
+            safety_stop="captcha_rejected",
+            error="captcha challenge detected",
+        )
+
+    result = run_soak(
+        settings=settings,
+        config=_fast_config(),
+        store=store,
+        max_cycles=5,
+        validation_runner=fake_runner,
+    )
+
+    status = dashboard_status(store)
+    assert result.status == "blocked"
+    assert status["status"] == "blocked"
+    assert status["stats"]["total_cycles"] == 1
+    assert status["alert"]["active"] is True
+    assert status["alert"]["reason"] == "captcha_rejected"
+    assert "CAPTCHA" in status["alert"]["title"]
+    assert "paused" in status["alert"]["message"]
+
+
 def test_stop_request_stops_runner_after_current_safe_point(tmp_path: Path) -> None:
     settings = load_settings(
         {
@@ -274,6 +316,8 @@ def test_dashboard_root_contains_screenshot_evidence_ui(tmp_path: Path) -> None:
     assert "iconLibrary" in html
     assert "Outcome Mix" in html
     assert "Cycle Timeline" in html
+    assert "safetyAlert" in html
+    assert "Critical safety stop" in html
     assert "donut" in html
     assert "sparkline" in html
 

@@ -249,6 +249,55 @@ def _dashboard_html() -> str:
     .status.running, .status.completed { background: var(--ok-soft); color: var(--ok); }
     .status.blocked, .status.stale { background: var(--bad-soft); color: var(--bad); }
     .status.waiting { background: var(--warn-soft); color: var(--warn); }
+    .hidden { display: none !important; }
+    .alert-banner {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 14px;
+      align-items: flex-start;
+      margin-bottom: 16px;
+      padding: 18px;
+      border: 2px solid var(--bad);
+      border-radius: 8px;
+      background:
+        linear-gradient(135deg, rgba(180, 35, 24, .08), rgba(255, 241, 240, .96)),
+        var(--panel);
+      box-shadow: 0 18px 50px rgba(180, 35, 24, .16);
+    }
+    .alert-icon {
+      width: 46px;
+      height: 46px;
+      border-radius: 8px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bad);
+      color: #fff;
+      flex: 0 0 auto;
+    }
+    .alert-icon svg { width: 25px; height: 25px; stroke-width: 2.25; }
+    .alert-kicker {
+      color: var(--bad);
+      font-size: 12px;
+      font-weight: 850;
+      letter-spacing: .02em;
+      text-transform: uppercase;
+    }
+    .alert-title {
+      margin-top: 4px;
+      font-size: clamp(24px, 3vw, 34px);
+      line-height: 1.06;
+      font-weight: 850;
+    }
+    .alert-message { margin-top: 7px; color: #681d17; font-size: 15px; line-height: 1.45; }
+    .alert-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 14px;
+      margin-top: 12px;
+      color: #7a271a;
+      font-size: 13px;
+    }
     .hero {
       display: grid;
       grid-template-columns: minmax(0, 1.5fr) minmax(340px, .85fr);
@@ -485,6 +534,19 @@ def _dashboard_html() -> str:
     </div>
   </header>
   <main>
+    <section id="safetyAlert" class="alert-banner hidden" role="alert" aria-live="polite">
+      <div id="safetyAlertIcon" class="alert-icon"></div>
+      <div>
+        <div class="alert-kicker">Critical safety stop</div>
+        <div id="safetyAlertTitle" class="alert-title">Portal action paused</div>
+        <div id="safetyAlertMessage" class="alert-message">The soak runner stopped before any further portal traffic.</div>
+        <div class="alert-meta">
+          <span>Reason <code id="safetyAlertReason">-</code></span>
+          <span>Cycle <code id="safetyAlertCycle">-</code></span>
+        </div>
+      </div>
+    </section>
+
     <div class="hero">
       <section class="snapshot">
         <div class="snapshot-top">
@@ -595,6 +657,13 @@ def _dashboard_html() -> str:
     };
     const localTime = (value) => value ? new Date(value).toLocaleString() : "-";
     const fileName = (path) => path ? path.split(/[\\\\/]/).pop() : "";
+    const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#039;"
+    }[char]));
     const statusBadge = (status) => `<span class="badge ${status || ""}">${status || "unknown"}</span>`;
     const pct = (value) => value === null || value === undefined ? "-" : `${Math.round(value * 100)}%`;
     const latestCycle = (cycles) => (cycles || [])[0] || null;
@@ -613,7 +682,7 @@ def _dashboard_html() -> str:
       const stats = data.stats || {};
       const cycles = stats.total_cycles || 0;
       if (!data.run) return "Ready for the first long-term run";
-      if (data.status === "blocked") return "Run blocked by a safety stop";
+      if (data.status === "blocked") return (data.alert && data.alert.title) || "Run blocked by a safety stop";
       if (data.status === "stale") return "Dashboard has not seen a fresh heartbeat";
       if (cycles === 0) return "Ready for the first cycle";
       if ((stats.safety_stops || 0) === 0 && ["running", "waiting"].includes(data.status)) return `Behaving normally for ${fmtSeconds(stats.uptime_seconds)}`;
@@ -673,6 +742,20 @@ def _dashboard_html() -> str:
           }).join("")}
         </svg>`;
     };
+    const renderAlert = (data) => {
+      const alert = data.alert;
+      const shell = document.getElementById("safetyAlert");
+      if (!alert || !alert.active) {
+        shell.classList.add("hidden");
+        return;
+      }
+      shell.classList.remove("hidden");
+      document.getElementById("safetyAlertIcon").innerHTML = icon("alert");
+      document.getElementById("safetyAlertTitle").textContent = alert.title || "Portal action paused";
+      document.getElementById("safetyAlertMessage").textContent = alert.message || "The soak runner stopped before any further portal traffic.";
+      document.getElementById("safetyAlertReason").textContent = alert.reason || "-";
+      document.getElementById("safetyAlertCycle").textContent = alert.cycle_sequence || "-";
+    };
     async function requestStop() {
       if (!confirm("Request the soak runner to stop after the current safe point?")) return;
       await fetch("/api/stop", { method: "POST" });
@@ -691,6 +774,7 @@ def _dashboard_html() -> str:
       const canStop = ["running", "waiting", "stale"].includes(data.status);
       const stopButton = document.getElementById("stopButton");
       stopButton.disabled = !canStop;
+      renderAlert(data);
       document.getElementById("alive").textContent = fmtSeconds(stats.uptime_seconds);
       document.getElementById("success").textContent = pct(stats.success_rate);
       document.getElementById("downloads").textContent = stats.downloads ?? "-";
@@ -738,7 +822,7 @@ def _dashboard_html() -> str:
           <td>${cycle.result_count ?? ""}</td>
           <td>${artifact}</td>
           <td>${report}</td>
-          <td>${cycle.safety_stop || cycle.error || ""}</td>
+          <td>${escapeHtml(cycle.safety_stop || cycle.error || "")}</td>
           <td>${localTime(cycle.finished_at)}</td>
         </tr>`;
       }).join("");

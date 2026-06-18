@@ -79,6 +79,18 @@ CHALLENGE_MARKERS = (
     "Request unsuccessful",
 )
 
+CAPTCHA_MARKERS = (
+    "g-recaptcha",
+    "grecaptcha.enterprise",
+    "recaptcha/api.js",
+    "h-captcha",
+    "data-sitekey",
+    "captcha-container",
+    "captcha verification",
+    "complete the captcha",
+    "no soy un robot",
+)
+
 
 def redact(value: Any) -> Any:
     if isinstance(value, Mapping):
@@ -139,8 +151,13 @@ def classify_response(
         if code == "intente-mas-tarde":
             return StopReason.CAPTCHA_REJECTED
         message = str(data.get("msg", "")).lower()
+        if any(marker in message for marker in CAPTCHA_MARKERS):
+            return StopReason.CAPTCHA_REJECTED
         if code == "error" and "intente" in message and "tarde" in message:
             return StopReason.TEMPORARY_UNAVAILABLE
+
+    if any(marker in lower_text for marker in CAPTCHA_MARKERS):
+        return StopReason.CAPTCHA_REJECTED
 
     if any(marker.lower() in lower_text for marker in CHALLENGE_MARKERS):
         return StopReason.WAF_CHALLENGE
