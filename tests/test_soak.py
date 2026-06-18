@@ -254,6 +254,30 @@ def test_dashboard_status_endpoint_and_artifact_link(tmp_path: Path) -> None:
     assert content.startswith(b"%PDF")
 
 
+def test_dashboard_root_contains_screenshot_evidence_ui(tmp_path: Path) -> None:
+    settings = load_settings(
+        {
+            "CBRS_PROFILE_DIR": ".cbrs/chrome-profile",
+            "CBRS_OUTPUT_DIR": "outputs",
+        },
+        root=tmp_path,
+    )
+    store = SoakStore(tmp_path / ".cbrs" / "soak" / "soak.sqlite3")
+    dashboard = start_dashboard(store, settings=settings, port=0)
+    try:
+        with urlopen(f"{dashboard.url}/", timeout=5) as response:
+            html = response.read().decode("utf-8")
+    finally:
+        dashboard.stop()
+
+    assert "Evidence Snapshot" in html
+    assert "iconLibrary" in html
+    assert "Outcome Mix" in html
+    assert "Cycle Timeline" in html
+    assert "donut" in html
+    assert "sparkline" in html
+
+
 def test_dashboard_stop_endpoint_requests_stop(tmp_path: Path) -> None:
     settings = load_settings(
         {
