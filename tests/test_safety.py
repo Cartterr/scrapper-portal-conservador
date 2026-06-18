@@ -96,3 +96,12 @@ def test_redacts_raw_ip_fields_and_text() -> None:
 
     assert redacted["raw_ip"] == "[REDACTED]"
     assert redacted["message"] == "egress is [REDACTED_IP]"
+
+
+def test_redacts_generic_token_assignments() -> None:
+    redacted = redact("blocked with token=secret and refresh_token: abc123")
+
+    assert "secret" not in redacted
+    assert "abc123" not in redacted
+    assert "token=[REDACTED]" in redacted
+    assert "refresh_token: [REDACTED]" in redacted

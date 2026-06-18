@@ -108,7 +108,35 @@ Acceptance:
 - PDF exists and has non-zero size
 - sanitized report includes PDF path and size only
 
-## 6. Safety Stop Proofs
+## 6. Long-Running Soak Proof
+
+Use the soak runner when the goal is to prove the normal flow over time without
+waiting on a manual multi-day checklist:
+
+```powershell
+python -m cbrs soak dashboard
+python -m cbrs soak run --dry-run --max-cycles 3 --dashboard
+python -m cbrs soak run --dashboard
+```
+
+Acceptance:
+
+- standalone dashboard starts without creating a run or touching the portal
+- dry-run writes local soak history and placeholder output without portal traffic
+- live soak starts with one immediate full-flow cycle
+- later live cycles wait a randomized test-only `2-4` minute interval,
+  averaging about 20 full-flow consults per hour
+- every live cycle uses preflight, the persistent profile, safe search, and one
+  first-result download
+- PDFs are written under `outputs/soak/<run_id>/<cycle_id>/`
+- the dashboard at `http://127.0.0.1:8765` shows status, uptime, heartbeat,
+  success rate, safety stops, validation reports, and output artifacts
+- `python -m cbrs soak stop` or the dashboard Stop button requests a graceful
+  stop after the current safe point
+- any hard safety stop leaves the dashboard alive but blocks all future portal
+  actions until operator review
+
+## 7. Safety Stop Proofs
 
 These are logic tests, not live stress tests:
 

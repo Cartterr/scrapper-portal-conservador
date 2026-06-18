@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 from . import config
@@ -10,9 +12,7 @@ from .browser_runtime import get_browser_status
 from .preflight import preflight_validation_metadata, run_preflight
 from .safety import SafetyStopException, StopReason, redact_text
 from .validation import (
-    finish_validation_report,
-    new_validation_report,
-    write_validation_report,
+    run_controlled_validation,
 )
 
 
@@ -293,83 +293,94 @@ def cmd_download(args: argparse.Namespace, scraper: CBRSScraper) -> None:
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
-    from .scraper import CBRSScraper
-
     headless = _runtime_headless(args)
-    preflight_result = run_preflight(config.SETTINGS, write_report=True)
-    report = new_validation_report(
-        config.SETTINGS,
+    print("Running one controlled live validation.")
+    print("This uses the persistent browser profile, normal pacing, and no retries.")
+
+    result = run_controlled_validation(
+        settings=config.SETTINGS,
         search_kind="text" if args.query else "fna",
+        query=args.query,
+        foja=args.foja,
+        numero=args.numero,
+        ano=args.ano,
         download_first=args.download_first,
-        preflight_metadata=preflight_validation_metadata(preflight_result),
+        output_dir=Path(args.output),
+        keep_images=args.keep_images,
         headless=headless,
     )
 
-    if not preflight_result.ok:
-        finish_validation_report(
-            report,
-            status="safety_stop",
-            safety_stop=StopReason.EGRESS_PREFLIGHT.value,
-            error="Fixed-egress preflight failed.",
-        )
-        report_path = write_validation_report(report, config.SETTINGS)
-        if preflight_result.report_path:
-            print(f"Preflight failed. Report: {preflight_result.report_path}", file=sys.stderr)
-        print(f"Validation report: {report_path}")
-        return 2
+    if result.preflight_report_path:
+        preflight_status = "passed" if result.report.get("preflight_status") == "passed" else "failed"
+        stream = sys.stdout if preflight_status == "passed" else sys.stderr
+        print(f"Preflight {preflight_status}. Report: {result.preflight_report_path}", file=stream)
+    if result.result_count is not None:
+        print(f"Search completed. Result count: {result.result_count}")
+    if result.pdf_path:
+        print(f"Download completed. PDF: {result.pdf_path}")
+    if result.exit_code == 2:
+        print(f"Safety stop: {result.error}", file=sys.stderr)
+    elif result.exit_code == 1:
+        print(f"Validation failed: {result.error}", file=sys.stderr)
+    print(f"Validation report: {result.report_path}")
+    return result.exit_code
 
-    print("Running one controlled live validation.")
-    print("This uses the persistent browser profile, normal pacing, and no retries.")
-    if preflight_result.report_path:
-        print(f"Preflight passed. Report: {preflight_result.report_path}")
 
-    try:
-        with CBRSScraper(headless=headless) as scraper:
-            if args.query:
-                results = scraper.search_by_text(args.query)
-            else:
-                results = scraper.search_by_fna(args.foja, args.numero, args.ano)
+def cmd_soak(args: argparse.Namespace) -> int:
+    from .soak import default_soak_store, dashboard_status, load_soak_config, run_soak
 
-            report["result_count"] = len(results)
-            print(f"Search completed. Result count: {len(results)}")
-
-            if args.download_first:
-                if not results:
-                    raise RuntimeError("Cannot download: validation search returned no results.")
-                ticket = results[0].get("ticket")
-                if not ticket:
-                    raise RuntimeError("Cannot download: first result did not include a ticket.")
-                pdf_path = scraper.download_all_images(
-                    ticket,
-                    Path(args.output),
-                    keep_images=args.keep_images,
-                )
-                report["pdf_created"] = True
-                report["pdf_path"] = str(pdf_path)
-                report["pdf_size_bytes"] = pdf_path.stat().st_size
-                print(f"Download completed. PDF: {pdf_path}")
-
-        finish_validation_report(report, status="passed")
-        report_path = write_validation_report(report, config.SETTINGS)
-        print(f"Validation report: {report_path}")
+    store = default_soak_store(config.SETTINGS)
+    if args.soak_command == "status":
+        print(json.dumps(dashboard_status(store), ensure_ascii=False, indent=2))
         return 0
-    except SafetyStopException as exc:
-        finish_validation_report(
-            report,
-            status="safety_stop",
-            safety_stop=exc.reason.value,
-            error=str(exc),
-        )
-        report_path = write_validation_report(report, config.SETTINGS)
-        print(f"Safety stop: {exc}", file=sys.stderr)
-        print(f"Validation report: {report_path}")
-        return 2
-    except Exception as exc:
-        finish_validation_report(report, status="failed", error=str(exc))
-        report_path = write_validation_report(report, config.SETTINGS)
-        print(f"Validation failed: {exc}", file=sys.stderr)
-        print(f"Validation report: {report_path}")
-        return 1
+    if args.soak_command == "export":
+        payload = store.export_snapshot()
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        if args.output:
+            output = Path(args.output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(text, encoding="utf-8")
+            print(f"Soak export: {output}")
+        else:
+            print(text)
+        return 0
+    if args.soak_command == "stop":
+        store.request_stop()
+        print("Stop requested. The soak runner will stop after the current safe point.")
+        return 0
+
+    soak_config = load_soak_config(
+        config.SETTINGS,
+        path=Path(args.config) if args.config else None,
+    )
+    if args.soak_command == "dashboard":
+        from .soak_dashboard import start_dashboard
+
+        host = args.host or soak_config.dashboard_host
+        port = args.port if args.port is not None else soak_config.dashboard_port
+        dashboard = start_dashboard(store, settings=config.SETTINGS, host=host, port=port)
+        print(f"Soak dashboard: {dashboard.url}")
+        print("Dashboard is running without starting the soak flow. Press Ctrl+C to stop it.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            dashboard.stop()
+            print("\nDashboard stopped.")
+        return 0
+
+    result = run_soak(
+        settings=config.SETTINGS,
+        config=soak_config,
+        store=store,
+        dry_run=args.dry_run,
+        max_cycles=args.max_cycles,
+        dashboard=args.dashboard,
+        headless=_runtime_headless(args),
+        on_dashboard_start=lambda url: print(f"Soak dashboard: {url}"),
+    )
+    print(f"Soak run {result.status}: {result.run_id}")
+    return result.exit_code
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -459,6 +470,73 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep individual JPEG files alongside the PDF",
     )
+
+    soak_parser = subparsers.add_parser("soak", help="Run long-running CBRS soak checks")
+    soak_subparsers = soak_parser.add_subparsers(dest="soak_command", required=True)
+    soak_run_parser = soak_subparsers.add_parser(
+        "run",
+        help="Run the controlled long-running soak loop",
+    )
+    soak_run_parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="Start the read-only local dashboard",
+    )
+    soak_run_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Exercise soak storage and dashboard without portal traffic",
+    )
+    soak_run_parser.add_argument(
+        "--max-cycles",
+        type=int,
+        default=None,
+        help="Stop after this many cycles; omitted runs until stopped",
+    )
+    soak_run_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to .cbrs/soak-config.json override",
+    )
+    soak_subparsers.add_parser("status", help="Print the latest soak status JSON")
+    soak_dashboard_parser = soak_subparsers.add_parser(
+        "dashboard",
+        help="Start the local dashboard without starting the soak loop",
+    )
+    soak_dashboard_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to .cbrs/soak-config.json override",
+    )
+    soak_dashboard_parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help="Dashboard host; defaults to soak config",
+    )
+    soak_dashboard_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Dashboard port; defaults to soak config",
+    )
+    soak_subparsers.add_parser(
+        "stop",
+        help="Request the active soak runner to stop after the current safe point",
+    )
+    soak_export_parser = soak_subparsers.add_parser(
+        "export",
+        help="Export latest soak history as sanitized JSON",
+    )
+    soak_export_parser.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default=None,
+        help="Write export JSON to a file instead of stdout",
+    )
     return parser
 
 
@@ -480,6 +558,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "validate":
             return cmd_validate(args)
+        if args.command == "soak":
+            return cmd_soak(args)
 
         from .scraper import CBRSScraper
 

@@ -164,7 +164,7 @@ def write_preflight_report(
     log_dir = settings.profile_dir.parent / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = log_dir / f"preflight-{timestamp}.json"
+    path = _unique_report_path(log_dir, "preflight", timestamp)
     path.write_text(
         json.dumps(redact(report), ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -260,3 +260,14 @@ def _hash_text(value: str) -> str:
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _unique_report_path(log_dir: Path, prefix: str, timestamp: str) -> Path:
+    path = log_dir / f"{prefix}-{timestamp}.json"
+    if not path.exists():
+        return path
+    for counter in range(2, 1000):
+        candidate = log_dir / f"{prefix}-{timestamp}-{counter}.json"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("Could not allocate unique preflight report path")

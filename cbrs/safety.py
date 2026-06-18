@@ -62,6 +62,9 @@ COOKIE_VALUE_RE = re.compile(
 HEADER_VALUE_RE = re.compile(
     r"(?i)(authorization|recaptcha-token|recaptchaToken|set-cookie|cookie)(\s*[:=]\s*)([^\s,;}]+)"
 )
+TOKEN_VALUE_RE = re.compile(
+    r"(?i)\b([A-Za-z0-9_.-]*token[A-Za-z0-9_.-]*)(\s*[:=]\s*)([^\s,;}]+)"
+)
 FINGERPRINT_ARG_RE = re.compile(r"(?i)(--fingerprint=)([A-Za-z0-9_-]+)")
 PROXY_URL_RE = re.compile(
     r"(?i)\b((?:https?|socks5)://)([^@\s/]+)@([^\s/]+)"
@@ -101,6 +104,7 @@ def redact_text(text: str) -> str:
     text = JWT_RE.sub("[REDACTED_JWT]", text)
     text = COOKIE_VALUE_RE.sub(lambda m: f"{m.group(1)}=[REDACTED]", text)
     text = HEADER_VALUE_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", text)
+    text = TOKEN_VALUE_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", text)
     text = FINGERPRINT_ARG_RE.sub(r"\1[REDACTED]", text)
     text = PROXY_URL_RE.sub(r"\1[REDACTED]@\3", text)
     text = IPV4_RE.sub("[REDACTED_IP]", text)
