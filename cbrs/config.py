@@ -173,7 +173,7 @@ def load_settings(
         cloak_fingerprint_seed=_empty_to_none(env.get("CBRS_CLOAK_FINGERPRINT_SEED")),
         cloak_proxy_url=_empty_to_none(env.get("CBRS_CLOAK_PROXY_URL")),
         allow_cloak_auto_update=_bool(env.get("CBRS_ALLOW_CLOAK_AUTO_UPDATE")),
-        output_dir=_path(env.get("CBRS_OUTPUT_DIR"), default="output", root=root),
+        output_dir=_path(env.get("CBRS_OUTPUT_DIR"), default="outputs", root=root),
         request_delay_seconds=request_delay,
         use_curl_cffi_for_images=_bool(env.get("CBRS_USE_CURL_CFFI_FOR_IMAGES")),
         curl_cffi_impersonate=env.get("CBRS_CURL_CFFI_IMPERSONATE", "chrome120"),

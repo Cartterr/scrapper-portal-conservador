@@ -2,6 +2,9 @@
 .env
 .env.local
 output/
+outputs/*
+!outputs/
+!outputs/.gitkeep
 *.har
 *.jwt
 *.cookie

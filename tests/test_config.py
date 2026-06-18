@@ -48,6 +48,7 @@ def test_settings_parse_production_defaults(tmp_path: Path) -> None:
     assert settings.expected_egress_country == "CL"
     assert settings.profile_dir == tmp_path / ".cbrs" / "chrome-profile"
     assert settings.cloak_cache_dir == tmp_path / ".cbrs" / "cloak-cache"
+    assert settings.output_dir == tmp_path / "outputs"
     assert settings.allow_cloak_auto_update is False
 
 

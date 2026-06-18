@@ -64,7 +64,7 @@ def _write_safe_gitignore(path: Path) -> None:
                 ".cbrs/",
                 ".env",
                 ".env.local",
-                "output/",
+                "outputs/",
                 "*.cookie",
                 "*.session.json",
                 "*.storage_state.json",

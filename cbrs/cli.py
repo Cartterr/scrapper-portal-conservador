@@ -150,7 +150,7 @@ def cmd_doctor() -> int:
         ".cbrs/",
         ".env",
         ".env.local",
-        "output/",
+        "outputs/",
         "*.cookie",
         "*.session.json",
         "*.storage_state.json",
