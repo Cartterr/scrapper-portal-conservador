@@ -178,7 +178,7 @@ def _dashboard_html() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CBRS Soak Monitor</title>
+  <title>Monitor de Prueba Continua CBRS</title>
   <style>
     :root {
       color-scheme: light;
@@ -525,24 +525,24 @@ def _dashboard_html() -> str:
 <body>
   <header>
     <div>
-      <h1>CBRS Soak Monitor</h1>
-      <div class="muted">Local read-only runtime dashboard</div>
+      <h1>Monitor de Prueba Continua CBRS</h1>
+      <div class="muted">Panel local de solo lectura</div>
     </div>
     <div class="actions">
-      <button id="stopButton" class="primary" disabled>Stop</button>
-      <div id="status" class="status">loading</div>
+      <button id="stopButton" class="primary" disabled>Detener</button>
+      <div id="status" class="status">cargando</div>
     </div>
   </header>
   <main>
     <section id="safetyAlert" class="alert-banner hidden" role="alert" aria-live="polite">
       <div id="safetyAlertIcon" class="alert-icon"></div>
       <div>
-        <div class="alert-kicker">Critical safety stop</div>
-        <div id="safetyAlertTitle" class="alert-title">Portal action paused</div>
-        <div id="safetyAlertMessage" class="alert-message">The soak runner stopped before any further portal traffic.</div>
+        <div class="alert-kicker">Parada crítica de seguridad</div>
+        <div id="safetyAlertTitle" class="alert-title">Acción del portal pausada</div>
+        <div id="safetyAlertMessage" class="alert-message">La prueba continua se detuvo antes de generar más tráfico al portal.</div>
         <div class="alert-meta">
-          <span>Reason <code id="safetyAlertReason">-</code></span>
-          <span>Cycle <code id="safetyAlertCycle">-</code></span>
+          <span>Motivo <code id="safetyAlertReason">-</code></span>
+          <span>Ciclo <code id="safetyAlertCycle">-</code></span>
         </div>
       </div>
     </section>
@@ -551,28 +551,28 @@ def _dashboard_html() -> str:
       <section class="snapshot">
         <div class="snapshot-top">
           <div>
-            <div class="snapshot-title">Evidence Snapshot</div>
-            <h2 id="headline">Loading current test evidence</h2>
-            <div id="headlineSub" class="snapshot-subtitle">The dashboard is collecting the latest run state.</div>
+            <div class="snapshot-title">Evidencia actual</div>
+            <h2 id="headline">Cargando evidencia de la prueba</h2>
+            <div id="headlineSub" class="snapshot-subtitle">El panel está cargando el estado más reciente.</div>
           </div>
-          <span id="heroStatus" class="status">loading</span>
+          <span id="heroStatus" class="status">cargando</span>
         </div>
         <div class="proof-strip">
-          <div class="proof-item"><div class="label">Run id</div><div id="runId" class="value">-</div></div>
-          <div class="proof-item"><div class="label">Started</div><div id="startedAt" class="value">-</div></div>
-          <div class="proof-item"><div class="label">Last cycle</div><div id="lastCycle" class="value">-</div></div>
-          <div class="proof-item"><div class="label">Next cycle</div><div id="nextCycleProof" class="value">-</div></div>
+          <div class="proof-item"><div class="label">ID de ejecución</div><div id="runId" class="value">-</div></div>
+          <div class="proof-item"><div class="label">Inicio</div><div id="startedAt" class="value">-</div></div>
+          <div class="proof-item"><div class="label">Último ciclo</div><div id="lastCycle" class="value">-</div></div>
+          <div class="proof-item"><div class="label">Próximo ciclo</div><div id="nextCycleProof" class="value">-</div></div>
         </div>
       </section>
 
       <section class="panel chart-shell">
         <div class="chart-title">
-          <h2>Outcome Mix</h2>
+          <h2>Resumen de resultados</h2>
           <span id="cycleSample" class="chart-caption">-</span>
         </div>
         <div class="donut-wrap">
           <div id="donut" class="donut" style="--ok-deg: 0deg; --bad-deg: 0deg;">
-            <div class="donut-center"><span id="donutValue">-</span><span class="muted">pass</span></div>
+            <div class="donut-center"><span id="donutValue">-</span><span class="muted">éxito</span></div>
           </div>
           <div id="legend" class="legend"></div>
         </div>
@@ -582,44 +582,44 @@ def _dashboard_html() -> str:
 
     <div class="kpi-grid">
       <div class="metric">
-        <div class="metric-head"><div><div class="label">Alive</div><div id="alive" class="value">-</div></div><span id="aliveIcon" class="icon"></span></div>
-        <div id="aliveNote" class="metric-note">Runtime heartbeat</div>
+        <div class="metric-head"><div><div class="label">Activo</div><div id="alive" class="value">-</div></div><span id="aliveIcon" class="icon"></span></div>
+        <div id="aliveNote" class="metric-note">Latido de ejecución</div>
       </div>
       <div class="metric">
-        <div class="metric-head"><div><div class="label">Success Rate</div><div id="success" class="value">-</div></div><span id="successIcon" class="icon ok"></span></div>
-        <div id="successNote" class="metric-note">Passed cycles over latest run</div>
+        <div class="metric-head"><div><div class="label">Tasa de éxito</div><div id="success" class="value">-</div></div><span id="successIcon" class="icon ok"></span></div>
+        <div id="successNote" class="metric-note">Ciclos correctos en la última ejecución</div>
       </div>
       <div class="metric">
-        <div class="metric-head"><div><div class="label">PDF Outputs</div><div id="downloads" class="value">-</div></div><span id="downloadIcon" class="icon"></span></div>
-        <div id="downloadsNote" class="metric-note">Generated files available below</div>
+        <div class="metric-head"><div><div class="label">PDFs generados</div><div id="downloads" class="value">-</div></div><span id="downloadIcon" class="icon"></span></div>
+        <div id="downloadsNote" class="metric-note">Archivos disponibles abajo</div>
       </div>
       <div class="metric">
-        <div class="metric-head"><div><div class="label">Safety Stops</div><div id="safetyStops" class="value">-</div></div><span id="shieldIcon" class="icon ok"></span></div>
-        <div id="safetyNote" class="metric-note">Hard stops remain visible</div>
+        <div class="metric-head"><div><div class="label">Paradas de seguridad</div><div id="safetyStops" class="value">-</div></div><span id="shieldIcon" class="icon ok"></span></div>
+        <div id="safetyNote" class="metric-note">Las paradas críticas quedan visibles</div>
       </div>
     </div>
 
     <div class="visual-grid">
       <section class="chart-shell">
         <div class="chart-title">
-          <h2>Cycle Timeline</h2>
-          <span class="chart-caption">latest run, oldest to newest</span>
+          <h2>Línea de ciclos</h2>
+          <span class="chart-caption">última ejecución, de antiguo a reciente</span>
         </div>
         <div id="sparkline" class="sparkline"></div>
       </section>
 
       <section>
-        <h2>Runtime Proof</h2>
-        <div id="runtime" class="muted">Loading...</div>
+        <h2>Prueba de ejecución</h2>
+        <div id="runtime" class="muted">Cargando...</div>
       </section>
     </div>
 
     <section>
-      <h2>Cycles</h2>
+      <h2>Ciclos</h2>
       <table>
         <thead>
           <tr>
-            <th>#</th><th>Status</th><th>Target</th><th>Results</th><th>PDF</th><th>Report</th><th>Stop</th><th>Finished</th>
+            <th>#</th><th>Estado</th><th>Objetivo</th><th>Resultados</th><th>PDF</th><th>Reporte</th><th>Parada</th><th>Finalizado</th>
           </tr>
         </thead>
         <tbody id="cycles"></tbody>
@@ -627,9 +627,9 @@ def _dashboard_html() -> str:
     </section>
 
     <section>
-      <h2>Events</h2>
+      <h2>Eventos</h2>
       <table>
-        <thead><tr><th>Time</th><th>Level</th><th>Message</th></tr></thead>
+        <thead><tr><th>Hora</th><th>Nivel</th><th>Mensaje</th></tr></thead>
         <tbody id="events"></tbody>
       </table>
     </section>
@@ -664,7 +664,43 @@ def _dashboard_html() -> str:
       '"': "&quot;",
       "'": "&#039;"
     }[char]));
-    const statusBadge = (status) => `<span class="badge ${status || ""}">${status || "unknown"}</span>`;
+    const statusLabels = {
+      blocked: "bloqueado",
+      completed: "completado",
+      failed: "fallido",
+      not_started: "no iniciado",
+      passed: "correcto",
+      running: "ejecutando",
+      safety_stop: "parada de seguridad",
+      stale: "sin latido",
+      stopped: "detenido",
+      waiting: "en espera"
+    };
+    const eventMessages = {
+      "cycle blocked": "ciclo bloqueado",
+      "cycle failed": "ciclo fallido",
+      "cycle passed": "ciclo correcto",
+      "cycle running": "ciclo en ejecución",
+      "cycle started": "ciclo iniciado",
+      "soak run started": "prueba continua iniciada",
+      "soak run stop requested": "detención solicitada",
+      "soak run stopped by operator": "prueba continua detenida por el operador"
+    };
+    const levelLabels = { error: "error", info: "info", warning: "advertencia" };
+    const statusLabel = (status) => statusLabels[status] || status || "desconocido";
+    const eventMessageLabel = (message) => eventMessages[message] || message || "-";
+    const levelLabel = (level) => levelLabels[level] || level || "-";
+    const targetLabel = (label) => ({
+      default_safe_query: "consulta segura predeterminada",
+      safe_text: "consulta segura",
+      safe_fna: "foja/número/año seguro"
+    }[label] || label || "-");
+    const booleanLabel = (value) => value === true ? "sí" : value === false ? "no" : "-";
+    const windowModeLabel = (value) => ({
+      normal: "normal",
+      offscreen: "fuera de pantalla"
+    }[value] || value || "-");
+    const statusBadge = (status) => `<span class="badge ${status || ""}">${escapeHtml(statusLabel(status))}</span>`;
     const pct = (value) => value === null || value === undefined ? "-" : `${Math.round(value * 100)}%`;
     const latestCycle = (cycles) => (cycles || [])[0] || null;
     const statusCounts = (cycles) => {
@@ -681,13 +717,13 @@ def _dashboard_html() -> str:
     const screenshotHeadline = (data) => {
       const stats = data.stats || {};
       const cycles = stats.total_cycles || 0;
-      if (!data.run) return "Ready for the first long-term run";
-      if (data.status === "blocked") return (data.alert && data.alert.title) || "Run blocked by a safety stop";
-      if (data.status === "stale") return "Dashboard has not seen a fresh heartbeat";
-      if (cycles === 0) return "Ready for the first cycle";
-      if ((stats.safety_stops || 0) === 0 && ["running", "waiting"].includes(data.status)) return `Behaving normally for ${fmtSeconds(stats.uptime_seconds)}`;
-      if ((stats.safety_stops || 0) === 0 && data.status === "completed") return "Last run completed cleanly";
-      return `Completed ${cycles} cycles with visible safety evidence`;
+      if (!data.run) return "Listo para la primera prueba continua";
+      if (data.status === "blocked") return (data.alert && data.alert.title) || "Ejecución bloqueada por seguridad";
+      if (data.status === "stale") return "El panel no recibe latidos recientes";
+      if (cycles === 0) return "Listo para el primer ciclo";
+      if ((stats.safety_stops || 0) === 0 && ["running", "waiting"].includes(data.status)) return `Funcionando normalmente por ${fmtSeconds(stats.uptime_seconds)}`;
+      if ((stats.safety_stops || 0) === 0 && data.status === "completed") return "Última ejecución completada correctamente";
+      return `${cycles} ciclos completados con evidencia visible`;
     };
     const renderDonut = (stats, cycles) => {
       const counts = statusCounts(cycles);
@@ -699,17 +735,17 @@ def _dashboard_html() -> str:
       donut.style.setProperty("--bad-deg", `${badDeg}deg`);
       document.getElementById("donutValue").textContent = pct(stats.success_rate);
       document.getElementById("legend").innerHTML = [
-        `<div class="legend-item"><span><span class="dot ok"></span>Passed</span><strong>${counts.passed}</strong></div>`,
-        `<div class="legend-item"><span><span class="dot bad"></span>Failed/blocked</span><strong>${counts.failed + counts.blocked}</strong></div>`,
-        `<div class="legend-item"><span><span class="dot warn"></span>Running/waiting</span><strong>${counts.running + counts.waiting}</strong></div>`
+        `<div class="legend-item"><span><span class="dot ok"></span>Correctos</span><strong>${counts.passed}</strong></div>`,
+        `<div class="legend-item"><span><span class="dot bad"></span>Fallidos/bloqueados</span><strong>${counts.failed + counts.blocked}</strong></div>`,
+        `<div class="legend-item"><span><span class="dot warn"></span>En ejecución/en espera</span><strong>${counts.running + counts.waiting}</strong></div>`
       ].join("");
-      document.getElementById("cycleSample").textContent = `${(cycles || []).length} cycle sample`;
+      document.getElementById("cycleSample").textContent = `${(cycles || []).length} ciclo(s)`;
       const max = Math.max(1, ...Object.values(counts));
       const bars = [
-        ["Passed", counts.passed, "ok"],
-        ["Failed", counts.failed, "bad"],
-        ["Blocked", counts.blocked, "bad"],
-        ["In flight", counts.running + counts.waiting, "warn"]
+        ["Correctos", counts.passed, "ok"],
+        ["Fallidos", counts.failed, "bad"],
+        ["Bloqueados", counts.blocked, "bad"],
+        ["En curso", counts.running + counts.waiting, "warn"]
       ];
       document.getElementById("outcomeBars").innerHTML = bars.map(([label, count, tone]) => `
         <div class="bar-row"><span>${label}</span><div class="bar-track"><div class="bar-fill ${tone}" style="width:${Math.max(4, count / max * 100)}%"></div></div><strong>${count}</strong></div>
@@ -719,7 +755,7 @@ def _dashboard_html() -> str:
       const shell = document.getElementById("sparkline");
       const ordered = [...(cycles || [])].reverse().slice(-32);
       if (!ordered.length) {
-        shell.innerHTML = '<div class="empty">No cycle history yet. Start the soak run to populate this chart.</div>';
+        shell.innerHTML = '<div class="empty">Todavía no hay historial de ciclos. Inicia la prueba continua para llenar este gráfico.</div>';
         return;
       }
       const width = 720, height = 168, pad = 24;
@@ -728,17 +764,17 @@ def _dashboard_html() -> str:
       const points = ordered.map((cycle, index) => [pad + step * index, yFor(cycle.status), cycle]);
       const path = points.map(([x, y], index) => `${index ? "L" : "M"}${x.toFixed(1)} ${y.toFixed(1)}`).join(" ");
       shell.innerHTML = `
-        <svg viewBox="0 0 ${width} ${height}" width="100%" height="100%" role="img" aria-label="Cycle outcome trend">
+        <svg viewBox="0 0 ${width} ${height}" width="100%" height="100%" role="img" aria-label="Tendencia de resultados por ciclo">
           <path d="M${pad} 56 H${width-pad}" stroke="#dbe4ef" stroke-width="1"/>
           <path d="M${pad} 92 H${width-pad}" stroke="#dbe4ef" stroke-width="1"/>
           <path d="M${pad} 124 H${width-pad}" stroke="#dbe4ef" stroke-width="1"/>
-          <text x="${pad}" y="45">passed</text>
-          <text x="${pad}" y="84">active</text>
-          <text x="${pad}" y="116">stopped</text>
+          <text x="${pad}" y="45">correcto</text>
+          <text x="${pad}" y="84">activo</text>
+          <text x="${pad}" y="116">detenido</text>
           <path d="${path}" fill="none" stroke="#1d4ed8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
           ${points.map(([x, y, cycle]) => {
             const color = cycle.status === "passed" ? "#11845b" : cycle.status === "running" || cycle.status === "waiting" ? "#b76e00" : "#b42318";
-            return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="5" fill="${color}" stroke="#fff" stroke-width="2"><title>Cycle ${cycle.sequence}: ${cycle.status}</title></circle>`;
+            return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="5" fill="${color}" stroke="#fff" stroke-width="2"><title>Ciclo ${cycle.sequence}: ${statusLabel(cycle.status)}</title></circle>`;
           }).join("")}
         </svg>`;
     };
@@ -751,13 +787,13 @@ def _dashboard_html() -> str:
       }
       shell.classList.remove("hidden");
       document.getElementById("safetyAlertIcon").innerHTML = icon("alert");
-      document.getElementById("safetyAlertTitle").textContent = alert.title || "Portal action paused";
-      document.getElementById("safetyAlertMessage").textContent = alert.message || "The soak runner stopped before any further portal traffic.";
+      document.getElementById("safetyAlertTitle").textContent = alert.title || "Acción del portal pausada";
+      document.getElementById("safetyAlertMessage").textContent = alert.message || "La prueba continua se detuvo antes de generar más tráfico al portal.";
       document.getElementById("safetyAlertReason").textContent = alert.reason || "-";
       document.getElementById("safetyAlertCycle").textContent = alert.cycle_sequence || "-";
     };
     async function requestStop() {
-      if (!confirm("Request the soak runner to stop after the current safe point?")) return;
+      if (!confirm("¿Solicitar que la prueba continua se detenga en el próximo punto seguro?")) return;
       await fetch("/api/stop", { method: "POST" });
       await refresh();
     }
@@ -765,10 +801,10 @@ def _dashboard_html() -> str:
       const response = await fetch("/api/status", { cache: "no-store" });
       const data = await response.json();
       const status = document.getElementById("status");
-      status.textContent = data.status || "unknown";
+      status.textContent = statusLabel(data.status);
       status.className = `status ${data.status || ""}`;
       const heroStatus = document.getElementById("heroStatus");
-      heroStatus.textContent = data.status || "unknown";
+      heroStatus.textContent = statusLabel(data.status);
       heroStatus.className = `status ${data.status || ""}`;
       const stats = data.stats || {};
       const canStop = ["running", "waiting", "stale"].includes(data.status);
@@ -781,8 +817,8 @@ def _dashboard_html() -> str:
       document.getElementById("safetyStops").textContent = stats.safety_stops ?? "-";
       document.getElementById("headline").textContent = screenshotHeadline(data);
       document.getElementById("headlineSub").textContent = data.run
-        ? `Latest run has ${stats.total_cycles || 0} cycle(s), ${stats.downloads || 0} PDF output(s), and ${stats.safety_stops || 0} safety stop(s).`
-        : "Open the dashboard now, then start the soak flow when you are ready.";
+        ? `La última ejecución tiene ${stats.total_cycles || 0} ciclo(s), ${stats.downloads || 0} PDF(s) generado(s) y ${stats.safety_stops || 0} parada(s) de seguridad.`
+        : "Abre el panel ahora e inicia la prueba continua cuando estés listo.";
       document.getElementById("runId").textContent = data.run ? data.run.run_id : "-";
       document.getElementById("startedAt").textContent = data.run ? localTime(data.run.started_at) : "-";
       const last = latestCycle(data.cycles);
@@ -795,22 +831,22 @@ def _dashboard_html() -> str:
       document.getElementById("downloadIcon").innerHTML = icon("download");
       document.getElementById("shieldIcon").className = `icon ${(stats.safety_stops || 0) ? "bad" : "ok"}`;
       document.getElementById("shieldIcon").innerHTML = (stats.safety_stops || 0) ? icon("alert") : icon("shield");
-      document.getElementById("aliveNote").textContent = `Heartbeat age ${fmtSeconds(stats.heartbeat_age_seconds)}`;
-      document.getElementById("successNote").textContent = `${stats.passed_cycles || 0} passed / ${stats.total_cycles || 0} total`;
-      document.getElementById("downloadsNote").textContent = `${stats.downloads || 0} artifact link(s) in latest run`;
-      document.getElementById("safetyNote").textContent = (stats.safety_stops || 0) ? "Review stop reason before continuing" : "No hard stops in latest run";
+      document.getElementById("aliveNote").textContent = `Edad del latido ${fmtSeconds(stats.heartbeat_age_seconds)}`;
+      document.getElementById("successNote").textContent = `${stats.passed_cycles || 0} correctos / ${stats.total_cycles || 0} total`;
+      document.getElementById("downloadsNote").textContent = `${stats.downloads || 0} enlace(s) de archivo en la última ejecución`;
+      document.getElementById("safetyNote").textContent = (stats.safety_stops || 0) ? "Revisar el motivo antes de continuar" : "Sin paradas críticas en la última ejecución";
       renderDonut(stats, data.cycles || []);
       renderSparkline(data.cycles || []);
       const runtime = data.runtime || {};
       const run = data.run || {};
       document.getElementById("runtime").innerHTML = [
-        `backend=<code>${runtime.browser_backend || "-"}</code>`,
-        `window=<code>${runtime.browser_window_mode || "-"}</code>`,
-        `headless=<code>${runtime.browser_headless}</code>`,
-        `delay=<code>${runtime.request_delay_seconds || "-"}s</code>`,
-        `expected country=<code>${runtime.expected_egress_country || "-"}</code>`,
-        `next cycle=<code>${run.next_cycle_at ? localTime(run.next_cycle_at) : "-"}</code>`,
-        `blocked reason=<code>${run.blocked_reason || "-"}</code>`
+        `motor=<code>${runtime.browser_backend || "-"}</code>`,
+        `ventana=<code>${windowModeLabel(runtime.browser_window_mode)}</code>`,
+        `sin interfaz=<code>${booleanLabel(runtime.browser_headless)}</code>`,
+        `demora=<code>${runtime.request_delay_seconds || "-"}s</code>`,
+        `país esperado=<code>${runtime.expected_egress_country || "-"}</code>`,
+        `próximo ciclo=<code>${run.next_cycle_at ? localTime(run.next_cycle_at) : "-"}</code>`,
+        `motivo de bloqueo=<code>${run.blocked_reason || "-"}</code>`
       ].map((item) => `<div style="margin-bottom:8px">${item}</div>`).join("");
       document.getElementById("cycles").innerHTML = (data.cycles || []).map((cycle) => {
         const artifact = cycle.artifact_path ? `<a href="/artifact/${cycle.cycle_id}" target="_blank">${fileName(cycle.artifact_path)}</a>` : "";
@@ -818,7 +854,7 @@ def _dashboard_html() -> str:
         return `<tr>
           <td>${cycle.sequence}</td>
           <td>${statusBadge(cycle.status)}</td>
-          <td>${cycle.target_label}</td>
+          <td>${escapeHtml(targetLabel(cycle.target_label))}</td>
           <td>${cycle.result_count ?? ""}</td>
           <td>${artifact}</td>
           <td>${report}</td>
@@ -828,8 +864,8 @@ def _dashboard_html() -> str:
       }).join("");
       document.getElementById("events").innerHTML = (data.events || []).slice(0, 25).map((event) => `<tr>
         <td>${localTime(event.created_at)}</td>
-        <td>${event.level}</td>
-        <td>${event.message}</td>
+        <td>${escapeHtml(levelLabel(event.level))}</td>
+        <td>${escapeHtml(eventMessageLabel(event.message))}</td>
       </tr>`).join("");
     }
     document.getElementById("stopButton").addEventListener("click", requestStop);

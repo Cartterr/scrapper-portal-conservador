@@ -208,7 +208,7 @@ def test_captcha_safety_stop_pauses_and_exposes_alert(tmp_path: Path) -> None:
     assert status["alert"]["active"] is True
     assert status["alert"]["reason"] == "captcha_rejected"
     assert "CAPTCHA" in status["alert"]["title"]
-    assert "paused" in status["alert"]["message"]
+    assert "pausada" in status["alert"]["message"]
 
 
 def test_stop_request_stops_runner_after_current_safe_point(tmp_path: Path) -> None:
@@ -312,12 +312,12 @@ def test_dashboard_root_contains_screenshot_evidence_ui(tmp_path: Path) -> None:
     finally:
         dashboard.stop()
 
-    assert "Evidence Snapshot" in html
+    assert "Evidencia actual" in html
     assert "iconLibrary" in html
-    assert "Outcome Mix" in html
-    assert "Cycle Timeline" in html
+    assert "Resumen de resultados" in html
+    assert "Línea de ciclos" in html
     assert "safetyAlert" in html
-    assert "Critical safety stop" in html
+    assert "Parada crítica de seguridad" in html
     assert "donut" in html
     assert "sparkline" in html
 

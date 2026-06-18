@@ -702,17 +702,17 @@ def _active_alert(
         or "safety_stop"
     )
     reason_text = str(reason)
-    title = "Portal safety stop"
-    summary = "The soak runner paused immediately. No further portal actions will run until operator review and restart."
+    title = "Parada de seguridad del portal"
+    summary = "La prueba continua se pausó de inmediato. No habrá más acciones en el portal hasta revisión y reinicio manual."
     if reason_text == "captcha_rejected":
-        title = "CAPTCHA challenge detected"
-        summary = "CBRS returned a CAPTCHA-related signal. The indefinite test is paused and will not continue portal traffic."
+        title = "Desafío CAPTCHA detectado"
+        summary = "CBRS devolvió una señal relacionada con CAPTCHA. La prueba indefinida queda pausada y no seguirá enviando tráfico al portal."
     elif reason_text in {"waf_challenge", "unexpected_html"}:
-        title = "Portal challenge detected"
-        summary = "CBRS or its WAF returned a challenge page. The indefinite test is paused before any more portal actions."
+        title = "Desafío del portal detectado"
+        summary = "CBRS o su WAF devolvió una página de desafío. La prueba indefinida se pausó antes de cualquier otra acción."
     elif reason_text == "rate_limit":
-        title = "Rate limit safety stop"
-        summary = "CBRS returned a rate-limit signal. The indefinite test is paused and will not retry automatically."
+        title = "Límite de uso detectado"
+        summary = "CBRS devolvió una señal de límite de uso. La prueba indefinida queda pausada y no reintentará automáticamente."
 
     return redact(
         {
