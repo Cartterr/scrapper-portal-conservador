@@ -392,6 +392,97 @@ def cmd_soak(args: argparse.Namespace) -> int:
     return result.exit_code
 
 
+def cmd_pool(args: argparse.Namespace) -> int:
+    from .account_pool import (
+        account_settings,
+        dashboard_status,
+        default_pool_store,
+        load_account_pool_config,
+        run_account_pool,
+    )
+
+    pool_config = load_account_pool_config(
+        config.SETTINGS,
+        path=Path(args.config) if getattr(args, "config", None) else None,
+    )
+    store = default_pool_store(config.SETTINGS)
+
+    if args.pool_command == "status":
+        print(json.dumps(dashboard_status(store, config=pool_config), ensure_ascii=False, indent=2))
+        return 0
+    if args.pool_command == "stop":
+        store.request_stop()
+        print("Stop requested. The account pool runner will stop after the current safe point.")
+        return 0
+    if args.pool_command == "dashboard":
+        from .account_pool_dashboard import start_pool_dashboard
+
+        host = args.host or pool_config.dashboard_host
+        port = args.port if args.port is not None else pool_config.dashboard_port
+        dashboard = start_pool_dashboard(
+            store,
+            settings=config.SETTINGS,
+            config=pool_config,
+            host=host,
+            port=port,
+        )
+        print(f"Account pool dashboard: {dashboard.url}")
+        print("Dashboard is running without starting the pool flow. Press Ctrl+C to stop it.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            dashboard.stop()
+            print("\nDashboard stopped.")
+        return 0
+    if args.pool_command == "init":
+        from .scraper import CBRSScraper
+
+        account = _pool_account_by_id(pool_config, args.account)
+        settings = account_settings(config.SETTINGS, account)
+        result = run_preflight(settings, write_report=True, approve_baseline=True)
+        for check in result.report.get("checks", []):
+            status = "OK" if check.get("ok") else "FAIL"
+            print(f"{status:4} {check.get('name')}: {check.get('detail')}")
+        if result.report_path:
+            print(f"Preflight report: {result.report_path}")
+        if not result.ok:
+            print("Pool account init stopped because preflight failed.", file=sys.stderr)
+            return 1
+
+        print(f"Opening CBRS login page for {account.label}...")
+        print("Please log in manually in the browser window.")
+        print("This account has its own persistent Chrome profile.")
+        print("No credentials, raw cookies, or session JSON will be exported.\n")
+        print("Waiting for login...")
+        timeout = args.timeout if args.timeout > 0 else None
+        with CBRSScraper(headless=False, settings=settings) as scraper:
+            scraper.init_session(timeout_seconds=timeout)
+        print(f"\nSession ready for {account.label}.")
+        return 0
+
+    result = run_account_pool(
+        settings=config.SETTINGS,
+        config=pool_config,
+        store=store,
+        dry_run=args.dry_run,
+        max_cycles=args.max_cycles,
+        dashboard=args.dashboard,
+        headless=_runtime_headless(args),
+        on_dashboard_start=lambda url: print(f"Account pool dashboard: {url}"),
+    )
+    print(f"Account pool run {result.status}: {result.run_id}")
+    return result.exit_code
+
+
+def _pool_account_by_id(pool_config, account_id: str):
+    for account in pool_config.accounts:
+        if account.account_id == account_id:
+            return account
+    available = ", ".join(account.account_id for account in pool_config.accounts)
+    raise SystemExit(f"Unknown pool account {account_id!r}. Available accounts: {available}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cbrs",
@@ -557,6 +648,86 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Write export JSON to a file instead of stdout",
     )
+
+    pool_parser = subparsers.add_parser("pool", help="Run the authorized account query pool")
+    pool_subparsers = pool_parser.add_subparsers(dest="pool_command", required=True)
+
+    pool_init_parser = pool_subparsers.add_parser(
+        "init",
+        help="Open browser for manual login into one pool account profile",
+    )
+    pool_init_parser.add_argument(
+        "--account",
+        required=True,
+        help="Pool account id, e.g. ejecutivo_1",
+    )
+    pool_init_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=0,
+        help="Seconds to wait for login; 0 waits indefinitely",
+    )
+    pool_init_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to .cbrs/account-pool.json override",
+    )
+
+    pool_run_parser = pool_subparsers.add_parser(
+        "run",
+        help="Run the controlled multi-account pool loop",
+    )
+    pool_run_parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="Start the read-only local pool dashboard",
+    )
+    pool_run_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Exercise pool storage and dashboard without portal traffic",
+    )
+    pool_run_parser.add_argument(
+        "--max-cycles",
+        type=int,
+        default=None,
+        help="Stop after this many cycles; omitted runs until stopped",
+    )
+    pool_run_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to .cbrs/account-pool.json override",
+    )
+
+    pool_dashboard_parser = pool_subparsers.add_parser(
+        "dashboard",
+        help="Start the local account pool dashboard without running the pool",
+    )
+    pool_dashboard_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to .cbrs/account-pool.json override",
+    )
+    pool_dashboard_parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help="Dashboard host; defaults to pool config",
+    )
+    pool_dashboard_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Dashboard port; defaults to pool config",
+    )
+    pool_subparsers.add_parser("status", help="Print the latest pool status JSON")
+    pool_subparsers.add_parser(
+        "stop",
+        help="Request the active pool runner to stop after the current safe point",
+    )
     return parser
 
 
@@ -585,6 +756,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_validate(args)
         if args.command == "soak":
             return cmd_soak(args)
+        if args.command == "pool":
+            return cmd_pool(args)
 
         from .scraper import CBRSScraper
 

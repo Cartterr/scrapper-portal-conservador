@@ -87,3 +87,38 @@ def test_soak_stop_parser() -> None:
 
     assert args.command == "soak"
     assert args.soak_command == "stop"
+
+
+def test_pool_init_parser_targets_one_account() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["pool", "init", "--account", "ejecutivo_1", "--timeout", "600"])
+
+    assert args.command == "pool"
+    assert args.pool_command == "init"
+    assert args.account == "ejecutivo_1"
+    assert args.timeout == 600
+
+
+def test_pool_run_parser_supports_dashboard_dry_run() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        ["pool", "run", "--dashboard", "--dry-run", "--max-cycles", "6"]
+    )
+
+    assert args.command == "pool"
+    assert args.pool_command == "run"
+    assert args.dashboard is True
+    assert args.dry_run is True
+    assert args.max_cycles == 6
+
+
+def test_pool_dashboard_and_stop_parsers() -> None:
+    parser = build_parser()
+    dashboard_args = parser.parse_args(["pool", "dashboard", "--port", "9877"])
+    stop_args = parser.parse_args(["pool", "stop"])
+
+    assert dashboard_args.command == "pool"
+    assert dashboard_args.pool_command == "dashboard"
+    assert dashboard_args.port == 9877
+    assert stop_args.command == "pool"
+    assert stop_args.pool_command == "stop"

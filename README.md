@@ -62,6 +62,23 @@ python -m cbrs soak run --dashboard
 python -m cbrs soak stop
 ```
 
+Pool autorizado de 3 cuentas:
+
+```powershell
+python -m cbrs pool init --account ejecutivo_1 --timeout 600
+python -m cbrs pool init --account ejecutivo_2 --timeout 600
+python -m cbrs pool init --account ejecutivo_3 --timeout 600
+
+python -m cbrs pool dashboard
+python -m cbrs pool run --dashboard
+python -m cbrs pool stop
+```
+
+El pool usa `.cbrs/account-pool.json` si existe, pero por defecto crea tres
+labels locales: `ejecutivo_1`, `ejecutivo_2`, `ejecutivo_3`. No pongas emails,
+RUTs, passwords ni tokens en ese archivo; cada cuenta se inicia con login manual
+y perfil persistente propio.
+
 ## Stack
 
 - Python 3.14.
@@ -70,6 +87,7 @@ python -m cbrs soak stop
 - `Pillow` para ensamblar imágenes en PDF.
 - `pytest` para pruebas automatizadas.
 - SQLite + `http.server` para el monitor local de prueba continua.
+- Runtime de pool multi-cuenta con SQLite local y perfiles aislados por cuenta.
 
 ## Qué Hace
 
@@ -77,8 +95,13 @@ python -m cbrs soak stop
 - Ejecuta búsquedas por razón social o por foja/número/año.
 - Descarga el primer resultado o los documentos indicados y genera PDFs.
 - Guarda PDFs en `outputs/`.
+- Puede repartir ciclos entre tres cuentas autorizadas, con cupo teórico de
+  20 consultas por cuenta y 60 consultas diarias totales.
+- Guarda PDFs del pool en `outputs/pool/<run>/<cuenta>/<cycle>/`.
 - Genera reportes sanitizados de validación en `.cbrs/logs/`.
 - Incluye un monitor local de prueba continua en `http://127.0.0.1:8765`.
+- Incluye dashboard del pool con barra de consultas disponibles, estado por
+  ejecutivo, siguiente ciclo y cuentas pausadas.
 - Detiene el flujo ante señales de seguridad como límite diario, CAPTCHA,
   errores WAF, drift de egreso o falta de sesión.
 
@@ -93,10 +116,12 @@ python -m cbrs soak stop
 - Se organizaron outputs en `outputs/` y `outputs/soak/<run>/<cycle>/`.
 - Se agregaron reportes JSON sanitizados para auditoría.
 - Se implementó `doctor`, `preflight`, `validate` y el grupo `soak`.
+- Se implementó `pool` para operar cuentas nominales autorizadas con perfiles
+  separados y cupo diario por cuenta.
 - Se agregó dashboard local en español con estado vivo, countdown, PDFs,
   ciclos, eventos y alertas críticas.
 - Se añadió cobertura de pruebas para configuración, seguridad, preflight,
-  validación, PDFs, runtime de navegador y soak.
+  validación, PDFs, runtime de navegador, soak y pool multi-cuenta.
 
 ## Caveats
 
@@ -107,8 +132,10 @@ python -m cbrs soak stop
   estable/autorizado.
 - El monitor local no aumenta tráfico por sí solo, pero el runner de soak sí
   ejecuta ciclos reales cuando está activo.
-- No hay rotación de cuentas, rotación de IP, resolución externa de CAPTCHA ni
-  reintentos agresivos.
+- El pool no es rotación evasiva: solo debe usarse con cuentas nominales
+  autorizadas por el cliente/CBRS, y una cuenta pausada no se fuerza ni se
+  reintenta agresivamente.
+- No hay rotación de IP, resolución externa de CAPTCHA ni reintentos agresivos.
 
 ## Áreas a Explorar
 
@@ -116,6 +143,8 @@ python -m cbrs soak stop
   allowlisting para uso productivo.
 - Definir una cuota diaria operacional segura según contrato o autorización del
   portal.
+- Confirmar si las 60 consultas teóricas del pool deben quedar como límite duro
+  o si conviene usar un margen operacional más conservador.
 - Mejorar captura visual automática del portal cuando ocurra un safety stop.
 - Evaluar egreso dedicado/cliente si la red actual no es el ambiente final.
 - Separar un modo de prueba completamente offline con fixtures para demos sin
