@@ -14,24 +14,12 @@ logger = logging.getLogger(__name__)
 
 
 class CBRSScraper:
-    def __init__(
-        self,
-        *,
-        headless: bool = False,
-        settings: Settings = SETTINGS,
-        close_browser_on_exit: bool = True,
-    ) -> None:
+    def __init__(self, *, headless: bool = False, settings: Settings = SETTINGS) -> None:
         self.settings = settings
         self.browser = BrowserSession(settings, headless=headless)
         self.client = BrowserOriginClient(self.browser, settings)
-        self.close_browser_on_exit = close_browser_on_exit
 
     def close(self) -> None:
-        self.client.close()
-        if self.close_browser_on_exit:
-            self.browser.close()
-
-    def close_browser(self) -> None:
         self.client.close()
         self.browser.close()
 
