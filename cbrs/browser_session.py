@@ -106,7 +106,13 @@ class BrowserSession:
             self.page.goto(self.settings.commerce_url, wait_until="domcontentloaded", timeout=60000)
 
     def has_login_cookie(self) -> bool:
-        cookies = self.context.cookies([self.settings.base_url])
+        cookies = self.context.cookies(
+            [
+                self.settings.base_url,
+                self.settings.commerce_url,
+                self._url("/api/v1/auth/refresh"),
+            ]
+        )
         return any(cookie["name"] in LOGIN_COOKIE_NAMES for cookie in cookies)
 
     def wait_for_login(self, *, timeout_seconds: int | None = None) -> None:

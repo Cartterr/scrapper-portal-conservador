@@ -146,6 +146,24 @@ def test_browser_session_accepts_refresh_cookie(tmp_path: Path) -> None:
     assert session.has_login_cookie() is True
 
 
+def test_browser_session_checks_auth_refresh_cookie_path(tmp_path: Path) -> None:
+    settings = load_settings({}, root=tmp_path)
+    captured = {}
+
+    class FakeContext:
+        def cookies(self, urls):
+            captured["urls"] = urls
+            if any(url.endswith("/api/v1/auth/refresh") for url in urls):
+                return [{"name": "cbrs_refresh_token", "value": "[REDACTED]"}]
+            return []
+
+    session = BrowserSession(settings)
+    session._context = FakeContext()
+
+    assert session.has_login_cookie() is True
+    assert f"{settings.base_url}/api/v1/auth/refresh" in captured["urls"]
+
+
 def test_browser_session_rejects_stay_signed_in_cookie_without_tokens(tmp_path: Path) -> None:
     settings = load_settings({}, root=tmp_path)
 
