@@ -599,6 +599,40 @@ def choose_target(config: PoolConfig, sequence: int) -> PoolTarget:
     return config.targets[(sequence - 1) % len(config.targets)]
 
 
+class _LiveScraperCache:
+    def __init__(self, scraper_cls: Callable[..., Any] | None = None) -> None:
+        self._scraper_cls = scraper_cls
+        self._scrapers: dict[str, Any] = {}
+
+    def factory_for(self, account_id: str) -> Callable[..., Any]:
+        def factory(**kwargs: Any) -> Any:
+            scraper = self._scrapers.get(account_id)
+            if scraper is None:
+                scraper_cls = self._scraper_cls
+                if scraper_cls is None:
+                    from .scraper import CBRSScraper
+
+                    scraper_cls = CBRSScraper
+                scraper = scraper_cls(
+                    headless=kwargs.get("headless", False),
+                    settings=kwargs.get("settings", SETTINGS),
+                    close_browser_on_exit=False,
+                )
+                self._scrapers[account_id] = scraper
+            return scraper
+
+        return factory
+
+    def close_all(self) -> None:
+        for scraper in self._scrapers.values():
+            close_browser = getattr(scraper, "close_browser", None)
+            if callable(close_browser):
+                close_browser()
+            else:
+                scraper.close()
+        self._scrapers.clear()
+
+
 def run_account_pool(
     *,
     settings: Settings = SETTINGS,
@@ -645,6 +679,7 @@ def run_account_pool(
     sequence = 0
     final_status = "completed"
     exit_code = 0
+    live_scrapers = _LiveScraperCache() if not dry_run else None
     try:
         while max_cycles is None or sequence < max_cycles:
             if store.stop_requested():
@@ -705,22 +740,26 @@ def run_account_pool(
             )
 
             with _heartbeat_while_cycle_runs(store, run_id):
-                result = (
-                    _dry_run_validation(runtime_settings, target, cycle_output_dir)
-                    if dry_run
-                    else validation_runner(
-                        settings=runtime_settings,
-                        search_kind=target.kind,
-                        query=target.query,
-                        foja=target.foja,
-                        numero=target.numero,
-                        ano=target.ano,
-                        download_first=True,
-                        output_dir=cycle_output_dir,
-                        keep_images=False,
-                        headless=headless,
-                    )
-                )
+                if dry_run:
+                    result = _dry_run_validation(runtime_settings, target, cycle_output_dir)
+                else:
+                    validation_kwargs: dict[str, Any] = {
+                        "settings": runtime_settings,
+                        "search_kind": target.kind,
+                        "query": target.query,
+                        "foja": target.foja,
+                        "numero": target.numero,
+                        "ano": target.ano,
+                        "download_first": True,
+                        "output_dir": cycle_output_dir,
+                        "keep_images": False,
+                        "headless": headless,
+                    }
+                    if live_scrapers is not None and validation_runner is run_controlled_validation:
+                        validation_kwargs["scraper_factory"] = live_scrapers.factory_for(
+                            account.account_id
+                        )
+                    result = validation_runner(**validation_kwargs)
 
             cycle_status = _cycle_status(result)
             store.finish_cycle(
@@ -795,6 +834,8 @@ def run_account_pool(
         exit_code = 0
         store.add_event(run_id, message="pool run stopped by operator")
     finally:
+        if live_scrapers is not None:
+            live_scrapers.close_all()
         if final_status == "waiting_capacity" and max_cycles is None:
             store.update_run(run_id, status=final_status)
         else:

@@ -237,6 +237,39 @@ def test_pool_daily_usage_survives_runner_restart(tmp_path: Path) -> None:
     assert usage["ejecutivo_2"] == 1
 
 
+def test_live_scraper_cache_reuses_account_browser(tmp_path: Path) -> None:
+    from cbrs.account_pool import _LiveScraperCache
+
+    settings = load_settings(
+        {"CBRS_PROFILE_DIR": ".cbrs/chrome-profile", "CBRS_OUTPUT_DIR": "outputs"},
+        root=tmp_path,
+    )
+    created: list[object] = []
+
+    class FakeReusableScraper:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            self.close_count = 0
+            created.append(self)
+
+        def close_browser(self) -> None:
+            self.close_count += 1
+
+    cache = _LiveScraperCache(scraper_cls=FakeReusableScraper)
+    factory = cache.factory_for("ejecutivo_1")
+
+    first = factory(headless=False, settings=settings)
+    second = factory(headless=True, settings=settings)
+
+    assert first is second
+    assert len(created) == 1
+    assert first.kwargs["close_browser_on_exit"] is False
+
+    cache.close_all()
+
+    assert first.close_count == 1
+
+
 def test_pool_waits_when_daily_capacity_is_exhausted(tmp_path: Path) -> None:
     from cbrs.account_pool import (
         AccountPoolStore,
