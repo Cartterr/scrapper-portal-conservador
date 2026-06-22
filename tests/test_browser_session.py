@@ -133,7 +133,20 @@ def test_browser_session_accepts_actual_portal_login_cookie(tmp_path: Path) -> N
     assert session.has_login_cookie() is True
 
 
-def test_browser_session_accepts_persistent_stay_signed_in_cookie(tmp_path: Path) -> None:
+def test_browser_session_accepts_refresh_cookie(tmp_path: Path) -> None:
+    settings = load_settings({}, root=tmp_path)
+
+    class FakeContext:
+        def cookies(self, urls):
+            return [{"name": "cbrs_refresh_token", "value": "[REDACTED]"}]
+
+    session = BrowserSession(settings)
+    session._context = FakeContext()
+
+    assert session.has_login_cookie() is True
+
+
+def test_browser_session_rejects_stay_signed_in_cookie_without_tokens(tmp_path: Path) -> None:
     settings = load_settings({}, root=tmp_path)
 
     class FakeContext:
@@ -143,4 +156,4 @@ def test_browser_session_accepts_persistent_stay_signed_in_cookie(tmp_path: Path
     session = BrowserSession(settings)
     session._context = FakeContext()
 
-    assert session.has_login_cookie() is True
+    assert session.has_login_cookie() is False

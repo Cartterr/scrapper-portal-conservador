@@ -13,7 +13,6 @@ from .safety import SafetyStopException, StopReason
 
 logger = logging.getLogger(__name__)
 LOGIN_COOKIE_NAMES = {
-    "auth_cbrs_stay_signed_in",
     "auth_cbrs_token",
     "cbrs_refresh_token",
 }
