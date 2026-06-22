@@ -186,6 +186,57 @@ def test_pool_safety_stop_pauses_only_affected_account(tmp_path: Path) -> None:
     assert status["pool"]["paused_accounts"] == 1
 
 
+def test_pool_daily_usage_survives_runner_restart(tmp_path: Path) -> None:
+    from cbrs.account_pool import (
+        AccountPoolStore,
+        PoolConfig,
+        PoolTarget,
+        dashboard_status,
+        load_account_pool_config,
+        run_account_pool,
+    )
+
+    settings = load_settings(
+        {"CBRS_PROFILE_DIR": ".cbrs/chrome-profile", "CBRS_OUTPUT_DIR": "outputs"},
+        root=tmp_path,
+    )
+    base_config = load_account_pool_config(settings)
+    config = PoolConfig(
+        accounts=base_config.accounts,
+        daily_quota_per_account=20,
+        interval_minutes=0,
+        dashboard_host="127.0.0.1",
+        dashboard_port=8765,
+        targets=(PoolTarget(label="safe_text", kind="text", query="BANCO DE CHILE"),),
+    )
+    store = AccountPoolStore(tmp_path / ".cbrs" / "pool" / "pool.sqlite3")
+
+    first = run_account_pool(
+        settings=settings,
+        config=config,
+        store=store,
+        dry_run=True,
+        max_cycles=1,
+    )
+    second = run_account_pool(
+        settings=settings,
+        config=config,
+        store=store,
+        dry_run=True,
+        max_cycles=1,
+    )
+
+    status = dashboard_status(store, config=config)
+    usage = {account["account_id"]: account["used_today"] for account in status["accounts"]}
+    assert first.run_id != second.run_id
+    assert status["run"]["run_id"] == second.run_id
+    assert status["stats"]["total_cycles"] == 1
+    assert status["pool"]["used_today"] == 2
+    assert status["pool"]["remaining_today"] == 58
+    assert usage["ejecutivo_1"] == 1
+    assert usage["ejecutivo_2"] == 1
+
+
 def test_pool_waits_when_daily_capacity_is_exhausted(tmp_path: Path) -> None:
     from cbrs.account_pool import (
         AccountPoolStore,

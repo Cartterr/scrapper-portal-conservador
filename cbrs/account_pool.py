@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 from .config import SETTINGS, Settings
@@ -408,10 +408,10 @@ class AccountPoolStore:
                 """
                 SELECT account_id, COUNT(*) AS count
                 FROM cycles
-                WHERE run_id = ? AND quota_date = ? AND status = 'passed'
+                WHERE quota_date = ? AND status = 'passed'
                 GROUP BY account_id
                 """,
-                (run_id, quota_date),
+                (quota_date,),
             ).fetchall()
         return {str(row["account_id"]): int(row["count"]) for row in rows}
 
@@ -520,10 +520,15 @@ class AccountPoolStore:
             }
         )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         db = sqlite3.connect(self.path)
         db.row_factory = sqlite3.Row
-        return db
+        try:
+            yield db
+            db.commit()
+        finally:
+            db.close()
 
 
 def load_account_pool_config(
