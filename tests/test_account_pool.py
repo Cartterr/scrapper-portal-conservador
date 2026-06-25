@@ -52,6 +52,7 @@ def test_pool_config_rejects_credentials_and_emails(tmp_path: Path) -> None:
                         "label": "Ejecutivo 1",
                         "email": "person@example.test",
                         "password": "secret",
+                        "proxy_url": "http://user:pass@example.test:33335",
                     }
                 ]
             }
@@ -61,6 +62,47 @@ def test_pool_config_rejects_credentials_and_emails(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="credentials"):
         load_account_pool_config(settings, path=config_path)
+
+
+def test_pool_account_proxy_url_env_resolves_to_account_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cbrs.account_pool import account_settings, load_account_pool_config
+
+    settings = load_settings(
+        {
+            "CBRS_PROFILE_DIR": ".cbrs/chrome-profile",
+            "CBRS_EGRESS_MODE": "dedicated_static_isp",
+        },
+        root=tmp_path,
+    )
+    config_path = tmp_path / ".cbrs" / "account-pool.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "id": "ejecutivo_1",
+                        "label": "Ejecutivo 1",
+                        "proxy_url_env": "CBRS_EJECUTIVO_1_PROXY_URL",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "CBRS_EJECUTIVO_1_PROXY_URL",
+        "http://user:pass@example.test:33335",
+    )
+
+    config = load_account_pool_config(settings, path=config_path)
+    runtime_settings = account_settings(settings, config.accounts[0])
+
+    assert config.accounts[0].proxy_url_env == "CBRS_EJECUTIVO_1_PROXY_URL"
+    assert runtime_settings.proxy_url == "http://user:pass@example.test:33335"
 
 
 def test_pool_dry_run_distributes_cycles_and_tracks_daily_capacity(tmp_path: Path) -> None:

@@ -105,6 +105,59 @@ def test_browser_session_launches_chrome_offscreen_when_configured(
     assert "--window-position=-32000,-32000" in captured["kwargs"]["args"]
 
 
+def test_browser_session_launches_chrome_with_proxy(tmp_path: Path, monkeypatch) -> None:
+    settings = load_settings(
+        {
+            "CBRS_EGRESS_MODE": "dedicated_static_isp",
+            "CBRS_PROXY_URL": "http://proxy-user:proxy-pass@example.test:33335",
+        },
+        root=tmp_path,
+    )
+    browser = tmp_path / "chrome.exe"
+    captured = {}
+
+    class FakeContext:
+        pages = []
+
+        def close(self):
+            pass
+
+    class FakeChromium:
+        def launch_persistent_context(self, user_data_dir, **kwargs):
+            captured["kwargs"] = kwargs
+            return FakeContext()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+        def stop(self):
+            pass
+
+    class FakeSyncPlaywright:
+        def start(self):
+            return FakePlaywright()
+
+    monkeypatch.setattr(
+        "cbrs.browser_session.detect_browser",
+        lambda loaded_settings: SimpleNamespace(path=browser, family="chrome", source="auto"),
+    )
+    monkeypatch.setitem(sys.modules, "playwright", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "playwright.sync_api",
+        SimpleNamespace(sync_playwright=lambda: FakeSyncPlaywright()),
+    )
+
+    with BrowserSession(settings, headless=False):
+        pass
+
+    assert captured["kwargs"]["proxy"] == {
+        "server": "http://example.test:33335",
+        "username": "proxy-user",
+        "password": "proxy-pass",
+    }
+
+
 def test_browser_session_rejects_proxy_in_chrome_backend(tmp_path: Path) -> None:
     settings = load_settings(
         {"CBRS_CLOAK_PROXY_URL": "socks5://user:pass@example.test:1234"},

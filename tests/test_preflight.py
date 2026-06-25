@@ -33,7 +33,10 @@ def test_preflight_requires_egress_mode_before_network_lookup(tmp_path: Path) ->
     assert result.ok is False
     assert "egress mode: not configured" in result.report["errors"]
     assert result.report["egress_hash"] is None
-    assert result.report["checks"][4]["detail"] == "not_checked"
+    egress_country_check = next(
+        check for check in result.report["checks"] if check["name"] == "egress country"
+    )
+    assert egress_country_check["detail"] == "not_checked"
 
 
 def test_preflight_rejects_personal_direct_without_ack(tmp_path: Path) -> None:
@@ -147,7 +150,7 @@ def test_preflight_fails_when_country_is_not_expected(tmp_path: Path) -> None:
     assert "egress country: US" in result.report["errors"]
 
 
-def test_preflight_fails_when_proxy_is_configured(tmp_path: Path) -> None:
+def test_preflight_fails_when_legacy_cloak_proxy_is_configured(tmp_path: Path) -> None:
     settings = _settings_with_browser(
         tmp_path,
         {"CBRS_CLOAK_PROXY_URL": "socks5://user:pass@example.test:1234"},
@@ -160,7 +163,49 @@ def test_preflight_fails_when_proxy_is_configured(tmp_path: Path) -> None:
     )
 
     assert result.ok is False
-    assert "proxy disabled: CBRS_CLOAK_PROXY_URL configured" in result.report["errors"]
+    assert "legacy cloak proxy disabled: CBRS_CLOAK_PROXY_URL configured" in result.report["errors"]
+
+
+def test_preflight_fails_when_browser_proxy_has_wrong_mode(tmp_path: Path) -> None:
+    settings = _settings_with_browser(
+        tmp_path,
+        {"CBRS_PROXY_URL": "http://user:pass@example.test:33335"},
+    )
+
+    result = run_preflight(
+        settings,
+        fetch_egress=lambda: (_raise("egress lookup should not run")),
+        write_report=False,
+    )
+
+    assert result.ok is False
+    assert (
+        "browser proxy route: CBRS_PROXY_URL requires CBRS_EGRESS_MODE=dedicated_static_isp"
+        in result.report["errors"]
+    )
+
+
+def test_preflight_allows_browser_proxy_for_dedicated_static_isp(tmp_path: Path) -> None:
+    settings = _settings_with_browser(
+        tmp_path,
+        {
+            "CBRS_EGRESS_MODE": "dedicated_static_isp",
+            "CBRS_PROXY_URL": "http://user:pass@example.test:33335",
+        },
+    )
+
+    result = run_preflight(
+        settings,
+        fetch_egress=lambda: {"ip": "1.2.3.4", "country": "CL"},
+        approve_baseline=True,
+        write_report=False,
+    )
+
+    assert result.ok is True
+    assert result.report["proxy_configured"] is True
+    assert result.report["proxy_scheme"] == "http"
+    assert result.report["proxy_host_hash"]
+    assert "example.test" not in json.dumps(result.report)
 
 
 def _settings_with_browser(tmp_path: Path, env: dict[str, str] | None = None):

@@ -30,6 +30,8 @@ Acceptance:
 - after approval, plain `preflight` passes only from the same egress hash
 - search results only show docs/tests/legacy code, not active production config
 - `.env` does not contain `CBRS_CLOAK_PROXY_URL`
+- `.env` may contain `CBRS_PROXY_URL` only when
+  `CBRS_EGRESS_MODE=dedicated_static_isp`; never commit the real proxy URL
 - `.env` contains one of:
   `CBRS_EGRESS_MODE=client_vpn`,
   `CBRS_EGRESS_MODE=client_office`, or
@@ -74,7 +76,8 @@ Acceptance:
 - report does not store query text, ticket, cookies, JWTs, captcha tokens, raw
   IPs, credentials, or proxy URLs
 - report stores browser backend, browser family, profile hash, egress country,
-  egress hash, fixed delay, and safety-stop reason if any
+  egress hash, fixed delay, sanitized proxy metadata, and safety-stop reason if
+  any
 
 ## 4. Day 2 Search-Only Live Proof
 
@@ -142,8 +145,8 @@ These are logic tests, not live stress tests:
 
 - `tests/test_safety.py` proves `err-limite`, `intente-mas-tarde`, `403`, `429`,
   WAF/challenge HTML, and image HTML responses stop the flow.
-- `tests/test_preflight.py` proves proxy config, non-CL egress, and egress-hash
-  drift stop before portal traffic.
+- `tests/test_preflight.py` proves legacy proxy config, non-CL egress, invalid
+  browser-proxy mode, and egress-hash drift stop before portal traffic.
 - The live tool must not continue, retry, rotate accounts, or switch identity
   after any safety stop.
 
@@ -157,6 +160,8 @@ These are logic tests, not live stress tests:
 - do not use a personal/home IP for approval or live validation
 - use client-owned Chilean egress, a client VPN, or a dedicated static Chile ISP
   path approved in writing
+- if using `CBRS_PROXY_URL`, keep it fixed per account/profile and use only
+  `CBRS_EGRESS_MODE=dedicated_static_isp`
 - if personal/direct mode is used anyway, label it explicitly and stop after the
   minimum login/search proof
 - no continuing after egress drift, `403`, `429`, `err-limite`,

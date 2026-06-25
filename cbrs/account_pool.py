@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import sqlite3
@@ -40,6 +41,11 @@ SECRET_ACCOUNT_KEYS = {
     "token",
     "cookie",
     "credentials",
+    "api_key",
+    "bright_data_api_key",
+    "proxy_url",
+    "proxy_password",
+    "proxy_username",
 }
 
 
@@ -48,6 +54,7 @@ class PoolAccount:
     account_id: str
     label: str
     enabled: bool = True
+    proxy_url_env: str | None = None
 
 
 @dataclass(frozen=True)
@@ -564,7 +571,19 @@ def load_account_pool_config(
 
 def account_settings(settings: Settings, account: PoolAccount) -> Settings:
     profile_root = settings.profile_dir.parent / "accounts" / account.account_id
-    return replace(settings, profile_dir=(profile_root / "chrome-profile").resolve())
+    proxy_url = settings.proxy_url
+    if account.proxy_url_env:
+        proxy_url = os.environ.get(account.proxy_url_env)
+        if not proxy_url:
+            raise ValueError(
+                f"Pool account {account.account_id} requires env var "
+                f"{account.proxy_url_env} with its proxy URL."
+            )
+    return replace(
+        settings,
+        profile_dir=(profile_root / "chrome-profile").resolve(),
+        proxy_url=proxy_url,
+    )
 
 
 def default_pool_store(settings: Settings = SETTINGS) -> AccountPoolStore:
@@ -989,7 +1008,15 @@ def _parse_accounts(raw_accounts: Any) -> Iterable[PoolAccount]:
             raise ValueError("each pool account requires an id")
         label = str(raw.get("label") or account_id).strip()
         enabled = bool(raw.get("enabled", True))
-        accounts.append(PoolAccount(account_id=account_id, label=label, enabled=enabled))
+        proxy_url_env = _safe_env_var(str(raw.get("proxy_url_env") or "").strip())
+        accounts.append(
+            PoolAccount(
+                account_id=account_id,
+                label=label,
+                enabled=enabled,
+                proxy_url_env=proxy_url_env,
+            )
+        )
     return accounts
 
 
@@ -1020,6 +1047,14 @@ def _safe_account_id(value: str) -> str:
     value = value.strip().lower().replace("-", "_")
     if not re.fullmatch(r"[a-z0-9_]+", value):
         return ""
+    return value
+
+
+def _safe_env_var(value: str) -> str | None:
+    if not value:
+        return None
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", value):
+        raise ValueError("proxy_url_env must be an uppercase environment variable name")
     return value
 
 

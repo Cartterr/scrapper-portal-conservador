@@ -111,6 +111,15 @@ def test_cloak_proxy_url_is_loaded(tmp_path: Path) -> None:
     assert settings.cloak_proxy_url == "socks5://user:pass@example.test:1234"
 
 
+def test_browser_proxy_url_is_loaded(tmp_path: Path) -> None:
+    settings = load_settings(
+        {"CBRS_PROXY_URL": "http://user:pass@example.test:33335"},
+        root=tmp_path,
+    )
+
+    assert settings.proxy_url == "http://user:pass@example.test:33335"
+
+
 def test_no_multi_account_rotation_config_exists() -> None:
     import cbrs.config as config
 

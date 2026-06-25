@@ -22,6 +22,19 @@ CBRS_PROFILE_DIR=.cbrs/chrome-profile
 CBRS_OUTPUT_DIR=outputs
 ```
 
+Si vas a usar un proveedor de IP estática ISP chilena dedicada, no guardes el
+proxy en el repo. Decláralo solo en `.env` y usa el modo dedicado:
+
+```dotenv
+CBRS_EGRESS_MODE=dedicated_static_isp
+CBRS_EXPECTED_EGRESS_COUNTRY=CL
+CBRS_PROXY_URL=http://usuario:password@host:puerto
+```
+
+El valor real de `CBRS_PROXY_URL` se valida por preflight, pero los reportes
+solo guardan esquema, puerto y hash del host. No se guardan usuario, password,
+IP cruda ni URL completa.
+
 Para una prueba local explícita desde tu conexión actual:
 
 ```dotenv
@@ -79,6 +92,24 @@ labels locales: `ejecutivo_1`, `ejecutivo_2`, `ejecutivo_3`. No pongas emails,
 RUTs, passwords ni tokens en ese archivo; cada cuenta se inicia con login manual
 y perfil persistente propio.
 
+Para asignar un proxy fijo diferente por cuenta, guarda solo el nombre de la
+variable de entorno en `.cbrs/account-pool.json`:
+
+```json
+{
+  "accounts": [
+    {
+      "id": "ejecutivo_1",
+      "label": "Ejecutivo 1",
+      "proxy_url_env": "CBRS_EJECUTIVO_1_PROXY_URL"
+    }
+  ]
+}
+```
+
+Luego define `CBRS_EJECUTIVO_1_PROXY_URL` fuera de git. El dashboard y los logs
+siguen mostrando solo labels sanitizados.
+
 ## Stack
 
 - Python 3.14.
@@ -111,6 +142,8 @@ y perfil persistente propio.
   perfil persistente.
 - Se dejó de guardar sesiones crudas tipo `.cbrs_session.json`.
 - Se agregó preflight de egreso, país esperado y hash sanitizado.
+- Se agregó soporte para egreso estático ISP dedicado por `CBRS_PROXY_URL`,
+  con metadata sanitizada y bloqueo si se usa fuera del modo dedicado.
 - Se incorporaron paradas duras ante `403`, `429`, `err-limite`,
   `intente-mas-tarde`, CAPTCHA o HTML de desafío.
 - Se organizaron outputs en `outputs/` y `outputs/soak/<run>/<cycle>/`.
@@ -130,6 +163,8 @@ y perfil persistente propio.
 - El login es manual; no se guardan credenciales ni se automatiza el ingreso.
 - La confiabilidad depende de mantener el mismo perfil de navegador y un egreso
   estable/autorizado.
+- `CBRS_PROXY_URL` solo es válido para egresos estáticos/dedicados; no está
+  pensado para rotación, pools residenciales variables ni fallback automático.
 - El monitor local no aumenta tráfico por sí solo, pero el runner de soak sí
   ejecuta ciclos reales cuando está activo.
 - El pool no es rotación evasiva: solo debe usarse con cuentas nominales

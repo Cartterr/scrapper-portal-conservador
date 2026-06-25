@@ -6,10 +6,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from .browser_runtime import get_browser_status, profile_hash
-from .config import ALLOWED_EGRESS_MODES, PERSONAL_DIRECT_EGRESS_MODE, SETTINGS, Settings
+from .config import (
+    ALLOWED_EGRESS_MODES,
+    PERSONAL_DIRECT_EGRESS_MODE,
+    SETTINGS,
+    Settings,
+    proxy_metadata,
+)
 from .safety import redact
 
 EGRESS_INFO_URL = "https://ipinfo.io/json"
@@ -33,7 +40,7 @@ def run_preflight(
     write_report: bool = True,
     approve_baseline: bool = False,
 ) -> PreflightResult:
-    fetch_egress = fetch_egress or fetch_public_egress
+    fetch_egress = fetch_egress or (lambda: fetch_public_egress(settings))
     checks: list[dict[str, Any]] = []
     errors: list[str] = []
     browser_status = get_browser_status(settings)
@@ -55,9 +62,16 @@ def run_preflight(
     _add_check(
         checks,
         errors,
-        "proxy disabled",
+        "legacy cloak proxy disabled",
         settings.cloak_proxy_url is None,
         "not configured" if settings.cloak_proxy_url is None else "CBRS_CLOAK_PROXY_URL configured",
+    )
+    _add_check(
+        checks,
+        errors,
+        "browser proxy route",
+        _proxy_route_allowed(settings),
+        _proxy_route_detail(settings),
     )
     _add_check(
         checks,
@@ -133,6 +147,7 @@ def run_preflight(
         "expected_egress_country": settings.expected_egress_country,
         "egress_country": egress_country,
         "egress_hash": egress_hash,
+        **proxy_metadata(settings),
         "checks": checks,
         "errors": errors,
     }
@@ -147,9 +162,11 @@ def ensure_preflight_ok(settings: Settings = SETTINGS) -> PreflightResult:
     return result
 
 
-def fetch_public_egress() -> dict[str, Any]:
+def fetch_public_egress(settings: Settings = SETTINGS) -> dict[str, Any]:
     request = Request(EGRESS_INFO_URL, headers={"user-agent": "cbrs-preflight/1.0"})
-    with urlopen(request, timeout=20) as response:
+    opener = _proxy_opener(settings.proxy_url)
+    open_fn = opener.open if opener else urlopen
+    with open_fn(request, timeout=20) as response:
         payload = response.read().decode("utf-8", errors="replace")
     data = json.loads(payload)
     if not isinstance(data, dict):
@@ -181,6 +198,10 @@ def preflight_validation_metadata(result: PreflightResult) -> dict[str, Any]:
         "egress_hash": report.get("egress_hash"),
         "profile_hash": report.get("profile_hash"),
         "preflight_status": report.get("status"),
+        "proxy_configured": report.get("proxy_configured"),
+        "proxy_scheme": report.get("proxy_scheme"),
+        "proxy_host_hash": report.get("proxy_host_hash"),
+        "proxy_port": report.get("proxy_port"),
     }
 
 
@@ -240,6 +261,35 @@ def _egress_mode_allowed(settings: Settings) -> bool:
         settings.egress_mode == PERSONAL_DIRECT_EGRESS_MODE
         and settings.allow_personal_egress
     )
+
+
+def _proxy_route_allowed(settings: Settings) -> bool:
+    if settings.cloak_proxy_url:
+        return False
+    if not settings.proxy_url:
+        return True
+    return settings.egress_mode == "dedicated_static_isp"
+
+
+def _proxy_route_detail(settings: Settings) -> str:
+    if settings.cloak_proxy_url:
+        return "CBRS_CLOAK_PROXY_URL configured"
+    if not settings.proxy_url:
+        return "not configured"
+    if settings.egress_mode != "dedicated_static_isp":
+        return "CBRS_PROXY_URL requires CBRS_EGRESS_MODE=dedicated_static_isp"
+    parsed = urlparse(settings.proxy_url)
+    return f"{parsed.scheme.lower()} proxy configured"
+
+
+def _proxy_opener(proxy_url: str | None):
+    if not proxy_url:
+        return None
+    parsed = urlparse(proxy_url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise RuntimeError("preflight egress check supports only HTTP(S) proxy URLs")
+    proxy_handler = ProxyHandler({"http": proxy_url, "https": proxy_url})
+    return build_opener(proxy_handler)
 
 
 def _egress_mode_detail(settings: Settings) -> str:

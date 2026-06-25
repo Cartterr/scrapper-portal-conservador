@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 
 from .browser_runtime import detect_browser
@@ -50,6 +50,7 @@ class BrowserSession:
                 raise RuntimeError(
                     "CBRS_CLOAK_PROXY_URL is not allowed with the production chrome backend."
                 )
+            proxy = _playwright_proxy(self.settings.proxy_url)
             executable = detect_browser(self.settings)
 
             from playwright.sync_api import sync_playwright
@@ -61,6 +62,7 @@ class BrowserSession:
                 headless=self.headless,
                 accept_downloads=True,
                 bypass_csp=True,
+                proxy=proxy,
                 args=_chrome_launch_args(self.settings, headless=self.headless),
             )
             return self
@@ -301,3 +303,21 @@ def _chrome_launch_args(settings: Settings, *, headless: bool) -> list[str]:
     if settings.window_mode == "offscreen":
         return list(OFFSCREEN_CHROME_ARGS)
     return []
+
+
+def _playwright_proxy(proxy_url: str | None) -> dict[str, str] | None:
+    if not proxy_url:
+        return None
+    parsed = urlparse(proxy_url)
+    if parsed.scheme.lower() not in {"http", "https", "socks5"}:
+        raise RuntimeError("CBRS_PROXY_URL must start with http://, https://, or socks5://.")
+    if not parsed.hostname or not parsed.port:
+        raise RuntimeError("CBRS_PROXY_URL must include a proxy host and port.")
+    proxy: dict[str, str] = {
+        "server": f"{parsed.scheme.lower()}://{parsed.hostname}:{parsed.port}",
+    }
+    if parsed.username:
+        proxy["username"] = unquote(parsed.username)
+    if parsed.password:
+        proxy["password"] = unquote(parsed.password)
+    return proxy

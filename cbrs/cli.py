@@ -135,9 +135,9 @@ def cmd_doctor() -> int:
             _egress_mode_detail(settings),
         ),
         (
-            "production proxy disabled",
-            settings.cloak_proxy_url is None,
-            "not configured" if settings.cloak_proxy_url is None else "CBRS_CLOAK_PROXY_URL configured",
+            "browser proxy route",
+            _proxy_route_allowed(settings),
+            _proxy_route_detail(settings),
         ),
         (
             "image transport",
@@ -201,6 +201,24 @@ def _egress_mode_detail(settings: config.Settings) -> str:
             else "personal_direct requires CBRS_ALLOW_PERSONAL_EGRESS=1"
         )
     return settings.egress_mode
+
+
+def _proxy_route_allowed(settings: config.Settings) -> bool:
+    if settings.cloak_proxy_url:
+        return False
+    if not settings.proxy_url:
+        return True
+    return settings.egress_mode == "dedicated_static_isp"
+
+
+def _proxy_route_detail(settings: config.Settings) -> str:
+    if settings.cloak_proxy_url:
+        return "CBRS_CLOAK_PROXY_URL configured"
+    if not settings.proxy_url:
+        return "not configured"
+    if settings.egress_mode != "dedicated_static_isp":
+        return "CBRS_PROXY_URL requires CBRS_EGRESS_MODE=dedicated_static_isp"
+    return "configured for dedicated_static_isp"
 
 
 def _runtime_headless(args: argparse.Namespace) -> bool:

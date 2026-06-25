@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .browser_runtime import browser_runtime_metadata
-from .config import SETTINGS, Settings
+from .config import SETTINGS, Settings, proxy_metadata
 from .preflight import preflight_validation_metadata, run_preflight
 from .safety import SafetyStopException, StopReason
 from .safety import redact
@@ -41,6 +41,7 @@ def new_validation_report(
         "egress_country": None,
         "egress_hash": None,
         "preflight_status": None,
+        **proxy_metadata(settings),
     }
     return {
         "schema": "cbrs-validation-v1",

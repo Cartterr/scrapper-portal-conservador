@@ -54,7 +54,7 @@ def test_doctor_fails_when_proxy_is_configured(monkeypatch, capsys, tmp_path: Pa
     out = capsys.readouterr().out
 
     assert result == 1
-    assert "FAIL production proxy disabled: CBRS_CLOAK_PROXY_URL configured" in out
+    assert "FAIL browser proxy route: CBRS_CLOAK_PROXY_URL configured" in out
 
 
 def _write_safe_gitignore(path: Path) -> None:

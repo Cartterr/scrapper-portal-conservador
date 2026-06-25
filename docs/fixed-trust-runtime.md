@@ -3,9 +3,11 @@
 ## Decision
 
 Production uses normal Chrome/Edge with one clean persistent profile and a
-declared non-personal Chilean egress path. This aligns the automated flow with
-the operator's authorized access pattern while avoiding the user's personal/home
-IP, residential proxy trust, and stealth-browser reputation.
+declared non-personal Chilean egress path. That path can be a client VPN,
+client office connection, or a dedicated static Chile ISP proxy. This aligns
+the automated flow with the operator's authorized access pattern while avoiding
+the user's personal/home IP, rotating residential proxy trust, and
+stealth-browser reputation.
 
 IPRoyal Residential is not the production path because residential proxy pools
 can rotate, inherit unrelated reputation, and trigger portal risk controls even
@@ -19,12 +21,34 @@ connectivity experiments, never for production validation.
 - Profile: `.cbrs/chrome-profile`.
 - Egress mode: mandatory `client_vpn`, `client_office`, or
   `dedicated_static_isp`.
+- Proxy URL: allowed only with `CBRS_EGRESS_MODE=dedicated_static_isp`.
+  Reports store only sanitized proxy metadata.
 - Egress hash: expected country `CL`, with a saved hash baseline after explicit
   approval from the intended non-personal path.
 - Login: manual only.
 - Pacing: fixed `5.0s` minimum-safe delay by default.
 - Reports: sanitized JSON under `.cbrs/logs/`.
 - Stops: no retry, no identity change, no proxy fallback.
+
+## Dedicated Static ISP Proxy
+
+Use a static ISP proxy only when the provider gives one stable Chilean endpoint
+for the account/profile. Configure it through `.env`, never in committed files:
+
+```dotenv
+CBRS_EGRESS_MODE=dedicated_static_isp
+CBRS_EXPECTED_EGRESS_COUNTRY=CL
+CBRS_PROXY_URL=http://usuario:password@host:puerto
+```
+
+For the account pool, each account can point to a different environment
+variable with `proxy_url_env` in `.cbrs/account-pool.json`. The file stores the
+variable name only; the actual proxy URL stays in the local environment.
+
+`preflight` verifies the public egress through the configured HTTP(S) proxy and
+stores only scheme, port, and a short host hash. SOCKS5 can be used by the
+browser launcher, but preflight cannot verify SOCKS5 egress through the standard
+library and will fail fast instead of assuming it is safe.
 
 ## Official Access / Allowlisting Request
 

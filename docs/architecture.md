@@ -16,13 +16,15 @@ trust path.
 cbrs doctor
   Verifies production config uses the chrome backend
   Verifies Chrome/Edge can be found
-  Verifies proxy config is absent
+  Verifies legacy Cloak proxy config is absent
+  Allows browser proxy only for dedicated static ISP mode
   Verifies the egress mode is explicitly declared
   Verifies local secret/profile paths are ignored by git
 
 cbrs preflight
   Checks installed Chrome/Edge and profile metadata
-  Confirms no local proxy env is configured
+  Confirms legacy Cloak proxy env is not configured
+  Confirms any browser proxy is only used with dedicated static ISP mode
   Refuses public egress lookup until egress mode is declared
   Looks up public egress country
   Requires CL by default
@@ -96,6 +98,7 @@ CBRS_HEADLESS=0
 CBRS_WINDOW_MODE=offscreen
 CBRS_EGRESS_MODE=client_vpn
 CBRS_EXPECTED_EGRESS_COUNTRY=CL
+CBRS_PROXY_URL=
 CBRS_OUTPUT_DIR=outputs
 CBRS_REQUEST_DELAY_SECONDS=5.0
 CBRS_USE_CURL_CFFI_FOR_IMAGES=0
@@ -136,6 +139,12 @@ This mode is intentionally not production-safe; reports will label it as
 `CBRS_CLOAK_PROXY_URL` is not allowed in production fixed-egress mode. Keep it
 out of `.env` before running `doctor`, `preflight`, `init`, `search`,
 `download`, or `validate`.
+
+`CBRS_PROXY_URL` is the generic fixed browser proxy setting. It is allowed only
+when `CBRS_EGRESS_MODE=dedicated_static_isp`, and should point to one stable
+Chile ISP endpoint. Reports redact the full proxy URL and store only scheme,
+port, and a host hash. Do not use it for rotating proxy pools or fallback after
+blocks.
 
 `CBRS_USE_CURL_CFFI_FOR_IMAGES=1` is a compatibility transport only for binary
 image downloads. The default remains browser-origin fetch to preserve one

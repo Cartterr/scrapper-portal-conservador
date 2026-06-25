@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
+from urllib.parse import urlparse
 
 from dotenv import dotenv_values
 
@@ -44,6 +45,7 @@ class Settings:
     cloak_cache_dir: Path
     cloak_fingerprint_seed: str | None
     cloak_proxy_url: str | None
+    proxy_url: str | None
     allow_cloak_auto_update: bool
     output_dir: Path
     request_delay_seconds: float
@@ -172,6 +174,7 @@ def load_settings(
         ),
         cloak_fingerprint_seed=_empty_to_none(env.get("CBRS_CLOAK_FINGERPRINT_SEED")),
         cloak_proxy_url=_empty_to_none(env.get("CBRS_CLOAK_PROXY_URL")),
+        proxy_url=_empty_to_none(env.get("CBRS_PROXY_URL")),
         allow_cloak_auto_update=_bool(env.get("CBRS_ALLOW_CLOAK_AUTO_UPDATE")),
         output_dir=_path(env.get("CBRS_OUTPUT_DIR"), default="outputs", root=root),
         request_delay_seconds=request_delay,
@@ -181,6 +184,30 @@ def load_settings(
 
 
 SETTINGS = load_settings()
+
+
+def proxy_metadata(settings: Settings = SETTINGS) -> dict[str, object]:
+    if not settings.proxy_url:
+        return {
+            "proxy_configured": False,
+            "proxy_scheme": None,
+            "proxy_host_hash": None,
+            "proxy_port": None,
+        }
+    parsed = urlparse(settings.proxy_url)
+    host = parsed.hostname or ""
+    return {
+        "proxy_configured": True,
+        "proxy_scheme": parsed.scheme.lower(),
+        "proxy_host_hash": _hash_text(host) if host else None,
+        "proxy_port": parsed.port,
+    }
+
+
+def _hash_text(value: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 # Backwards-compatible constants for small scripts/importers.
 BASE_URL = SETTINGS.base_url
