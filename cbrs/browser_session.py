@@ -61,7 +61,8 @@ class BrowserSession:
                 executable_path=str(executable.path),
                 headless=self.headless,
                 accept_downloads=True,
-                bypass_csp=True,
+                bypass_csp=False,
+                chromium_sandbox=True,
                 proxy=proxy,
                 args=_chrome_launch_args(self.settings, headless=self.headless),
             )

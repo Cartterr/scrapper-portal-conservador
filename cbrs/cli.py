@@ -478,6 +478,32 @@ def cmd_pool(args: argparse.Namespace) -> int:
             scraper.init_session(timeout_seconds=timeout)
         print(f"\nSession ready for {account.label}.")
         return 0
+    if args.pool_command == "login-debug":
+        from .login_debug import run_login_debug
+
+        account = _pool_account_by_id(pool_config, args.account)
+        settings = account_settings(config.SETTINGS, account)
+        result = run_preflight(settings, write_report=True, approve_baseline=True)
+        for check in result.report.get("checks", []):
+            status = "OK" if check.get("ok") else "FAIL"
+            print(f"{status:4} {check.get('name')}: {check.get('detail')}")
+        if result.report_path:
+            print(f"Preflight report: {result.report_path}")
+        if not result.ok:
+            print("Pool login debug stopped because preflight failed.", file=sys.stderr)
+            return 1
+
+        print(f"Opening diagnostic CBRS login page for {account.label}...")
+        print("Try the manual login once in that browser window.")
+        print("The debug log stores only sanitized URLs, statuses, console errors, and redacted snippets.\n")
+        timeout = args.timeout if args.timeout > 0 else None
+        try:
+            log_path = run_login_debug(settings, timeout_seconds=timeout, label=account.label)
+        except SafetyStopException as exc:
+            print(f"Login debug stopped: {exc}", file=sys.stderr)
+            return 1
+        print(f"\nLogin debug complete: {log_path}")
+        return 0
 
     result = run_account_pool(
         settings=config.SETTINGS,
@@ -686,6 +712,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds to wait for login; 0 waits indefinitely",
     )
     pool_init_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to .cbrs/account-pool.json override",
+    )
+    pool_login_debug_parser = pool_subparsers.add_parser(
+        "login-debug",
+        help="Open one pool account profile with sanitized login/network diagnostics",
+    )
+    pool_login_debug_parser.add_argument(
+        "--account",
+        required=True,
+        help="Pool account id, e.g. ejecutivo_1",
+    )
+    pool_login_debug_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="Seconds to wait for login; 0 waits indefinitely",
+    )
+    pool_login_debug_parser.add_argument(
         "--config",
         type=str,
         default=None,

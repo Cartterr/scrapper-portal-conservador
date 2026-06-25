@@ -35,6 +35,7 @@ cbrs preflight
 cbrs init
   Runs preflight first
   Opens headed Chrome/Edge with .cbrs/chrome-profile
+  Keeps Chromium sandbox enabled and does not bypass CSP
   Operator logs in manually
   Browser storage persists locally
   No raw cookie/session JSON is exported
