@@ -34,6 +34,7 @@ cbrs preflight
 
 cbrs init
   Runs preflight first
+  Runs proxy health when a fixed browser proxy is configured
   Opens headed Chrome/Edge with .cbrs/chrome-profile
   Keeps Chromium sandbox enabled and does not bypass CSP
   Operator logs in manually
@@ -42,6 +43,7 @@ cbrs init
 
 cbrs validate
   Runs preflight before any portal request
+  Runs proxy health before browser work when CBRS_PROXY_URL is configured
   Reuses the persistent browser profile in headed mode by default
   Can move the headed browser offscreen with CBRS_WINDOW_MODE=offscreen
   Uses fixed 5.0s pacing and browser-origin fetch
@@ -146,6 +148,11 @@ when `CBRS_EGRESS_MODE=dedicated_static_isp`, and should point to one stable
 Chile ISP endpoint. Reports redact the full proxy URL and store only scheme,
 port, and a host hash. Do not use it for rotating proxy pools or fallback after
 blocks.
+
+`python -m cbrs pool proxy-health` checks each configured pool account proxy
+before login attempts: Chile egress, Google reCAPTCHA Enterprise script loading,
+and CBRS `/api/v1/home/start`. A proxy that fails this gate is not production
+usable even if its public IP geolocates to Chile.
 
 `CBRS_USE_CURL_CFFI_FOR_IMAGES=1` is a compatibility transport only for binary
 image downloads. The default remains browser-origin fetch to preserve one

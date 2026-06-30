@@ -9,6 +9,7 @@ from typing import Any, Callable
 from .browser_runtime import browser_runtime_metadata
 from .config import SETTINGS, Settings, proxy_metadata
 from .preflight import preflight_validation_metadata, run_preflight
+from .proxy_health import proxy_health_validation_metadata, run_proxy_health
 from .safety import SafetyStopException, StopReason
 from .safety import redact
 
@@ -142,6 +143,28 @@ def run_controlled_validation(
             safety_stop=StopReason.EGRESS_PREFLIGHT.value,
             error="Fixed-egress preflight failed.",
         )
+
+    proxy_health_result = None
+    if settings.proxy_url:
+        proxy_health_result = run_proxy_health(settings, write_report=True)
+        report.update(proxy_health_validation_metadata(proxy_health_result))
+        if not proxy_health_result.ok:
+            finish_validation_report(
+                report,
+                status="safety_stop",
+                safety_stop=StopReason.PROXY_HEALTH.value,
+                error="Proxy health gate failed.",
+            )
+            report_path = write_validation_report(report, settings)
+            return ValidationRunResult(
+                exit_code=2,
+                status="safety_stop",
+                report=report,
+                report_path=report_path,
+                preflight_report_path=preflight_result.report_path,
+                safety_stop=StopReason.PROXY_HEALTH.value,
+                error="Proxy health gate failed.",
+            )
 
     try:
         if scraper_factory is None:

@@ -78,6 +78,9 @@ python -m cbrs soak stop
 Pool autorizado de 3 cuentas:
 
 ```powershell
+python -m cbrs pool proxy-health
+python -m cbrs pool proxy-health --account ejecutivo_1
+
 python -m cbrs pool init --account ejecutivo_1 --timeout 600
 python -m cbrs pool init --account ejecutivo_2 --timeout 600
 python -m cbrs pool init --account ejecutivo_3 --timeout 600
@@ -109,6 +112,12 @@ variable de entorno en `.cbrs/account-pool.json`:
 
 Luego define `CBRS_EJECUTIVO_1_PROXY_URL` fuera de git. El dashboard y los logs
 siguen mostrando solo labels sanitizados.
+
+Antes de intentar login con un proveedor nuevo, ejecuta `pool proxy-health`.
+Este gate valida que el proxy salga por `CL`, que Google reCAPTCHA Enterprise
+cargue correctamente y que el endpoint inicial de CBRS responda `200`. Si falla,
+`pool init`, `pool login-debug` y los ciclos vivos del pool no deben abrir flujo
+real.
 
 ## Stack
 
@@ -144,6 +153,8 @@ siguen mostrando solo labels sanitizados.
 - Se agregó preflight de egreso, país esperado y hash sanitizado.
 - Se agregó soporte para egreso estático ISP dedicado por `CBRS_PROXY_URL`,
   con metadata sanitizada y bloqueo si se usa fuera del modo dedicado.
+- Se agregó `pool proxy-health` para bloquear proxies que no cargan Google
+  reCAPTCHA o el inicio del portal CBRS antes de intentar login.
 - Se incorporaron paradas duras ante `403`, `429`, `err-limite`,
   `intente-mas-tarde`, CAPTCHA o HTML de desafío.
 - Se organizaron outputs en `outputs/` y `outputs/soak/<run>/<cycle>/`.
@@ -165,6 +176,8 @@ siguen mostrando solo labels sanitizados.
   estable/autorizado.
 - `CBRS_PROXY_URL` solo es válido para egresos estáticos/dedicados; no está
   pensado para rotación, pools residenciales variables ni fallback automático.
+- Un proxy puede pasar país `CL` y aun así no servir para login si no puede
+  cargar `https://www.google.com/recaptcha/enterprise.js`.
 - El monitor local no aumenta tráfico por sí solo, pero el runner de soak sí
   ejecuta ciclos reales cuando está activo.
 - El pool no es rotación evasiva: solo debe usarse con cuentas nominales

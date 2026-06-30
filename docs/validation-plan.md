@@ -15,6 +15,7 @@ python -m pytest
 python -m cbrs doctor
 python -m cbrs preflight
 python -m cbrs preflight --approve-egress-baseline
+python -m cbrs pool proxy-health
 rg -n "CapSolver|capsolver|2captcha|ACCOUNTS|USER_\d|PASSWORD_\d|cbrs_session|disable-blink|AutomationControlled|CBRS_CLOAK_PROXY_URL"
 ```
 
@@ -32,6 +33,8 @@ Acceptance:
 - `.env` does not contain `CBRS_CLOAK_PROXY_URL`
 - `.env` may contain `CBRS_PROXY_URL` only when
   `CBRS_EGRESS_MODE=dedicated_static_isp`; never commit the real proxy URL
+- if `CBRS_PROXY_URL` is configured, `pool proxy-health` must pass before login:
+  Chile egress, Google reCAPTCHA Enterprise script, and CBRS home start
 - `.env` contains one of:
   `CBRS_EGRESS_MODE=client_vpn`,
   `CBRS_EGRESS_MODE=client_office`, or
@@ -162,6 +165,8 @@ These are logic tests, not live stress tests:
   path approved in writing
 - if using `CBRS_PROXY_URL`, keep it fixed per account/profile and use only
   `CBRS_EGRESS_MODE=dedicated_static_isp`
+- do not attempt login or pool cycles on a proxy that cannot tunnel Google
+  reCAPTCHA Enterprise
 - if personal/direct mode is used anyway, label it explicitly and stop after the
   minimum login/search proof
 - no continuing after egress drift, `403`, `429`, `err-limite`,

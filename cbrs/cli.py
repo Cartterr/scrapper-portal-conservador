@@ -428,6 +428,25 @@ def cmd_pool(args: argparse.Namespace) -> int:
     if args.pool_command == "status":
         print(json.dumps(dashboard_status(store, config=pool_config), ensure_ascii=False, indent=2))
         return 0
+    if args.pool_command == "proxy-health":
+        from .proxy_health import run_proxy_health
+
+        accounts = (
+            [_pool_account_by_id(pool_config, args.account)]
+            if args.account
+            else list(pool_config.accounts)
+        )
+        exit_code = 0
+        for account in accounts:
+            settings = account_settings(config.SETTINGS, account)
+            result = run_proxy_health(settings, write_report=True)
+            print(f"{account.label} ({account.account_id})")
+            _print_proxy_health(result)
+            if result.report_path:
+                print(f"Proxy health report: {result.report_path}")
+            if not result.ok:
+                exit_code = 1
+        return exit_code
     if args.pool_command == "stop":
         store.request_stop()
         print("Stop requested. The account pool runner will stop after the current safe point.")
@@ -467,6 +486,9 @@ def cmd_pool(args: argparse.Namespace) -> int:
         if not result.ok:
             print("Pool account init stopped because preflight failed.", file=sys.stderr)
             return 1
+        if not _run_and_print_proxy_health(settings):
+            print("Pool account init stopped because proxy health failed.", file=sys.stderr)
+            return 1
 
         print(f"Opening CBRS login page for {account.label}...")
         print("Please log in manually in the browser window.")
@@ -491,6 +513,9 @@ def cmd_pool(args: argparse.Namespace) -> int:
             print(f"Preflight report: {result.report_path}")
         if not result.ok:
             print("Pool login debug stopped because preflight failed.", file=sys.stderr)
+            return 1
+        if not _run_and_print_proxy_health(settings):
+            print("Pool login debug stopped because proxy health failed.", file=sys.stderr)
             return 1
 
         print(f"Opening diagnostic CBRS login page for {account.label}...")
@@ -525,6 +550,22 @@ def _pool_account_by_id(pool_config, account_id: str):
             return account
     available = ", ".join(account.account_id for account in pool_config.accounts)
     raise SystemExit(f"Unknown pool account {account_id!r}. Available accounts: {available}")
+
+
+def _run_and_print_proxy_health(settings: config.Settings) -> bool:
+    from .proxy_health import run_proxy_health
+
+    result = run_proxy_health(settings, write_report=True)
+    _print_proxy_health(result)
+    if result.report_path:
+        print(f"Proxy health report: {result.report_path}")
+    return result.ok
+
+
+def _print_proxy_health(result) -> None:
+    for check in result.report.get("checks", []):
+        status = "OK" if check.get("ok") else "FAIL"
+        print(f"{status:4} {check.get('name')}: {check.get('detail')}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -695,6 +736,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     pool_parser = subparsers.add_parser("pool", help="Run the authorized account query pool")
     pool_subparsers = pool_parser.add_subparsers(dest="pool_command", required=True)
+
+    pool_proxy_health_parser = pool_subparsers.add_parser(
+        "proxy-health",
+        help="Check fixed proxy egress, Google reCAPTCHA, and CBRS login prerequisites",
+    )
+    pool_proxy_health_parser.add_argument(
+        "--account",
+        default=None,
+        help="Optional pool account id; omitted checks every configured account",
+    )
+    pool_proxy_health_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to .cbrs/account-pool.json override",
+    )
 
     pool_init_parser = pool_subparsers.add_parser(
         "init",
