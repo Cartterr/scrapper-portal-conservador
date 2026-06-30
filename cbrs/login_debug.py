@@ -129,6 +129,8 @@ def run_login_debug(
         page.on("framenavigated", on_frame_nav)
 
         write({"kind": "start", "account_label": label, "log_path": str(log_path)})
+        page.expose_function("__cbrsDebugEvent", write)
+        page.add_init_script(_browser_instrumentation_script())
         page.goto(settings.commerce_url, wait_until="domcontentloaded", timeout=60000)
 
         started = time.time()
@@ -195,3 +197,116 @@ def _redact(text: str | None) -> str | None:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _browser_instrumentation_script() -> str:
+    return r"""
+(() => {
+  const emit = (event) => {
+    try {
+      window.__cbrsDebugEvent(Object.assign({ kind: "browser_probe" }, event));
+    } catch (_error) {
+      // Debug hook is best-effort only.
+    }
+  };
+  const safeUrl = (value) => {
+    try {
+      const url = new URL(String(value), window.location.href);
+      return `${url.protocol}//${url.host}${url.pathname}`;
+    } catch (_error) {
+      return String(value).slice(0, 180);
+    }
+  };
+
+  const originalFetch = window.fetch;
+  if (typeof originalFetch === "function") {
+    window.fetch = async (...args) => {
+      const input = args[0];
+      const init = args[1] || {};
+      const method = init.method || (input && input.method) || "GET";
+      const url = safeUrl(input && input.url ? input.url : input);
+      emit({ probe: "fetch_start", method, url });
+      try {
+        const response = await originalFetch(...args);
+        emit({ probe: "fetch_done", method, url, status: response.status });
+        return response;
+      } catch (error) {
+        emit({ probe: "fetch_error", method, url, error: String(error && error.message || error) });
+        throw error;
+      }
+    };
+  }
+
+  const OriginalXHR = window.XMLHttpRequest;
+  if (typeof OriginalXHR === "function") {
+    window.XMLHttpRequest = function XMLHttpRequestProbe() {
+      const xhr = new OriginalXHR();
+      let method = "GET";
+      let url = "";
+      const originalOpen = xhr.open;
+      xhr.open = function openProbe(nextMethod, nextUrl, ...rest) {
+        method = nextMethod || "GET";
+        url = safeUrl(nextUrl);
+        emit({ probe: "xhr_open", method, url });
+        return originalOpen.call(xhr, nextMethod, nextUrl, ...rest);
+      };
+      xhr.addEventListener("loadend", () => {
+        emit({ probe: "xhr_done", method, url, status: xhr.status });
+      });
+      xhr.addEventListener("error", () => {
+        emit({ probe: "xhr_error", method, url, status: xhr.status });
+      });
+      return xhr;
+    };
+  }
+
+  const wrapRecaptcha = () => {
+    const enterprise = window.grecaptcha && window.grecaptcha.enterprise;
+    if (!enterprise || typeof enterprise.execute !== "function" || enterprise.__cbrsWrapped) {
+      return false;
+    }
+    const originalExecute = enterprise.execute.bind(enterprise);
+    enterprise.execute = async (...args) => {
+      const action = args[1] && args[1].action;
+      emit({ probe: "recaptcha_execute_start", action: action || null });
+      try {
+        const token = await originalExecute(...args);
+        emit({ probe: "recaptcha_execute_done", action: action || null, token_present: Boolean(token) });
+        return token;
+      } catch (error) {
+        emit({
+          probe: "recaptcha_execute_error",
+          action: action || null,
+          error: String(error && error.message || error),
+        });
+        throw error;
+      }
+    };
+    enterprise.__cbrsWrapped = true;
+    emit({ probe: "recaptcha_wrapped" });
+    return true;
+  };
+  const recaptchaInterval = setInterval(() => {
+    if (wrapRecaptcha()) {
+      clearInterval(recaptchaInterval);
+    }
+  }, 250);
+  setTimeout(() => clearInterval(recaptchaInterval), 30000);
+
+  window.addEventListener("click", (event) => {
+    const target = event.target;
+    const button = target && target.closest ? target.closest("button") : null;
+    if (button) {
+      emit({
+        probe: "button_click",
+        text: (button.innerText || button.textContent || "").trim().slice(0, 80),
+        disabled: Boolean(button.disabled),
+        type: button.getAttribute("type") || null,
+      });
+    }
+  }, true);
+  window.addEventListener("submit", (event) => {
+    emit({ probe: "form_submit", action: safeUrl(event.target && event.target.action || window.location.href) });
+  }, true);
+})();
+"""
