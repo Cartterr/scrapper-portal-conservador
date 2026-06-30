@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
-from urllib.request import ProxyHandler, Request, build_opener, urlopen
+from urllib.request import Request, urlopen
 
 from .browser_runtime import get_browser_status, profile_hash
 from .config import (
@@ -17,6 +17,7 @@ from .config import (
     Settings,
     proxy_metadata,
 )
+from .proxy import build_authenticated_proxy_opener
 from .safety import redact
 
 EGRESS_INFO_URL = "https://ipinfo.io/json"
@@ -283,13 +284,11 @@ def _proxy_route_detail(settings: Settings) -> str:
 
 
 def _proxy_opener(proxy_url: str | None):
-    if not proxy_url:
-        return None
-    parsed = urlparse(proxy_url)
-    if parsed.scheme.lower() not in {"http", "https"}:
-        raise RuntimeError("preflight egress check supports only HTTP(S) proxy URLs")
-    proxy_handler = ProxyHandler({"http": proxy_url, "https": proxy_url})
-    return build_opener(proxy_handler)
+    return build_authenticated_proxy_opener(
+        proxy_url,
+        supported_schemes={"http", "https"},
+        error_prefix="preflight egress check",
+    )
 
 
 def _egress_mode_detail(settings: Settings) -> str:

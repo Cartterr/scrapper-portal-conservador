@@ -6,11 +6,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
-from urllib.request import ProxyHandler, Request, build_opener, urlopen
+from urllib.request import Request, urlopen
 
 from .config import SETTINGS, Settings, proxy_metadata
 from .preflight import fetch_public_egress
+from .proxy import build_authenticated_proxy_opener
 from .safety import redact
 
 RECAPTCHA_SCRIPT_URL = "https://www.google.com/recaptcha/enterprise.js"
@@ -151,12 +151,11 @@ def _request_status(
 
 
 def _proxy_opener(proxy_url: str | None):
-    if not proxy_url:
-        return None
-    parsed = urlparse(proxy_url)
-    if parsed.scheme.lower() not in {"http", "https"}:
-        raise RuntimeError("proxy health supports only HTTP(S) proxy URLs")
-    return build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
+    return build_authenticated_proxy_opener(
+        proxy_url,
+        supported_schemes={"http", "https"},
+        error_prefix="proxy health",
+    )
 
 
 def _add_check(

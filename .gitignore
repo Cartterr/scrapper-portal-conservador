@@ -14,3 +14,4 @@ outputs/*
 __pycache__/
 .pytest_cache/
 .pytest_tmp/
+.playwright-mcp/
