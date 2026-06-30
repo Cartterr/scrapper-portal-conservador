@@ -26,7 +26,10 @@ def build_authenticated_proxy_opener(
         raise RuntimeError(f"{error_prefix} proxy URL must include a proxy host and port")
 
     proxy_without_auth = _proxy_url_without_auth(parsed)
-    handlers = [ProxyHandler({"http": proxy_without_auth, "https": proxy_without_auth})]
+    proxy_for_handler = (
+        _proxy_url_with_auth(parsed) if parsed.username is not None else proxy_without_auth
+    )
+    handlers = [ProxyHandler({"http": proxy_for_handler, "https": proxy_for_handler})]
     if parsed.username is not None:
         password_manager = HTTPPasswordMgrWithDefaultRealm()
         password_manager.add_password(
@@ -45,3 +48,7 @@ def _proxy_url_without_auth(parsed) -> str:
         host = f"[{host}]"
     netloc = f"{host}:{parsed.port}"
     return urlunparse((parsed.scheme.lower(), netloc, "", "", "", ""))
+
+
+def _proxy_url_with_auth(parsed) -> str:
+    return urlunparse((parsed.scheme.lower(), parsed.netloc, "", "", "", ""))
