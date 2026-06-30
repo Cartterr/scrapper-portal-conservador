@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -123,7 +124,7 @@ class BrowserSession:
         waited_ms = 0
         timeout_ms = None if timeout_seconds is None else timeout_seconds * 1000
         while True:
-            if self.has_login_cookie():
+            if self.has_active_login():
                 return
             if timeout_ms is not None and waited_ms >= timeout_ms:
                 raise SafetyStopException(
@@ -142,6 +143,26 @@ class BrowserSession:
                 "No active CBRS login found in the persistent profile. Run `cbrs init` first.",
                 context="auth",
             )
+
+    def has_active_login(self) -> bool:
+        if not self.has_login_cookie():
+            return False
+        response = self.fetch_json(
+            "/api/v1/auth/refresh",
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            body={},
+        )
+        if response.status != 200:
+            return False
+        try:
+            data = json.loads(response.body_text or "")
+        except json.JSONDecodeError:
+            return False
+        token = data.get("token")
+        if not isinstance(token, str) or not token:
+            return False
+        self.set_auth_cookie(token)
+        return True
 
     def generate_recaptcha_token(self, action: str) -> str:
         self._ensure_recaptcha_ready()

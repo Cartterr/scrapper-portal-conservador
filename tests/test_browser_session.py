@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-from cbrs.browser_session import BrowserSession
+from cbrs.browser_session import BrowserFetchResponse, BrowserSession
 from cbrs.config import load_settings
 
 
@@ -230,3 +230,32 @@ def test_browser_session_rejects_stay_signed_in_cookie_without_tokens(tmp_path: 
     session._context = FakeContext()
 
     assert session.has_login_cookie() is False
+
+
+def test_browser_session_rejects_stale_login_cookie(tmp_path: Path) -> None:
+    settings = load_settings({}, root=tmp_path)
+    session = BrowserSession(settings)
+    session.has_login_cookie = lambda: True
+    session.fetch_json = lambda *args, **kwargs: BrowserFetchResponse(
+        status=401,
+        headers={},
+        body_text='{"detail":"Token requerido"}',
+    )
+
+    assert session.has_active_login() is False
+
+
+def test_browser_session_accepts_cookie_after_successful_auth_refresh(tmp_path: Path) -> None:
+    settings = load_settings({}, root=tmp_path)
+    captured = {}
+    session = BrowserSession(settings)
+    session.has_login_cookie = lambda: True
+    session.fetch_json = lambda *args, **kwargs: BrowserFetchResponse(
+        status=200,
+        headers={},
+        body_text='{"token":"fresh.jwt.token"}',
+    )
+    session.set_auth_cookie = lambda token: captured.setdefault("token", token)
+
+    assert session.has_active_login() is True
+    assert captured["token"] == "fresh.jwt.token"
