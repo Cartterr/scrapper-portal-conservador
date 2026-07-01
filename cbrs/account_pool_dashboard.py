@@ -241,6 +241,9 @@ def _dashboard_html() -> str:
       --warn-soft: #fff4de;
       --bad: #b42318;
       --bad-soft: #fff1f0;
+      --captcha: #d97706;
+      --captcha-soft: #fff7ed;
+      --captcha-wave: #0891b2;
       --accent: #1d4ed8;
       --accent-soft: #e8efff;
       --shadow: 0 18px 50px rgba(31, 41, 55, .08);
@@ -340,8 +343,26 @@ def _dashboard_html() -> str:
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 14px;
+      position: relative;
     }
-    .account.paused, .account.captcha_pending { border-color: var(--bad); background: var(--bad-soft); }
+    .account.paused { border-color: var(--bad); background: var(--bad-soft); }
+    .account.captcha_pending {
+      border-color: var(--captcha);
+      background: linear-gradient(135deg, var(--captcha-soft), #fff);
+      animation: captchaBreath 2.8s ease-in-out infinite;
+      animation-delay: calc(var(--wave-index, 0) * 110ms);
+      box-shadow: 0 0 0 1px rgba(217, 119, 6, .16), 0 16px 40px rgba(217, 119, 6, .12);
+    }
+    .account.captcha_pending::before {
+      content: "";
+      position: absolute;
+      inset: -3px;
+      border: 2px solid rgba(8, 145, 178, .45);
+      border-radius: 10px;
+      pointer-events: none;
+      animation: captchaBreath 2.8s ease-in-out infinite;
+      animation-delay: calc(var(--wave-index, 0) * 110ms);
+    }
     .account.captcha_solving { border-color: var(--warn); background: var(--warn-soft); }
     .account.quota_reached { border-color: var(--warn); background: var(--warn-soft); }
     .account-top { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
@@ -377,6 +398,22 @@ def _dashboard_html() -> str:
     }
     .alert.show { display: block; }
     .alert h2 { color: var(--bad); font-size: 22px; }
+    @keyframes captchaBreath {
+      0%, 100% {
+        box-shadow: 0 0 0 1px rgba(217, 119, 6, .16), 0 16px 40px rgba(217, 119, 6, .12);
+        transform: translateY(0);
+      }
+      50% {
+        box-shadow: 0 0 0 4px rgba(8, 145, 178, .22), 0 20px 48px rgba(217, 119, 6, .2);
+        transform: translateY(-1px);
+      }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .account.captcha_pending,
+      .account.captcha_pending::before {
+        animation: none;
+      }
+    }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { padding: 9px 8px; border-bottom: 1px solid var(--line); text-align: left; }
     th { color: var(--muted); }
@@ -567,13 +604,13 @@ def _dashboard_html() -> str:
         .join("");
     }
     function renderAccounts(accounts) {
-      document.getElementById("accounts").innerHTML = accounts.map((account) => {
+      document.getElementById("accounts").innerHTML = accounts.map((account, index) => {
         const pct = account.daily_quota ? Math.min(100, (account.used_today / account.daily_quota) * 100) : 0;
         const note = account.paused_reason ? `Motivo: ${account.paused_reason}` : `${account.remaining_today} restantes hoy`;
         const action = account.status === "captcha_pending"
           ? `<button class="account-action" data-captcha-account="${escapeHtml(account.account_id)}">Resolver captcha</button>`
           : "";
-        return `<section class="account ${escapeHtml(account.status)}">
+        return `<section class="account ${escapeHtml(account.status)}" style="--wave-index:${index % 9}">
           <div class="account-top">
             <div class="account-name">${escapeHtml(account.label)}</div>
             <div class="status ${escapeHtml(account.status)}">${escapeHtml(label(account.status))}</div>

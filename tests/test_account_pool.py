@@ -481,5 +481,7 @@ def test_pool_dashboard_can_trigger_manual_captcha_recovery(tmp_path: Path) -> N
         dashboard.stop()
 
     assert "Resolver captcha" in html
+    assert "captchaBreath" in html
+    assert "--wave-index" in html
     assert payload == {"ok": True, "status": "started", "account_id": "ejecutivo_1"}
     assert calls == ["ejecutivo_1"]
