@@ -7,10 +7,10 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
-from .account_pool import AccountPoolStore, PoolConfig, dashboard_status
+from .account_pool import AccountPoolStore, PoolConfig, dashboard_status, resolve_account_captcha
 from .config import SETTINGS, Settings
 from .safety import redact
 
@@ -34,8 +34,9 @@ def start_pool_dashboard(
     config: PoolConfig,
     host: str = "127.0.0.1",
     port: int = 8765,
+    captcha_resolver: Callable[..., dict[str, Any]] | None = None,
 ) -> PoolDashboardHandle:
-    handler = _handler_factory(store, settings, config)
+    handler = _handler_factory(store, settings, config, captcha_resolver=captcha_resolver)
     server = ThreadingHTTPServer((host, port), handler)
     actual_host, actual_port = server.server_address[:2]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -47,7 +48,16 @@ def start_pool_dashboard(
     )
 
 
-def _handler_factory(store: AccountPoolStore, settings: Settings, config: PoolConfig):
+def _handler_factory(
+    store: AccountPoolStore,
+    settings: Settings,
+    config: PoolConfig,
+    *,
+    captcha_resolver: Callable[..., dict[str, Any]] | None = None,
+):
+    resolver = captcha_resolver or resolve_account_captcha
+    captcha_threads: dict[str, threading.Thread] = {}
+
     class AccountPoolDashboardHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
             return
@@ -91,7 +101,49 @@ def _handler_factory(store: AccountPoolStore, settings: Settings, config: PoolCo
                 store.request_stop()
                 self._send_json({"ok": True, "status": "stop_requested"})
                 return
+            if parsed.path.startswith("/api/captcha/") and parsed.path.endswith("/trigger"):
+                account_id = parsed.path.split("/")[3]
+                self._trigger_captcha(account_id)
+                return
             self.send_error(HTTPStatus.NOT_FOUND, "not found")
+
+        def _trigger_captcha(self, account_id: str) -> None:
+            known_ids = {account.account_id for account in config.accounts}
+            if account_id not in known_ids:
+                self.send_error(HTTPStatus.NOT_FOUND, "unknown account")
+                return
+            existing = captcha_threads.get(account_id)
+            if existing and existing.is_alive():
+                self._send_json({"ok": True, "status": "already_running", "account_id": account_id})
+                return
+
+            def run_recovery() -> None:
+                try:
+                    resolver(
+                        settings=settings,
+                        config=config,
+                        store=store,
+                        account_id=account_id,
+                    )
+                except Exception as exc:
+                    run = store.latest_run()
+                    if run:
+                        store.add_event(
+                            str(run["run_id"]),
+                            account_id=account_id,
+                            level="error",
+                            message="pool captcha recovery failed",
+                            data={"error": str(exc)},
+                        )
+
+            thread = threading.Thread(
+                target=run_recovery,
+                name=f"cbrs-captcha-{account_id}",
+                daemon=True,
+            )
+            captcha_threads[account_id] = thread
+            thread.start()
+            self._send_json({"ok": True, "status": "started", "account_id": account_id})
 
         def _send_artifact(self, cycle_id: str) -> None:
             match = None
@@ -236,7 +288,8 @@ def _dashboard_html() -> str:
     }
     .status.completed, .status.running, .status.waiting { background: var(--ok-soft); color: var(--ok); }
     .status.waiting_capacity { background: var(--warn-soft); color: var(--warn); }
-    .status.stale, .status.blocked { background: var(--bad-soft); color: var(--bad); }
+    .status.stale, .status.blocked, .status.captcha_pending { background: var(--bad-soft); color: var(--bad); }
+    .status.captcha_solving { background: var(--warn-soft); color: var(--warn); }
     .hero {
       display: grid;
       grid-template-columns: minmax(0, 1.6fr) minmax(320px, .8fr);
@@ -288,13 +341,24 @@ def _dashboard_html() -> str:
       border-radius: 8px;
       padding: 14px;
     }
-    .account.paused { border-color: var(--bad); background: var(--bad-soft); }
+    .account.paused, .account.captcha_pending { border-color: var(--bad); background: var(--bad-soft); }
+    .account.captcha_solving { border-color: var(--warn); background: var(--warn-soft); }
     .account.quota_reached { border-color: var(--warn); background: var(--warn-soft); }
     .account-top { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
     .account-name { font-weight: 850; }
     .account-count { font-size: 28px; font-weight: 900; margin: 8px 0; }
     .mini-bar { height: 10px; border-radius: 999px; overflow: hidden; background: #e8eef5; }
     .mini-bar span { display: block; height: 100%; background: var(--accent); }
+    .account-action {
+      margin-top: 12px;
+      border-color: var(--bad);
+      background: var(--bad);
+      width: 100%;
+    }
+    .account-action[disabled] {
+      cursor: not-allowed;
+      opacity: .65;
+    }
     .kpis {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -375,7 +439,7 @@ def _dashboard_html() -> str:
       <div class="kpi"><div class="muted">Usadas hoy</div><div id="usedToday" class="value">-</div></div>
       <div class="kpi"><div class="muted">Restantes hoy</div><div id="remainingToday" class="value">-</div></div>
       <div class="kpi"><div class="muted">PDFs generados</div><div id="downloads" class="value">-</div></div>
-      <div class="kpi"><div class="muted">Cuentas pausadas</div><div id="pausedAccounts" class="value">-</div></div>
+      <div class="kpi"><div class="muted">Captchas pendientes</div><div id="captchaPending" class="value">-</div></div>
     </div>
 
     <section class="panel">
@@ -392,6 +456,8 @@ def _dashboard_html() -> str:
     const statusLabels = {
       available: "disponible",
       blocked: "bloqueado",
+      captcha_pending: "captcha pendiente",
+      captcha_solving: "resolviendo captcha",
       completed: "completado",
       disabled: "deshabilitada",
       failed: "fallido",
@@ -424,6 +490,7 @@ def _dashboard_html() -> str:
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
     }[char]));
     let current = null;
+    let lastCaptchaNoticeKey = "";
     async function refresh() {
       const response = await fetch("/api/status");
       current = await response.json();
@@ -451,7 +518,7 @@ def _dashboard_html() -> str:
       document.getElementById("usedToday").textContent = used;
       document.getElementById("remainingToday").textContent = remaining;
       document.getElementById("downloads").textContent = stats.downloads ?? 0;
-      document.getElementById("pausedAccounts").textContent = pool.paused_accounts ?? 0;
+      document.getElementById("captchaPending").textContent = pool.captcha_pending_accounts ?? 0;
       renderAlert(current.alert);
       renderPoolFacts(pool, run, nextSeconds);
       renderAccounts(current.accounts || []);
@@ -484,6 +551,7 @@ def _dashboard_html() -> str:
       box.classList.add("show");
       document.getElementById("alertTitle").textContent = alert.title || "Advertencia";
       document.getElementById("alertMessage").textContent = alert.message || "-";
+      maybeNotifyCaptcha(alert);
     }
     function renderPoolFacts(pool, run, nextSeconds) {
       const rows = [
@@ -502,6 +570,9 @@ def _dashboard_html() -> str:
       document.getElementById("accounts").innerHTML = accounts.map((account) => {
         const pct = account.daily_quota ? Math.min(100, (account.used_today / account.daily_quota) * 100) : 0;
         const note = account.paused_reason ? `Motivo: ${account.paused_reason}` : `${account.remaining_today} restantes hoy`;
+        const action = account.status === "captcha_pending"
+          ? `<button class="account-action" data-captcha-account="${escapeHtml(account.account_id)}">Resolver captcha</button>`
+          : "";
         return `<section class="account ${escapeHtml(account.status)}">
           <div class="account-top">
             <div class="account-name">${escapeHtml(account.label)}</div>
@@ -510,8 +581,34 @@ def _dashboard_html() -> str:
           <div class="account-count">${account.used_today}/${account.daily_quota}</div>
           <div class="mini-bar"><span style="width:${pct}%"></span></div>
           <div class="muted" style="margin-top:8px">${escapeHtml(note)}</div>
+          ${action}
         </section>`;
       }).join("");
+    }
+    async function triggerCaptcha(accountId, button) {
+      if (!accountId) return;
+      if (button) {
+        button.disabled = true;
+        button.textContent = "Abriendo Chrome...";
+      }
+      await fetch(`/api/captcha/${encodeURIComponent(accountId)}/trigger`, { method: "POST" });
+      await refresh();
+    }
+    function maybeNotifyCaptcha(alert) {
+      if (!("Notification" in window)) return;
+      if (alert.reason !== "captcha_rejected") return;
+      const key = `${alert.account_id || alert.account_label || ""}:${alert.reason || ""}`;
+      if (!key || key === lastCaptchaNoticeKey) return;
+      lastCaptchaNoticeKey = key;
+      const send = () => new Notification("CBRS: captcha pendiente", {
+        body: `${alert.account_label || "Una cuenta"} necesita resolución manual.`,
+      });
+      if (Notification.permission === "granted") send();
+      else if (Notification.permission !== "denied") {
+        Notification.requestPermission().then((permission) => {
+          if (permission === "granted") send();
+        });
+      }
     }
     function renderCycles(cycles, artifacts) {
       const artifactMap = new Map((artifacts || []).map((item) => [item.cycle_id, item]));
@@ -532,6 +629,11 @@ def _dashboard_html() -> str:
     document.getElementById("stopButton").addEventListener("click", async () => {
       await fetch("/api/stop", { method: "POST" });
       await refresh();
+    });
+    document.getElementById("accounts").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-captcha-account]");
+      if (!button) return;
+      triggerCaptcha(button.dataset.captchaAccount, button).catch(console.error);
     });
     refresh().catch(console.error);
     setInterval(() => refresh().catch(console.error), 2000);

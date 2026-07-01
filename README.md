@@ -119,6 +119,12 @@ cargue correctamente y que el endpoint inicial de CBRS responda `200`. Si falla,
 `pool init`, `pool login-debug` y los ciclos vivos del pool no deben abrir flujo
 real.
 
+Si CBRS responde `captcha_rejected`, la cuenta queda como `captcha pendiente` y
+sale temporalmente del scheduler. El dashboard muestra un botón `Resolver captcha`
+que abre Chrome headed con el perfil persistente de esa cuenta; después ejecuta
+una verificación segura sin descargar PDF. Solo si esa verificación pasa, la
+cuenta vuelve automáticamente al pool.
+
 ## Stack
 
 - Python 3.14.

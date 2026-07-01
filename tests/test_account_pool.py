@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -149,7 +150,7 @@ def test_pool_dry_run_distributes_cycles_and_tracks_daily_capacity(tmp_path: Pat
     assert len(status["artifacts"]) == 6
 
 
-def test_pool_safety_stop_pauses_only_affected_account(tmp_path: Path) -> None:
+def test_pool_captcha_rejected_marks_only_affected_account_pending(tmp_path: Path) -> None:
     from cbrs.account_pool import (
         AccountPoolStore,
         PoolConfig,
@@ -220,12 +221,81 @@ def test_pool_safety_stop_pauses_only_affected_account(tmp_path: Path) -> None:
     assert result.status == "completed"
     assert calls[0] == "ejecutivo_1"
     assert "ejecutivo_1" not in calls[1:]
-    assert accounts["ejecutivo_1"]["status"] == "paused"
+    assert accounts["ejecutivo_1"]["status"] == "captcha_pending"
     assert accounts["ejecutivo_1"]["paused_reason"] == "captcha_rejected"
     assert accounts["ejecutivo_2"]["status"] == "available"
     assert accounts["ejecutivo_3"]["status"] == "available"
     assert status["stats"]["downloads"] == 3
-    assert status["pool"]["paused_accounts"] == 1
+    assert status["pool"]["captcha_pending_accounts"] == 1
+    assert status["alert"]["title"] == "Captcha pendiente"
+    assert status["alert"]["reason"] == "captcha_rejected"
+
+
+def test_manual_captcha_recovery_reenables_account_after_success(tmp_path: Path) -> None:
+    from cbrs.account_pool import (
+        AccountPoolStore,
+        PoolConfig,
+        PoolTarget,
+        dashboard_status,
+        load_account_pool_config,
+        mark_account_captcha_pending,
+        resolve_account_captcha,
+    )
+
+    settings = load_settings(
+        {"CBRS_PROFILE_DIR": ".cbrs/chrome-profile", "CBRS_OUTPUT_DIR": "outputs"},
+        root=tmp_path,
+    )
+    base_config = load_account_pool_config(settings)
+    config = PoolConfig(
+        accounts=base_config.accounts,
+        daily_quota_per_account=20,
+        interval_minutes=0,
+        dashboard_host="127.0.0.1",
+        dashboard_port=8765,
+        targets=(PoolTarget(label="safe_text", kind="text", query="BANCO DE CHILE"),),
+    )
+    store = AccountPoolStore(tmp_path / ".cbrs" / "pool" / "pool.sqlite3")
+    run_id = "pool-test"
+    store.create_run(run_id=run_id, dry_run=False, config=config, dashboard_url=None)
+    mark_account_captcha_pending(
+        store,
+        run_id,
+        "ejecutivo_1",
+        reason="captcha_rejected",
+    )
+    calls: list[bool | None] = []
+
+    def fake_runner(**kwargs: object) -> ValidationRunResult:
+        calls.append(kwargs.get("headless"))
+        report_path = tmp_path / ".cbrs" / "logs" / "validation-recovery.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("{}", encoding="utf-8")
+        return ValidationRunResult(
+            exit_code=0,
+            status="passed",
+            report={},
+            report_path=report_path,
+            preflight_report_path=None,
+            result_count=1,
+        )
+
+    result = resolve_account_captcha(
+        settings=settings,
+        config=config,
+        store=store,
+        run_id=run_id,
+        account_id="ejecutivo_1",
+        validation_runner=fake_runner,
+    )
+
+    status = dashboard_status(store, config=config)
+    accounts = {account["account_id"]: account for account in status["accounts"]}
+    assert result["status"] == "resolved"
+    assert calls == [False]
+    assert accounts["ejecutivo_1"]["status"] == "available"
+    assert accounts["ejecutivo_1"]["paused_reason"] is None
+    assert status["pool"]["captcha_pending_accounts"] == 0
 
 
 def test_pool_daily_usage_survives_runner_restart(tmp_path: Path) -> None:
@@ -357,3 +427,59 @@ def test_pool_dashboard_api_and_html_are_sanitized(tmp_path: Path) -> None:
     assert payload["pool"]["daily_quota"] == 60
     assert content.startswith(b"%PDF")
     assert stop_payload == {"ok": True, "status": "stop_requested"}
+
+
+def test_pool_dashboard_can_trigger_manual_captcha_recovery(tmp_path: Path) -> None:
+    from cbrs.account_pool import (
+        AccountPoolStore,
+        load_account_pool_config,
+        mark_account_captcha_pending,
+    )
+    from cbrs.account_pool_dashboard import start_pool_dashboard
+
+    settings = load_settings(
+        {"CBRS_PROFILE_DIR": ".cbrs/chrome-profile", "CBRS_OUTPUT_DIR": "outputs"},
+        root=tmp_path,
+    )
+    config = load_account_pool_config(settings)
+    store = AccountPoolStore(tmp_path / ".cbrs" / "pool" / "pool.sqlite3")
+    run_id = "pool-test"
+    store.create_run(run_id=run_id, dry_run=False, config=config, dashboard_url=None)
+    mark_account_captcha_pending(
+        store,
+        run_id,
+        "ejecutivo_1",
+        reason="captcha_rejected",
+    )
+    called = threading.Event()
+    calls: list[str] = []
+
+    def fake_resolver(**kwargs: object) -> dict[str, object]:
+        calls.append(str(kwargs["account_id"]))
+        called.set()
+        return {"ok": True, "status": "resolved"}
+
+    dashboard = start_pool_dashboard(
+        store,
+        settings=settings,
+        config=config,
+        port=0,
+        captcha_resolver=fake_resolver,
+    )
+    try:
+        with urlopen(f"{dashboard.url}/", timeout=5) as response:
+            html = response.read().decode("utf-8")
+        request = Request(
+            f"{dashboard.url}/api/captcha/ejecutivo_1/trigger",
+            data=b"",
+            method="POST",
+        )
+        with urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        assert called.wait(timeout=2)
+    finally:
+        dashboard.stop()
+
+    assert "Resolver captcha" in html
+    assert payload == {"ok": True, "status": "started", "account_id": "ejecutivo_1"}
+    assert calls == ["ejecutivo_1"]

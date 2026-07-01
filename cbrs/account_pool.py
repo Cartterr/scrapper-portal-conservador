@@ -31,6 +31,9 @@ DEFAULT_DASHBOARD_HOST = "127.0.0.1"
 DEFAULT_DASHBOARD_PORT = 8765
 DEFAULT_TARGET_LABEL = "default_safe_query"
 DEFAULT_TARGET_QUERY = "BANCO DE CHILE"
+CAPTCHA_REJECTED_REASON = "captcha_rejected"
+CAPTCHA_PENDING_STATUS = "captcha_pending"
+CAPTCHA_SOLVING_STATUS = "captcha_solving"
 LOCAL_TZ = ZoneInfo("America/Santiago")
 SECRET_ACCOUNT_KEYS = {
     "email",
@@ -177,6 +180,14 @@ class AccountPoolStore:
                     updated_at TEXT NOT NULL
                 );
                 """
+            )
+            db.execute(
+                """
+                UPDATE accounts
+                SET status = ?
+                WHERE status = 'paused' AND paused_reason = ?
+                """,
+                (CAPTCHA_PENDING_STATUS, CAPTCHA_REJECTED_REASON),
             )
 
     def create_run(
@@ -388,6 +399,48 @@ class AccountPoolStore:
                 WHERE run_id = ? AND account_id = ?
                 """,
                 ("paused", redact_text(reason), now, now, run_id, account_id),
+            )
+
+    def mark_account_captcha_pending(
+        self,
+        run_id: str,
+        account_id: str,
+        *,
+        reason: str = CAPTCHA_REJECTED_REASON,
+    ) -> None:
+        now = utc_now()
+        with self._connect() as db:
+            db.execute(
+                """
+                UPDATE accounts
+                SET status = ?, paused_reason = ?, paused_at = ?, updated_at = ?
+                WHERE run_id = ? AND account_id = ?
+                """,
+                (CAPTCHA_PENDING_STATUS, redact_text(reason), now, now, run_id, account_id),
+            )
+
+    def mark_account_captcha_solving(self, run_id: str, account_id: str) -> None:
+        now = utc_now()
+        with self._connect() as db:
+            db.execute(
+                """
+                UPDATE accounts
+                SET status = ?, updated_at = ?
+                WHERE run_id = ? AND account_id = ?
+                """,
+                (CAPTCHA_SOLVING_STATUS, now, run_id, account_id),
+            )
+
+    def mark_account_available(self, run_id: str, account_id: str) -> None:
+        now = utc_now()
+        with self._connect() as db:
+            db.execute(
+                """
+                UPDATE accounts
+                SET status = ?, paused_reason = NULL, paused_at = NULL, updated_at = ?
+                WHERE run_id = ? AND account_id = ?
+                """,
+                ("available", now, run_id, account_id),
             )
 
     def latest_run(self) -> dict[str, Any] | None:
@@ -618,6 +671,91 @@ def choose_target(config: PoolConfig, sequence: int) -> PoolTarget:
     return config.targets[(sequence - 1) % len(config.targets)]
 
 
+def mark_account_captcha_pending(
+    store: AccountPoolStore,
+    run_id: str,
+    account_id: str,
+    *,
+    reason: str = CAPTCHA_REJECTED_REASON,
+) -> None:
+    store.mark_account_captcha_pending(run_id, account_id, reason=reason)
+
+
+def resolve_account_captcha(
+    *,
+    settings: Settings = SETTINGS,
+    config: PoolConfig | None = None,
+    store: AccountPoolStore | None = None,
+    run_id: str | None = None,
+    account_id: str,
+    validation_runner: Callable[..., ValidationRunResult] = run_controlled_validation,
+) -> dict[str, Any]:
+    config = config or load_account_pool_config(settings)
+    store = store or default_pool_store(settings)
+    run = store.latest_run() if run_id is None else {"run_id": run_id}
+    if not run:
+        raise ValueError("No active pool run exists for captcha recovery.")
+    resolved_run_id = str(run["run_id"])
+    account = _account_by_id(config, account_id)
+    target = _target_for_recovery(config, store, resolved_run_id, account_id)
+    runtime_settings = account_settings(settings, account)
+    output_dir = (
+        settings.output_dir
+        / "pool"
+        / resolved_run_id
+        / account.account_id
+        / f"captcha-recovery-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    )
+
+    store.mark_account_captcha_solving(resolved_run_id, account.account_id)
+    store.add_event(
+        resolved_run_id,
+        account_id=account.account_id,
+        level="warning",
+        message="pool captcha recovery started",
+        data={"target_label": target.label, "target_kind": target.kind},
+    )
+    result = validation_runner(
+        settings=runtime_settings,
+        search_kind=target.kind,
+        query=target.query,
+        foja=target.foja,
+        numero=target.numero,
+        ano=target.ano,
+        download_first=False,
+        output_dir=output_dir,
+        keep_images=False,
+        headless=False,
+    )
+    if result.exit_code == 0:
+        store.mark_account_available(resolved_run_id, account.account_id)
+        store.add_event(
+            resolved_run_id,
+            account_id=account.account_id,
+            message="pool captcha resolved",
+            data={"status": result.status, "result_count": result.result_count},
+        )
+        return {"ok": True, "status": "resolved", "account_id": account.account_id}
+
+    reason = result.safety_stop or result.error or "captcha_still_pending"
+    if result.safety_stop == CAPTCHA_REJECTED_REASON:
+        store.mark_account_captcha_pending(resolved_run_id, account.account_id, reason=reason)
+        status = "captcha_pending"
+        message = "pool captcha still pending"
+    else:
+        store.pause_account(resolved_run_id, account.account_id, reason=reason)
+        status = "blocked"
+        message = "pool captcha recovery blocked"
+    store.add_event(
+        resolved_run_id,
+        account_id=account.account_id,
+        level="warning",
+        message=message,
+        data={"status": result.status, "safety_stop": result.safety_stop, "error": result.error},
+    )
+    return {"ok": False, "status": status, "account_id": account.account_id, "reason": reason}
+
+
 def run_account_pool(
     *,
     settings: Settings = SETTINGS,
@@ -771,14 +909,28 @@ def run_account_pool(
 
             if result.exit_code == 2:
                 reason = result.safety_stop or result.error or "safety_stop"
-                store.pause_account(run_id, account.account_id, reason=reason)
-                store.add_event(
-                    run_id,
-                    account_id=account.account_id,
-                    level="warning",
-                    message="pool account paused",
-                    data={"reason": reason},
-                )
+                if result.safety_stop == CAPTCHA_REJECTED_REASON:
+                    store.mark_account_captcha_pending(
+                        run_id,
+                        account.account_id,
+                        reason=reason,
+                    )
+                    store.add_event(
+                        run_id,
+                        account_id=account.account_id,
+                        level="warning",
+                        message="pool account captcha pending",
+                        data={"reason": reason},
+                    )
+                else:
+                    store.pause_account(run_id, account.account_id, reason=reason)
+                    store.add_event(
+                        run_id,
+                        account_id=account.account_id,
+                        level="warning",
+                        message="pool account paused",
+                        data={"reason": reason},
+                    )
 
             if store.stop_requested():
                 final_status = "stopped"
@@ -849,6 +1001,7 @@ def dashboard_status(
                 "used_today": 0,
                 "remaining_today": quota,
                 "paused_accounts": 0,
+                "captcha_pending_accounts": 0,
                 "available_accounts": len(config.accounts) if config else 3,
             },
             "accounts": _default_account_status(config),
@@ -897,6 +1050,9 @@ def dashboard_status(
         ]
     )
     paused_accounts = len([account for account in account_payload if account["status"] == "paused"])
+    captcha_pending_accounts = len(
+        [account for account in account_payload if account["status"] == CAPTCHA_PENDING_STATUS]
+    )
     status = str(run["status"])
     heartbeat_age = seconds_since(str(run["heartbeat_at"]))
     if status in {"running", "waiting", "waiting_capacity"} and heartbeat_age > 120:
@@ -922,6 +1078,7 @@ def dashboard_status(
                 "used_today": used_today,
                 "remaining_today": remaining_today,
                 "paused_accounts": paused_accounts,
+                "captcha_pending_accounts": captcha_pending_accounts,
                 "available_accounts": available_accounts,
                 "quota_date": quota_date,
                 "next_account_id": next_account.account_id if next_account else None,
@@ -933,6 +1090,7 @@ def dashboard_status(
                 remaining_today=remaining_today,
                 available_accounts=available_accounts,
                 paused_accounts=paused_accounts,
+                captcha_pending_accounts=captcha_pending_accounts,
                 accounts=account_payload,
             ),
             "stats": {
@@ -959,6 +1117,7 @@ def _active_alert(
     remaining_today: int,
     available_accounts: int,
     paused_accounts: int,
+    captcha_pending_accounts: int,
     accounts: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     if status == "waiting_capacity" and remaining_today <= 0:
@@ -969,6 +1128,14 @@ def _active_alert(
             "message": "Las 60 consultas teóricas del día ya fueron consumidas o reservadas por cuenta. No se generará más tráfico hasta el próximo día.",
             "reason": "daily_pool_exhausted",
         }
+    if status == "waiting_capacity" and available_accounts == 0 and captcha_pending_accounts:
+        return {
+            "active": True,
+            "severity": "critical",
+            "title": "Captcha pendiente",
+            "message": "Todas las cuentas disponibles requieren resolución manual de captcha antes de continuar.",
+            "reason": CAPTCHA_REJECTED_REASON,
+        }
     if status == "waiting_capacity" and available_accounts == 0 and paused_accounts:
         return {
             "active": True,
@@ -976,6 +1143,17 @@ def _active_alert(
             "title": "Todas las cuentas están pausadas",
             "message": "El runner sigue vivo, pero no ejecutará nuevas consultas hasta revisar las cuentas pausadas.",
             "reason": "all_accounts_paused",
+        }
+    pending = [account for account in accounts if account["status"] == CAPTCHA_PENDING_STATUS]
+    if pending:
+        return {
+            "active": True,
+            "severity": "warning",
+            "title": "Captcha pendiente",
+            "message": "Una cuenta necesita intervención manual. Usa el botón Resolver captcha para abrir Chrome con ese perfil.",
+            "reason": pending[0].get("paused_reason") or CAPTCHA_REJECTED_REASON,
+            "account_label": pending[0].get("label"),
+            "account_id": pending[0].get("account_id"),
         }
     paused = [account for account in accounts if account["status"] == "paused"]
     if paused:
@@ -1018,6 +1196,37 @@ def _parse_accounts(raw_accounts: Any) -> Iterable[PoolAccount]:
             )
         )
     return accounts
+
+
+def _account_by_id(config: PoolConfig, account_id: str) -> PoolAccount:
+    for account in config.accounts:
+        if account.account_id == account_id:
+            return account
+    available = ", ".join(account.account_id for account in config.accounts)
+    raise ValueError(f"Unknown pool account {account_id!r}. Available accounts: {available}")
+
+
+def _target_for_recovery(
+    config: PoolConfig,
+    store: AccountPoolStore,
+    run_id: str,
+    account_id: str,
+) -> PoolTarget:
+    latest_captcha_cycle = next(
+        (
+            cycle
+            for cycle in store.recent_cycles(run_id=run_id, limit=1000)
+            if cycle.get("account_id") == account_id
+            and cycle.get("safety_stop") == CAPTCHA_REJECTED_REASON
+        ),
+        None,
+    )
+    if latest_captcha_cycle:
+        target_label = str(latest_captcha_cycle.get("target_label") or "")
+        for target in config.targets:
+            if target.label == target_label:
+                return target
+    return config.targets[0]
 
 
 def _parse_targets(raw_targets: Any) -> Iterable[PoolTarget]:
