@@ -35,14 +35,7 @@ fi
 "${ROOT_DIR}/.venv/bin/python" -m pip install -r "${ROOT_DIR}/requirements.txt"
 "${ROOT_DIR}/.venv/bin/python" -m playwright install-deps chromium
 
-# WSL-only desktop integration. The dedicated WSLg viewer runs independently
-# from worker restarts and is enabled at Ubuntu startup.
-sudo install -m 0644 "${ROOT_DIR}/deploy/cbrs-dashboard-viewer.service" \
-  /etc/systemd/system/cbrs-dashboard-viewer.service
-sudo install -d -m 0755 /etc/systemd/system/cbrs-worker.service.d
-sudo install -m 0644 "${ROOT_DIR}/deploy/cbrs-worker-wsl.conf" \
-  /etc/systemd/system/cbrs-worker.service.d/wsl-dashboard-viewer.conf
-sudo systemctl daemon-reload
-sudo systemctl enable cbrs-dashboard-viewer.service
-
-echo "WSL2 runtime ready. The dashboard viewer will open through WSLg at Ubuntu startup."
+# The dashboard is rendered by the native Windows browser in development so it
+# can use the host monitor refresh rate. Ubuntu still owns every CBRS process.
+# deploy/windows/Start-CbrsWslHidden.vbs is the login-only host bridge.
+echo "WSL2 runtime ready. Install the Windows login bridge to open the native dashboard viewer."

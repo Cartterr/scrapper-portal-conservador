@@ -1,0 +1,8 @@
+[Unit]
+Description=Resume the fixed CBRS worker after a local dashboard request
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/rm -f /var/lib/cbrs/control/resume.request
+ExecStart=/usr/bin/systemctl start cbrs-worker.service

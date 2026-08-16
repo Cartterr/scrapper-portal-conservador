@@ -29,12 +29,9 @@ if ($installed -notcontains $DistroName) {
 
 $readinessCommand = @'
 set -euo pipefail
-set -a
-source /etc/cbrs/cbrs.env
-set +a
 cd /opt/cbrs
 install -d -o cbrs -g cbrs -m 0750 /var/lib/cbrs/readiness
-runuser -u cbrs --preserve-environment -- /opt/cbrs/.venv/bin/python -m cbrs readiness \
+runuser -u cbrs -- /opt/cbrs/.venv/bin/python -m cbrs readiness \
   --target ubuntu \
   --env-file /etc/cbrs/cbrs.env \
   --config /var/lib/cbrs/account-pool.json \

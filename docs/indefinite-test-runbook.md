@@ -128,11 +128,12 @@ CBRS, aunque restic puede contactar el NAS o backend configurado:
 
 ```bash
 sudo -u cbrs bash -lc '
-  set -a; source /etc/cbrs/cbrs.env; set +a
   cd /opt/cbrs
-  .venv/bin/python -m cbrs jobs status --config /var/lib/cbrs/account-pool.json
-  restic init
-  .venv/bin/python -m cbrs jobs backup --config /var/lib/cbrs/account-pool.json
+  .venv/bin/python deploy/run_with_env.py /etc/cbrs/cbrs.env -- \
+    .venv/bin/python -m cbrs jobs status --config /var/lib/cbrs/account-pool.json
+  .venv/bin/python deploy/run_with_env.py /etc/cbrs/cbrs.env -- restic init
+  .venv/bin/python deploy/run_with_env.py /etc/cbrs/cbrs.env -- \
+    .venv/bin/python -m cbrs jobs backup --config /var/lib/cbrs/account-pool.json
 '
 ```
 
@@ -150,9 +151,9 @@ la vez y aprobar su egress únicamente si corresponde al proxy chileno dedicado:
 ```bash
 sudo systemctl start cbrs-display.service cbrs-x11vnc.service cbrs-novnc.service
 sudo -u cbrs bash -lc '
-  set -a; source /etc/cbrs/cbrs.env; set +a
   cd /opt/cbrs
-  .venv/bin/python -m cbrs pool proxy-health \
+  .venv/bin/python deploy/run_with_env.py /etc/cbrs/cbrs.env -- \
+    .venv/bin/python -m cbrs pool proxy-health \
     --config /var/lib/cbrs/account-pool.json \
     --approve-egress-baseline
 '

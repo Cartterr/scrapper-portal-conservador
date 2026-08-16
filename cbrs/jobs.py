@@ -117,6 +117,7 @@ class JobStore:
                     input_json TEXT NOT NULL,
                     idempotency_key TEXT UNIQUE,
                     status TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
                     result_count INTEGER,
                     completed_items INTEGER NOT NULL DEFAULT 0,
                     failed_items INTEGER NOT NULL DEFAULT 0,
@@ -233,7 +234,7 @@ class JobStore:
             db.execute(
                 """
                 INSERT INTO schema_versions(component, version, applied_at)
-                VALUES ('jobs', 2, ?)
+                VALUES ('jobs', 3, ?)
                 ON CONFLICT(component) DO UPDATE SET
                     version = MAX(version, excluded.version),
                     applied_at = CASE
@@ -249,6 +250,18 @@ class JobStore:
             }
             if "egress_hash" not in columns:
                 db.execute("ALTER TABLE account_checks ADD COLUMN egress_hash TEXT")
+            job_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            if "priority" not in job_columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+            db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_jobs_claim_priority
+                ON jobs(status, next_run_at, priority DESC, created_at)
+                """
+            )
 
     def create_job(
         self,
@@ -256,9 +269,11 @@ class JobStore:
         kind: str,
         input_data: Mapping[str, Any],
         idempotency_key: str | None = None,
+        priority: int = 0,
     ) -> tuple[dict[str, Any], bool]:
         normalized = normalize_job_input(kind, input_data)
         key = _normalize_idempotency_key(idempotency_key)
+        priority = 1 if int(priority) > 0 else 0
         now = utc_now()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -278,13 +293,13 @@ class JobStore:
                 """
                 INSERT INTO jobs(
                     job_id, kind, input_json, idempotency_key, status,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'queued', ?, ?)
+                    priority, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
                 """,
-                (job_id, kind, stable_json(normalized), key, now, now),
+                (job_id, kind, stable_json(normalized), key, priority, now, now),
             )
             row = db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
-            self._add_event_db(db, job_id, "job_enqueued", {"kind": kind})
+            self._add_event_db(db, job_id, "job_enqueued", {"kind": kind, "priority": priority})
             return self._job_payload(db, row), True
 
     def get_job(self, job_id: str, *, include_input: bool = False) -> dict[str, Any] | None:
@@ -302,6 +317,41 @@ class JobStore:
             ).fetchall()
             return [self._job_payload(db, row) for row in rows]
 
+    def successful_fna_examples(self, *, limit: int = 8) -> list[dict[str, int]]:
+        """Return recent successful document coordinates for the local UI only."""
+        limit = max(1, min(int(limit), 20))
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT input_json, COUNT(*) AS success_count FROM jobs
+                WHERE kind = 'fna'
+                  AND status IN ('completed', 'partial')
+                  AND completed_items > 0
+                GROUP BY input_json
+                ORDER BY MAX(finished_at) DESC, MAX(rowid) DESC
+                LIMIT 200
+                """
+            ).fetchall()
+        examples_by_coordinates: dict[tuple[int, int, int], dict[str, int]] = {}
+        for row in rows:
+            try:
+                request = json.loads(str(row["input_json"]))
+                example = {
+                    "foja": int(request["foja"]),
+                    "numero": int(request["numero"]),
+                    "year": int(request["year"]),
+                    "success_count": int(row["success_count"]),
+                }
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            key = (example["foja"], example["numero"], example["year"])
+            prior = examples_by_coordinates.get(key)
+            if prior:
+                prior["success_count"] += example["success_count"]
+            else:
+                examples_by_coordinates[key] = example
+        return list(examples_by_coordinates.values())[:limit]
+
     def claim_next(self, owner: str, *, lease_seconds: int = JOB_LEASE_SECONDS) -> Job | None:
         now = utc_now()
         expires = _utc_after(lease_seconds)
@@ -314,7 +364,7 @@ class JobStore:
                 WHERE status IN ({placeholders})
                   AND cancel_requested = 0
                   AND (next_run_at IS NULL OR next_run_at <= ?)
-                ORDER BY created_at, rowid
+                ORDER BY priority DESC, created_at, rowid
                 LIMIT 1
                 """,
                 (*CLAIMABLE_JOB_STATES, now),
@@ -991,23 +1041,41 @@ class JobStore:
         *,
         include_input: bool = False,
     ) -> dict[str, Any]:
+        account_id = row["current_account_id"]
+        if not account_id:
+            attempt = db.execute(
+                """
+                SELECT account_id FROM job_attempts
+                WHERE job_id = ?
+                ORDER BY
+                    CASE WHEN status IN ('search_completed', 'completed') THEN 0 ELSE 1 END,
+                    COALESCE(finished_at, started_at) DESC,
+                    rowid DESC
+                LIMIT 1
+                """,
+                (row["job_id"],),
+            ).fetchone()
+            account_id = attempt["account_id"] if attempt else None
         payload = {
             "job_id": row["job_id"],
             "kind": row["kind"],
             "status": row["status"],
             "idempotency_key": row["idempotency_key"],
+            "priority": int(row["priority"] or 0),
             "result_count": row["result_count"],
             "completed_items": row["completed_items"],
             "failed_items": row["failed_items"],
             "error_code": row["error_code"],
             "error_message": row["error_message"],
             "current_account_id": row["current_account_id"],
+            "account_id": account_id,
             "next_run_at": row["next_run_at"],
             "cancel_requested": bool(row["cancel_requested"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
+            "attempts": self._attempts_db(db, str(row["job_id"])),
             "items": self._items_db(db, str(row["job_id"]), public=True),
         }
         raw_input = json.loads(str(row["input_json"]))
@@ -1018,6 +1086,30 @@ class JobStore:
         else:
             payload["request"] = {"text_saved": True}
         return redact(payload)
+
+    @staticmethod
+    def _attempts_db(db: sqlite3.Connection, job_id: str) -> list[dict[str, Any]]:
+        rows = db.execute(
+            """
+            SELECT account_id, status, safety_stop, started_at, finished_at
+            FROM job_attempts
+            WHERE job_id = ?
+            ORDER BY started_at, rowid
+            """,
+            (job_id,),
+        ).fetchall()
+        return [
+            redact(
+                {
+                    "account_id": row["account_id"],
+                    "status": row["status"],
+                    "reason": row["safety_stop"] or row["status"],
+                    "started_at": row["started_at"],
+                    "finished_at": row["finished_at"],
+                }
+            )
+            for row in rows
+        ]
 
     @staticmethod
     def _items_db(

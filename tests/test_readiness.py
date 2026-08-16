@@ -18,6 +18,10 @@ def _write_source_assets(root: Path) -> None:
         path.write_text("test\n", encoding="utf-8")
 
 
+def test_prerequisites_document_is_a_required_deployment_asset() -> None:
+    assert "PREREQUISITES.txt" in REQUIRED_SOURCE_FILES
+
+
 def _write_pool(path: Path, *, include_references: bool = True) -> None:
     account = {
         "id": "account_1",

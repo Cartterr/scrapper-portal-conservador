@@ -1,0 +1,402 @@
+CBRS - PRERREQUISITOS PARA INSTALACION E2E
+==========================================
+
+Version del documento: 1.1
+Entorno soportado: Ubuntu 24.04 LTS; en Windows, Ubuntu 24.04 dentro de WSL2
+
+PROPOSITO
+---------
+
+Este archivo define todo lo que debe existir, aprobarse o estar disponible antes
+de instalar y operar CBRS. Tambien es el contrato funcional aplicado por
+INSTALL-CBRS.bat con "clic derecho > Ejecutar como administrador".
+
+El instalador podra instalar software y validar el equipo, pero no puede inventar
+autorizaciones, comprar proxies, decidir cuotas, resolver CAPTCHA ni crear un
+destino de respaldo aprobado por el cliente.
+
+
+1. ARQUITECTURA SOPORTADA
+-------------------------
+
+Produccion:
+
+  - Ubuntu 24.04 LTS de 64 bits.
+  - Python, Playwright, Chrome, SQLite, Xvfb y los servicios se ejecutan en Ubuntu.
+
+Desarrollo o estacion Windows:
+
+  - Windows 11 de 64 bits con WSL2.
+  - Distribucion requerida: Ubuntu-24.04.
+  - Todo el runtime CBRS permanece dentro de Ubuntu/WSL2.
+  - El dashboard puede mostrarse en el navegador nativo de Windows para usar la
+    frecuencia real del monitor. Esto es solo visualizacion; no mueve el worker,
+    Playwright, perfiles, SQLite ni secretos fuera de Ubuntu.
+
+No soportado como runtime:
+
+  - Python nativo de Windows ejecutando CBRS.
+  - Chrome de Windows como navegador de las cuentas CBRS.
+  - Docker, React, Node.js, FastAPI, Postgres o un servidor web publico.
+  - Solucionadores externos de CAPTCHA, rotacion automatica de identidad o
+    exportacion de cookies/tokens.
+
+
+2. AUTORIZACIONES OBLIGATORIAS DEL CLIENTE
+------------------------------------------
+
+Antes de cualquier prueba viva debe existir confirmacion expresa de que:
+
+  [ ] Las cuentas indicadas estan autorizadas para consultar CBRS.
+  [ ] Las consultas, descargas, pruebas de cuota y soak estan autorizadas.
+  [ ] La cuota diaria de cada cuenta esta confirmada por el cliente/CBRS.
+  [ ] El uso de un proxy chileno fijo o sticky por cuenta esta autorizado.
+  [ ] El operador acepta aprobar manualmente el baseline inicial de egreso.
+  [ ] Existe una persona disponible para resolver CAPTCHA cuando sea necesario.
+  [ ] Se aprobo conservar permanentemente PDFs, SQLite y respaldos cifrados.
+
+Sin estas confirmaciones el instalador debe completar solo verificaciones offline
+y no debe iniciar trafico hacia CBRS.
+
+
+3. EQUIPO WINDOWS (CUANDO SE USE WSL2)
+--------------------------------------
+
+Requisitos obligatorios:
+
+  - Windows 11 x64 actualizado.
+  - Virtualizacion de CPU habilitada en BIOS/UEFI.
+  - WSL2 disponible o permiso para habilitarlo.
+  - Capacidad para reiniciar Windows si WSL lo solicita.
+  - Una cuenta de Windows con privilegios de administrador para la instalacion.
+  - Git disponible para clonar el repositorio, salvo que el futuro instalador
+    incluya una copia verificada del codigo.
+  - Fecha, hora y zona horaria del sistema correctas.
+  - Acceso de escritura al checkout y a la carpeta de Inicio del usuario.
+  - Antivirus/EDR corporativo configurado para permitir WSL, Chrome, Xvfb y los
+    scripts firmados o aprobados del repositorio.
+
+No se requiere Python, Chrome Linux ni Playwright preinstalados en Windows. Esos
+componentes se instalan dentro de Ubuntu.
+
+Comprobaciones basicas:
+
+  wsl.exe --status
+  wsl.exe --list --verbose
+  git --version
+
+La distribucion debe aparecer como Ubuntu-24.04 y VERSION 2.
+
+
+4. RECURSOS MINIMOS DEL EQUIPO
+------------------------------
+
+Minimo operativo:
+
+  - CPU x86_64 con 4 nucleos logicos y virtualizacion.
+  - 8 GiB de RAM total.
+  - 20 GiB libres antes de instalar y validar.
+  - Conexion estable a Internet.
+
+Recomendado para ejecucion indefinida y crecimiento de cuentas:
+
+  - 8 nucleos logicos o mas.
+  - 16 GiB de RAM o mas.
+  - SSD para el disco primario.
+  - Espacio primario dimensionado para perfiles, SQLite y PDFs permanentes.
+  - Un segundo volumen o NAS con capacidad igual o mayor que la evidencia que se
+    espera conservar.
+
+Los PDFs y snapshots no se eliminan automaticamente. Veinte GiB es el minimo del
+gate de readiness, no una estimacion de retencion a largo plazo.
+
+
+5. CONECTIVIDAD Y PUERTOS
+-------------------------
+
+Se requiere salida HTTPS (TCP 443) hacia:
+
+  - Repositorios de Ubuntu y el PPA usado para Python 3.14.
+  - Repositorio oficial de Google Chrome.
+  - PyPI y dependencias de Playwright.
+  - Portal CBRS y Google reCAPTCHA Enterprise.
+  - Endpoint de comprobacion de egreso usado por preflight/proxy-health.
+  - Host y puerto de cada proxy contratado.
+  - Destino restic/NAS, si el respaldo es remoto.
+
+Puertos locales:
+
+  - 8765: dashboard y API local.
+  - 6080: noVNC para recuperacion visual de CAPTCHA.
+  - 5900: puente VNC interno, ligado a loopback.
+  - Display X11 :99: Chrome headed dentro de Xvfb.
+
+No se necesita ningun puerto entrante publico. En produccion, 8765, 6080 y 5900
+deben permanecer en 127.0.0.1 y accederse mediante loopback o tunel SSH. En WSL2
+el dashboard puede usar la interfaz privada de la VM exclusivamente para el
+reenvio local de Windows; nunca debe publicarse en Internet.
+
+
+6. CUENTAS CBRS QUE DEBE ENTREGAR EL CLIENTE
+--------------------------------------------
+
+Por cada cuenta habilitada se necesita:
+
+  - Identificador interno sin espacios, por ejemplo ejecutivo_1.
+  - Nombre visible opcional.
+  - Correo/usuario de login.
+  - Contrasena actual.
+  - Cuota diaria autorizada, por ejemplo 20.
+  - URL completa del proxy asignado.
+  - Confirmacion de que la cuenta no exige un segundo factor no automatizable,
+    o instrucciones operativas aprobadas si lo exige.
+
+Cada cuenta usa:
+
+  - Un perfil Chrome persistente independiente.
+  - Variables de entorno de usuario, contrasena y proxy independientes.
+  - Estado, cuota y baseline de egreso independientes.
+
+Las credenciales no deben entregarse en commits, issues, capturas, argumentos de
+linea de comandos ni este archivo. Durante la instalacion se guardan solamente en
+`/etc/cbrs/cbrs.env` con permisos `0640 root:cbrs`.
+
+
+7. PROXY O EGRESO POR CUENTA
+----------------------------
+
+Requisito recomendado y modelo normal:
+
+  - Un IP chileno dedicado, permanente o sticky por cuenta.
+  - Protocolo HTTP o HTTPS con host y puerto definidos.
+  - Credenciales de proxy incluidas en una variable protegida, nunca en Git.
+  - Sin rotacion automatica durante la operacion.
+  - Capacidad de mantener la misma ruta durante sesiones prolongadas.
+  - Acceso comprobado a CBRS, reCAPTCHA Enterprise y el endpoint de egreso.
+
+Si varias cuentas comparten deliberadamente una ruta, debe existir autorizacion
+expresa y todas deben declarar el mismo `egress_group`. Esto reduce el aislamiento
+y no equivale al modelo recomendado de una IP por cuenta.
+
+Antes de la primera busqueda de cada cuenta, `proxy-health` debe confirmar:
+
+  [ ] Pais CL.
+  [ ] Acceso a CBRS.
+  [ ] Acceso al script de reCAPTCHA Enterprise.
+  [ ] Hash de egreso estable.
+  [ ] Aprobacion humana del baseline inicial.
+
+Un cambio posterior de egreso pausa la cuenta antes de consultar CBRS.
+
+
+8. RESPALDO Y RETENCION
+-----------------------
+
+El cliente debe proporcionar uno de estos destinos:
+
+  - Segundo disco/volumen montado en Ubuntu; o
+  - NAS o backend remoto compatible con restic.
+
+Tambien se necesita:
+
+  - Ruta o URL de `RESTIC_REPOSITORY`.
+  - Archivo de contrasena de restic fuera de Git.
+  - Permiso de escritura para el usuario de servicio `cbrs`.
+  - Espacio suficiente para retencion sin pruning automatico.
+  - El almacenamiento secundario debe estar en un dispositivo distinto del
+    almacenamiento primario de `/var/lib/cbrs/outputs`.
+
+Rutas esperadas en Ubuntu:
+
+  /etc/cbrs/                  configuracion protegida
+  /opt/cbrs/                  aplicacion y virtualenv
+  /var/lib/cbrs/              SQLite, perfiles y estado durable
+  /var/lib/cbrs/outputs/      PDFs permanentes
+  /var/log/cbrs/              reportes sanitizados
+  /srv/cbrs-backup/           destino local sugerido de restic
+
+
+9. SOFTWARE QUE INSTALARA/VERIFICARA EL INSTALADOR
+---------------------------------------------------
+
+INSTALL-CBRS.bat debe instalar o comprobar, de forma idempotente:
+
+  - WSL2 y Ubuntu-24.04 en Windows.
+  - `systemd` funcional dentro de Ubuntu.
+  - Python 3.14 y `python3.14-venv`.
+  - Google Chrome Stable para Linux.
+  - Xvfb, x11vnc, noVNC y websockify.
+  - restic, curl, ca-certificates, gnupg, rsync y utilidades requeridas.
+  - Virtualenv `/opt/cbrs/.venv`.
+  - Versiones fijadas en `requirements.txt`, incluidas Playwright, Pillow,
+    python-dotenv, curl_cffi y pytest.
+  - Dependencias Linux requeridas por Playwright/Chromium.
+  - Usuario/grupo de servicio `cbrs`, directorios y permisos.
+  - Unidades systemd del display, worker, dashboard, VNC/noVNC, backup y
+    aplicacion protegida de cambios de cuentas.
+
+El instalador no debe depender de Python nativo de Windows, Node.js, Docker ni
+un cambio global de ExecutionPolicy.
+
+
+10. ARCHIVOS DE CONFIGURACION
+-----------------------------
+
+Plantillas versionadas:
+
+  deploy/cbrs.env.example
+  deploy/account-pool.json.example
+
+Archivos reales, nunca versionados:
+
+  /etc/cbrs/cbrs.env
+  /etc/cbrs/restic-password
+  /var/lib/cbrs/account-pool.json
+
+Valores operativos obligatorios:
+
+  CBRS_BROWSER_BACKEND=chrome
+  CBRS_BROWSER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+  CBRS_HEADLESS=0
+  CBRS_EGRESS_MODE=dedicated_static_isp
+  CBRS_EXPECTED_EGRESS_COUNTRY=CL
+  CBRS_REQUEST_DELAY_SECONDS con valor igual o mayor al minimo seguro
+  DISPLAY=:99
+  RESTIC_REPOSITORY y RESTIC_PASSWORD_FILE
+
+Por cada cuenta deben existir las variables referenciadas por `username_env`,
+`password_env` y `proxy_url_env`. El JSON guarda nombres de variables, no valores
+secretos.
+
+Administracion local posterior a la instalacion:
+
+  - El boton `Configurar cuentas` del dashboard permite agregar, editar o
+    eliminar cuentas solo con el worker detenido.
+  - Una cuenta nueva requiere correo, contrasena, proxy dedicado y cupo diario.
+  - En cuentas existentes, dejar correo, contrasena o proxy vacios conserva el
+    valor protegido actual. Las contrasenas existentes nunca se muestran.
+  - Al guardar, la solicitud se aplica mediante una unidad systemd fija; no se
+    interpreta ningun comando ni ruta proporcionada por el navegador.
+
+
+10.1 USO DEL DASHBOARD LOCAL
+----------------------------
+
+El dashboard se abre en `http://127.0.0.1:8765/` y concentra los controles de
+operacion diaria:
+
+  - `Crear solicitud`: elegir `Por empresa` o `Por documento` (foja, numero,
+    ano), luego elegir `Agregar a cola` o `Buscar y descargar ahora`.
+  - `Buscar y descargar ahora` prioriza esa solicitud y puede iniciar el worker
+    seguro si estaba detenido. Es trafico CBRS real y sigue cupos, pacing,
+    preflight y safety stops.
+  - `Ej.` solo presenta coordenadas de documentos que ya produjeron PDFs
+    correctos en ese equipo; no inventa ejemplos ni inicia trafico al elegirlos.
+  - `Solicitudes recientes` permite abrir `Ver PDF` dentro del dashboard. Las
+    rutas de artefactos siguen restringidas a los outputs autorizados.
+  - `Resolver captcha` aparece exclusivamente en una cuenta con CAPTCHA o una
+    recuperacion equivalente pendiente; abre la intervencion visual local.
+
+
+11. LO QUE INSTALL-CBRS.BAT DEBE HACER
+--------------------------------------
+
+El instalador de Windows debe:
+
+  1. Verificar elevacion, arquitectura, virtualizacion, WSL2, red y espacio.
+  2. Mostrar un preview y no iniciar trafico CBRS durante la instalacion.
+  3. Instalar/reutilizar Ubuntu-24.04 y manejar de forma clara un reinicio.
+  4. Validar que el checkout contiene todos los assets obligatorios.
+  5. Instalar el runtime Ubuntu de forma idempotente.
+  6. Solicitar o importar las cuentas sin imprimir secretos.
+  7. Crear archivos protegidos y validar permisos.
+  8. Configurar el destino restic y ejecutar un backup de prueba.
+  9. Ejecutar `readiness` y guardar un reporte sanitizado.
+ 10. Detenerse para la aprobacion humana de cada baseline de egreso.
+ 11. Habilitar servicios solo despues de superar los gates, incluyendo la unidad
+     que aplica cambios locales de cuentas.
+ 12. Abrir el dashboard en el navegador nativo de Windows.
+ 13. Verificar heartbeat, API, espacio, backup y estado de servicios.
+ 14. Entregar un resumen final PASS/FAIL con acciones concretas.
+
+Debe poder ejecutarse nuevamente sin borrar perfiles, SQLite, PDFs, baselines ni
+configuracion existente.
+
+
+12. PASOS QUE SIEMPRE REQUIEREN PERSONA
+---------------------------------------
+
+  - Confirmar autorizacion y cuota.
+  - Proporcionar cuentas y proxies validos.
+  - Aprobar por primera vez el hash de egreso de cada cuenta.
+  - Resolver CAPTCHA o acciones interactivas exigidas por el portal.
+  - Aprobar el destino y la politica de respaldo.
+  - Autorizar el inicio de pruebas vivas o del soak indefinido.
+
+Ningun instalador debe omitir o simular estas decisiones.
+
+
+13. GATES DE ACEPTACION ANTES DE TRAFICO VIVO
+---------------------------------------------
+
+Todos deben finalizar correctamente:
+
+  [ ] Checkout completo y commit/release esperado.
+  [ ] Ubuntu 24.04 y Python 3.14 detectados.
+  [ ] Dependencias Python en las versiones fijadas.
+  [ ] Chrome Stable Linux, Xvfb, restic y systemd disponibles.
+  [ ] Configuracion segura: headed Chrome, pais CL y pacing valido.
+  [ ] Una referencia de secretos y perfil unico por cuenta.
+  [ ] Valores secretos presentes sin aparecer en el reporte.
+  [ ] Baseline aprobado para cada cuenta habilitada.
+  [ ] Directorios y permisos de produccion correctos.
+  [ ] Repositorio restic inicializado en almacenamiento secundario.
+  [ ] Backup exitoso durante las ultimas 36 horas.
+  [ ] Al menos 20 GiB libres o capacidad superior acordada.
+  [ ] Unidades systemd instaladas y saludables.
+  [ ] Dashboard accesible localmente sin exposicion publica.
+  [ ] Worker unico; ningun segundo proceso puede tomar el lease.
+
+Gate offline/sanitizado dentro de Ubuntu:
+
+  cd /opt/cbrs
+  .venv/bin/python -m cbrs readiness \
+    --target ubuntu \
+    --env-file /etc/cbrs/cbrs.env \
+    --config /var/lib/cbrs/account-pool.json \
+    --json-report /var/lib/cbrs/readiness/pre-live.json
+
+Este gate no inicia navegador ni hace trafico. `proxy-health`, aprobacion de
+baseline, login y consultas son gates vivos separados que requieren autorizacion.
+
+
+14. SEGURIDAD DEL CHECKOUT
+--------------------------
+
+Antes de compartir, instalar o hacer push:
+
+  - `.env`, `.env.local`, `.cbrs/`, perfiles, outputs y reportes reales deben
+    permanecer ignorados por Git.
+  - No deben existir passwords, tokens, cookies, JWT, IPs crudas ni URLs completas
+    de proxy en archivos rastreados.
+  - No se deben copiar perfiles Chrome entre cuentas.
+  - No se deben borrar ni reemplazar bases o PDFs existentes al reinstalar.
+  - El instalador debe mostrar valores sensibles como `[REDACTED]`.
+
+
+15. RESULTADO ESPERADO DE UNA INSTALACION COMPLETA
+--------------------------------------------------
+
+Una instalacion esta lista solo cuando:
+
+  - El reporte readiness dice LIVE READY.
+  - Worker, dashboard, display, noVNC y backup estan activos/saludables.
+  - Cada cuenta tiene perfil, proxy, baseline, cuota y sesion verificables.
+  - El dashboard abre localmente y muestra cuentas, jobs, PDFs, alertas y los
+    controles `Crear solicitud`, ejemplos comprobados y configuracion de cuentas.
+  - CAPTCHA pausa trafico y permite recuperacion manual.
+  - SQLite, perfiles y PDFs sobreviven reinicios.
+  - Existe un backup cifrado reciente en almacenamiento secundario.
+  - No se ha expuesto ningun secreto ni puerto publico.
+
+Hasta cumplir todo lo anterior, el estado correcto es NOT LIVE READY.

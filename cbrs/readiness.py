@@ -26,13 +26,20 @@ REQUIRED_PACKAGES = {
     "python-dotenv": "1.0.1",
 }
 REQUIRED_SOURCE_FILES = (
+    "PREREQUISITES.txt",
+    "INSTALL-CBRS.bat",
     "requirements.txt",
+    "deploy/configure_runtime.py",
+    "deploy/run_with_env.py",
+    "deploy/windows/Install-CbrsE2E.ps1",
     "deploy/install-ubuntu.sh",
     "deploy/install-wsl.sh",
     "deploy/cbrs.env.example",
     "deploy/account-pool.json.example",
     "deploy/cbrs-worker.service",
     "deploy/cbrs-dashboard.service",
+    "deploy/cbrs-configuration-apply.path",
+    "deploy/cbrs-configuration-apply.service",
     "deploy/cbrs-backup.timer",
 )
 

@@ -11,6 +11,27 @@
 
 ## Resumen ejecutivo
 
+Antes de instalar, revisar [PREREQUISITES.txt](PREREQUISITES.txt). Ese archivo
+define los requisitos del equipo, autorizaciones, cuentas, proxies, respaldo y
+gates que tambien debera aplicar el instalador E2E de Windows.
+
+### Instalación E2E en Windows
+
+Después de clonar una release aprobada, el cliente solo debe hacer clic derecho
+sobre [`INSTALL-CBRS.bat`](INSTALL-CBRS.bat) y elegir **Ejecutar como
+administrador**. El instalador:
+
+1. valida el checkout y habilita/reutiliza WSL2 con Ubuntu 24.04;
+2. puede continuar automáticamente después de un reinicio requerido;
+3. instala el runtime Linux y conserva cualquier estado existente;
+4. solicita cuentas, contraseñas y proxies mediante campos ocultos;
+5. configura restic, servicios y el dashboard nativo;
+6. ejecuta readiness y muestra un resultado `PASS/FAIL` sanitizado.
+
+La instalación no aprueba egresos ni inicia el worker sin confirmaciones
+separadas. Para revisar el plan sin cambios se puede ejecutar
+`INSTALL-CBRS.bat --plan` desde una consola.
+
 Esta plataforma facilita consultas documentales autorizadas en el portal CBRS y
 convierte las imágenes obtenidas en archivos PDF ordenados para revisión local.
 La operación combina sesiones de navegador persistentes, validaciones previas,
@@ -24,7 +45,7 @@ en Git, no se rotan identidades y no se realizan reintentos agresivos.
 
 | Valor para la operación | Cómo se materializa |
 |---|---|
-| **Automatización controlada** | Estandariza la búsqueda, selección y descarga sin perder supervisión humana. |
+| **Automatización controlada** | Estandariza la búsqueda y descarga sin perder supervisión humana. |
 | **Trazabilidad operacional** | Registra ciclos, estados y evidencia sanitizada para facilitar seguimiento y auditoría. |
 | **Protección de datos** | Mantiene perfiles, credenciales, resultados y configuración sensible fuera de Git. |
 | **Seguridad preventiva** | Detiene la actividad ante límites, CAPTCHA, WAF, sesión inválida o cambios de egreso. |
@@ -242,6 +263,8 @@ alinearse con la autorización o contrato aplicable.
 - Comprobación previa del proxy: egreso chileno, carga de reCAPTCHA Enterprise y
   disponibilidad inicial del portal.
 - Dashboard local en español para estado, ciclos, cupos, PDFs y alertas.
+- Controles locales para administrar cuentas, crear solicitudes por empresa o
+  documento, usar ejemplos comprobados y previsualizar PDFs generados.
 - Cobertura automatizada para configuración, navegador, seguridad, PDF,
   preflight, validación, soak y pool.
 
@@ -381,6 +404,16 @@ python -m cbrs jobs dashboard
 python -m cbrs jobs show JOB_ID
 ```
 
+El **Centro de control** del dashboard ofrece esas mismas rutas sin requerir la
+CLI: se puede buscar **Por empresa** o **Por documento** (`foja`, `número` y
+`año`, equivalente al flujo histórico `download --foja --numero --ano`). Para
+cualquiera de los dos tipos se puede elegir **Agregar a cola** o **Buscar y
+descargar ahora**. La segunda opción se marca como prioritaria y, si el worker
+está detenido, solicita su inicio seguro. Sigue respetando un único
+worker, cupos, pacing, preflight y safety stops; no salta los gates de CBRS.
+Si CBRS devuelve más de una inscripción válida, se descarga un PDF
+permanente por cada resultado.
+
 El dashboard/API escucha normalmente en `127.0.0.1:8765`. En WSL2, el drop-in
 `deploy/cbrs-dashboard-wsl.conf` habilita de forma explícita la interfaz privada
 de la VM para que pueda abrirse desde cualquier navegador del mismo PC. Usa:
@@ -403,20 +436,36 @@ permanece ligada a loopback y los puertos nunca se exponen a Internet. Las
 búsquedas procesan todas las coincidencias y publican PDFs permanentes bajo
 `outputs/jobs/<job_id>/`.
 
-En WSL2, `cbrs-dashboard-viewer.service` abre automáticamente una ventana tipo
-aplicación de Google Chrome Linux mediante WSLg. La unidad se ejecuta de forma
-independiente al worker, se reinicia si la ventana se cierra y vuelve a abrirse
-al iniciar Ubuntu. Usa `/var/lib/cbrs/dashboard-viewer`, un perfil exclusivo de
-visualización que nunca se reutiliza como perfil de una cuenta CBRS. Esta unidad
-no se instala en producción. No es necesario abrir PowerShell ni copiar una URL
-manualmente para observar la ejecución; cerrar la ventana tampoco detiene el
-worker.
+En WSL2 el dashboard se abre en el navegador **nativo de Windows**, mientras que
+el worker, SQLite, Playwright y todos los procesos CBRS permanecen en Ubuntu. Es
+una excepción exclusiva de visualización: WSLg expone actualmente el escritorio
+a 60 Hz, mientras que el navegador nativo puede usar la frecuencia real del
+monitor. El puente utiliza `http://127.0.0.1:8765/`, espera hasta que responda y
+no envía tráfico CBRS ni mueve lógica de aplicación a Windows.
 
 En la estación WSL de desarrollo, el inicio de sesión de Windows puede registrar
 `deploy/windows/Start-CbrsWslHidden.vbs` como puente de arranque sin privilegios.
-Ese puente solamente mantiene Ubuntu iniciado y no ejecuta lógica CBRS en
-Windows. Una vez iniciado Ubuntu, `systemd` recupera el worker, el dashboard, el
-visor y el temporizador de respaldo habilitados.
+Ese puente mantiene Ubuntu iniciado y abre el dashboard en el navegador nativo
+cuando el endpoint esté listo; no ejecuta lógica CBRS en Windows. El botón
+**Configurar cuentas** abre un formulario local para agregar, actualizar o
+eliminar cuentas. Las contraseñas existentes nunca se cargan ni se muestran: los
+campos vacíos las conservan y el botón de revelar solo muestra valores escritos
+en la sesión actual. Al guardar, una unidad local de `systemd` aplica la
+configuración protegida y mantiene el worker detenido hasta que el operador use
+**Reanudar worker**. Una vez iniciado Ubuntu, `systemd` recupera el worker, el
+dashboard y el temporizador de respaldo habilitados.
+
+### Controles de operación en el dashboard
+
+En la parte superior del dashboard, **Crear solicitud** reúne los controles que
+antes requerían la CLI: elegir **Por empresa** o **Por documento** (`foja`,
+`número`, `año`) y luego elegir **Agregar a cola** o **Buscar y descargar ahora**.
+La acción inmediata se prioriza y puede arrancar el worker de forma segura; por
+ello puede iniciar tráfico real, aunque nunca evita cupos, pacing, autenticación,
+preflight o safety stops. El botón pequeño **Ej.** carga solamente coordenadas
+que ya generaron PDFs correctos en el equipo. En **Solicitudes recientes**,
+**Ver PDF** abre el artefacto ya descargado dentro de un modal local. La
+recuperación visual solo se ofrece desde una cuenta con CAPTCHA pendiente.
 
 ## Consultas y documentos
 
@@ -474,9 +523,6 @@ Para comprobar la preparación E2E desde el propio Ubuntu sin iniciar Chrome ni
 tráfico, ejecutar dentro de `/opt/cbrs`:
 
 ```bash
-set -a
-source /etc/cbrs/cbrs.env
-set +a
 .venv/bin/python -m cbrs readiness \
   --target ubuntu \
   --env-file /etc/cbrs/cbrs.env \
@@ -619,8 +665,10 @@ docs/                        Arquitectura y guías operacionales
 - La confiabilidad depende de mantener perfiles de navegador y egresos estables.
 - Un proxy puede salir por Chile y aun así no ser apto si bloquea reCAPTCHA o el
   endpoint inicial del portal.
-- El dashboard no produce tráfico por sí solo; los runners `soak` y `pool` sí
-  ejecutan consultas reales cuando están activos.
+- El dashboard es principalmente operativo; **Buscar y descargar ahora** puede
+  encolar una solicitud prioritaria y solicitar el arranque seguro del worker.
+  Los runners `soak` y `pool` siguen siendo los únicos procesos que ejecutan
+  tráfico real contra CBRS.
 - No existe resolución externa de CAPTCHA, rotación automática de IP, cambio de
   identidad ni reintentos agresivos.
 - Una cuenta pausada requiere revisión y no se fuerza automáticamente.

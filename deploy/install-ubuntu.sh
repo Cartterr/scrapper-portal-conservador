@@ -43,7 +43,7 @@ if ! id cbrs >/dev/null 2>&1; then
   useradd --system --gid cbrs --home-dir /var/lib/cbrs --shell /usr/sbin/nologin cbrs
 fi
 
-install -d -o cbrs -g cbrs -m 0750 /var/lib/cbrs /var/lib/cbrs/outputs /var/log/cbrs /srv/cbrs-backup
+install -d -o cbrs -g cbrs -m 0750 /var/lib/cbrs /var/lib/cbrs/outputs /var/lib/cbrs/control /var/log/cbrs /srv/cbrs-backup
 install -d -o root -g cbrs -m 0750 /etc/cbrs
 install -d -o root -g root -m 0755 "${APP_DIR}"
 
@@ -81,7 +81,8 @@ fi
 
 for unit in cbrs-display.service cbrs-x11vnc.service cbrs-novnc.service \
             cbrs-worker.service cbrs-dashboard.service cbrs-backup.service \
-            cbrs-backup.timer; do
+            cbrs-backup.timer cbrs-worker-resume.path cbrs-worker-resume.service \
+            cbrs-configuration-apply.path cbrs-configuration-apply.service; do
   install -o root -g root -m 0644 "${APP_DIR}/deploy/${unit}" "/etc/systemd/system/${unit}"
 done
 systemctl daemon-reload

@@ -1,6 +1,7 @@
 [Unit]
 Description=CBRS loopback dashboard and jobs API
-After=network.target
+Wants=cbrs-novnc.service
+After=network.target cbrs-novnc.service
 
 [Service]
 Type=simple

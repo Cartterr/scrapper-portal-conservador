@@ -1,5 +1,6 @@
 import json
 import threading
+from dataclasses import replace
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -765,7 +766,9 @@ def test_pool_waits_when_daily_capacity_is_exhausted(tmp_path: Path) -> None:
     assert status["alert"]["title"] == "Pool diario agotado"
 
 
-def test_pool_dashboard_api_and_html_are_sanitized(tmp_path: Path) -> None:
+def test_pool_dashboard_api_and_html_are_sanitized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from cbrs.account_pool import AccountPoolStore, load_account_pool_config, run_account_pool
     from cbrs.account_pool_dashboard import start_pool_dashboard
 
@@ -774,6 +777,18 @@ def test_pool_dashboard_api_and_html_are_sanitized(tmp_path: Path) -> None:
         root=tmp_path,
     )
     config = load_account_pool_config(settings)
+    config = replace(
+        config,
+        accounts=(
+            replace(config.accounts[0], username_env="CBRS_DASHBOARD_TEST_USERNAME"),
+            *config.accounts[1:],
+        ),
+    )
+    monkeypatch.setenv("CBRS_DASHBOARD_TEST_USERNAME", "operator.name@example.test")
+    monkeypatch.setenv(
+        "CBRS_NOVNC_URL",
+        "http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale",
+    )
     store = AccountPoolStore(tmp_path / ".cbrs" / "pool" / "pool.sqlite3")
     run_account_pool(settings=settings, config=config, store=store, dry_run=True, max_cycles=1)
 
@@ -789,18 +804,80 @@ def test_pool_dashboard_api_and_html_are_sanitized(tmp_path: Path) -> None:
         request = Request(f"{dashboard.url}/api/stop", method="POST")
         with urlopen(request, timeout=5) as response:
             stop_payload = json.loads(response.read().decode("utf-8"))
+        resume_request = Request(f"{dashboard.url}/api/resume", method="POST")
+        with urlopen(resume_request, timeout=5) as response:
+            resume_payload = json.loads(response.read().decode("utf-8"))
+        account_request = Request(
+            f"{dashboard.url}/api/onboarding/accounts",
+            data=json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "id": "ejecutivo_1",
+                            "username": "operator.name@example.test",
+                            "password": "test-password-not-returned",
+                            "proxy_url": "http://proxy-user:proxy-password@proxy.example.test:8080",
+                            "daily_quota": 20,
+                        }
+                    ]
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(account_request, timeout=5) as response:
+            account_payload = json.loads(response.read().decode("utf-8"))
     finally:
         dashboard.stop()
 
     serialized = json.dumps(payload)
     assert "Pool de Consultas CBRS" in html
     assert "Consultas disponibles hoy" in html
-    assert "Ejecutivo 1" in html
+    assert "account.username_prefix || account.label" in html
+    assert payload["accounts"][0]["label"] == "operator.name"
+    assert "job-account-icon" in html
+    assert "const initial" in html
+    assert "<th>Motivo</th>" in html
+    assert "límite diario informado por CBRS" in html
+    assert "<th>N.º diario</th>" in html
+    assert "documentOrdinals" in html
+    assert "attempt-details" in html
+    assert "attempt-account" in html
+    assert "No intentado" in html
+    assert "shortJobId" in html
+    assert "table-scroll" in html
+    assert "captchaPhaseLabels" in html
+    assert "recovery-spinner" in html
+    assert "renderStopButton" in html
+    assert "Deteniendo…" in html
+    assert "Reanudar worker" in html
+    assert "Configurar cuentas" in html
+    assert "Agregar a cola" in html
+    assert "Buscar y descargar ahora" in html
+    assert "Por empresa" in html
+    assert "Por documento" in html
+    assert 'id="openExamples"' in html
+    assert "/api/examples" in html
+    assert "data-preview-job" in html
+    assert "pdfPreviewModal" in html
+    assert "/artifacts" in html
+    assert "/api/onboarding/accounts" in html
+    assert "Las contraseñas existentes nunca se cargan aquí" in html
     assert "email" not in serialized.lower()
     assert "password" not in serialized.lower()
+    assert payload["runtime"]["visual_url"].startswith("http://localhost:6080/")
+    assert "[REDACTED_IP]" not in payload["runtime"]["visual_url"]
     assert payload["pool"]["daily_quota"] == 60
     assert content.startswith(b"%PDF")
     assert stop_payload == {"ok": True, "status": "stop_requested"}
+    assert resume_payload == {"ok": True, "status": "resume_requested"}
+    assert account_payload == {"ok": True, "status": "account_configuration_requested"}
+    assert (settings.profile_dir.parent / "control" / "resume.request").read_text() == "resume\n"
+    request_payload = json.loads(
+        (settings.profile_dir.parent / "control" / "account-configuration.json").read_text()
+    )
+    assert request_payload["accounts"][0]["id"] == "ejecutivo_1"
+    assert "test-password-not-returned" not in json.dumps(account_payload)
 
 
 def test_pool_dashboard_can_trigger_manual_captcha_recovery(tmp_path: Path) -> None:
@@ -857,6 +934,9 @@ def test_pool_dashboard_can_trigger_manual_captcha_recovery(tmp_path: Path) -> N
     assert "Resolver captcha" in html
     assert "captchaBreath" in html
     assert "--wave-index" in html
+    assert ".jobs-table thead th" in html
+    assert "position: sticky" in html
+    assert "top: 64px" in html
     assert payload == {"ok": True, "status": "started", "account_id": "ejecutivo_1"}
     assert calls == ["ejecutivo_1"]
 
@@ -878,8 +958,12 @@ def test_pool_dashboard_visual_captcha_requires_operator_confirmation(
     store.mark_account_captcha_pending("pool-test", "ejecutivo_1")
     validated = threading.Event()
 
-    def fake_hold(_store, _settings, _config, *, account_id, confirmation):
+    def fake_hold(
+        _store, _settings, _config, *, account_id, confirmation, phase_changed=None
+    ):
         assert account_id == "ejecutivo_1"
+        if phase_changed:
+            phase_changed("waiting_operator")
         return confirmation.wait(timeout=2)
 
     def fake_resolver(**kwargs):
@@ -906,3 +990,61 @@ def test_pool_dashboard_visual_captcha_requires_operator_confirmation(
 
     assert trigger_payload["visual_confirmation_required"] is True
     assert complete_payload["status"] == "validation_requested"
+
+
+def test_visual_captcha_refreshes_expired_session_before_waiting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cbrs.account_pool import AccountPoolStore, load_account_pool_config
+    from cbrs.account_pool_dashboard import _hold_visual_captcha_session
+
+    settings = load_settings(
+        {"CBRS_PROFILE_DIR": ".cbrs/chrome-profile", "CBRS_OUTPUT_DIR": "outputs"},
+        root=tmp_path,
+    )
+    original = load_account_pool_config(settings)
+    account = replace(
+        original.accounts[0],
+        username_env="CBRS_TEST_USERNAME",
+        password_env="CBRS_TEST_PASSWORD",
+    )
+    config = replace(original, accounts=(account,))
+    monkeypatch.setenv("CBRS_TEST_USERNAME", "operator@example.test")
+    monkeypatch.setenv("CBRS_TEST_PASSWORD", "private")
+    store = AccountPoolStore(tmp_path / ".cbrs" / "pool" / "pool.sqlite3")
+    store.create_run(run_id="pool-test", dry_run=False, config=config, dashboard_url=None)
+    store.mark_account_captcha_pending("pool-test", account.account_id)
+    calls: list[tuple[str, str]] = []
+    reloaded = threading.Event()
+
+    class FakeBrowserSession:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+        def login_with_visible_form(self, username: str, password: str) -> str:
+            calls.append((username, password))
+            return "browser_form"
+
+        def reload_current_page(self) -> None:
+            reloaded.set()
+
+    monkeypatch.setattr("cbrs.browser_session.BrowserSession", FakeBrowserSession)
+    confirmation = threading.Event()
+    confirmation.set()
+
+    assert _hold_visual_captcha_session(
+        store,
+        settings,
+        config,
+        account_id=account.account_id,
+        confirmation=confirmation,
+    )
+    assert calls == [("operator@example.test", "private")]
+    assert reloaded.is_set()

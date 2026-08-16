@@ -9,11 +9,9 @@ $ErrorActionPreference = 'Stop'
 $command = @'
 set -euo pipefail
 systemctl --no-pager --plain status cbrs-worker.service cbrs-dashboard.service cbrs-backup.timer || true
-set -a
-source /etc/cbrs/cbrs.env
-set +a
 cd /opt/cbrs
-runuser -u cbrs --preserve-environment -- /opt/cbrs/.venv/bin/python -m cbrs jobs status \
+runuser -u cbrs -- /opt/cbrs/.venv/bin/python deploy/run_with_env.py /etc/cbrs/cbrs.env -- \
+  /opt/cbrs/.venv/bin/python -m cbrs jobs status \
   --config /var/lib/cbrs/account-pool.json
 '@
 

@@ -363,3 +363,51 @@ def test_login_response_preserves_captcha_as_a_safety_stop(tmp_path: Path) -> No
             )
         )
     assert error.value.reason == StopReason.CAPTCHA_REJECTED
+
+
+def test_prepare_interactive_login_prefills_without_submitting(tmp_path: Path) -> None:
+    settings = load_settings({}, root=tmp_path)
+    captured: dict[str, object] = {}
+
+    class FakeLocator:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.first = self
+
+        def wait_for(self, **kwargs) -> None:
+            captured[f"wait_{self.name}"] = kwargs
+
+        def fill(self, value: str) -> None:
+            captured[f"fill_{self.name}"] = value
+
+    class FakePage:
+        url = "about:blank"
+
+        def goto(self, url: str, **kwargs) -> None:
+            captured["goto"] = (url, kwargs)
+
+        def locator(self, selector: str) -> FakeLocator:
+            name = "password" if "password" in selector else "email"
+            return FakeLocator(name)
+
+    session = BrowserSession(settings)
+    session._context = SimpleNamespace(pages=[FakePage()])
+
+    session.prepare_interactive_login("operator@example.test", "private")
+
+    assert captured["goto"][0].endswith("/login")
+    assert captured["fill_email"] == "operator@example.test"
+    assert captured["fill_password"] == "private"
+
+
+def test_visible_form_login_submits_and_confirms_session(tmp_path: Path) -> None:
+    session = BrowserSession(load_settings({}, root=tmp_path))
+    session.open = lambda: session
+    captured: dict[str, str] = {}
+    session._login_with_form = lambda username, password: captured.update(
+        {"username": username, "password": password}
+    )
+    session.has_active_login = lambda: True
+
+    assert session.login_with_visible_form("operator@example.test", "private") == "browser_form"
+    assert captured == {"username": "operator@example.test", "password": "private"}

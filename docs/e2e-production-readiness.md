@@ -3,9 +3,10 @@
 ## Arquitectura soportada
 
 El entorno productivo soportado es Ubuntu. En estaciones Windows se desarrolla
-en Ubuntu sobre WSL2; WSLg muestra el mismo Google Chrome Linux usado por el
-runtime. No se mezclan procesos Python de WSL con Chrome o librerías nativas de
-Windows.
+en Ubuntu sobre WSL2. Chrome Linux usado por las cuentas se ejecuta en Xvfb; el
+dashboard puede mostrarse en el navegador nativo de Windows para aprovechar el
+compositor del host. No se mezclan Python, Playwright, perfiles ni librerías del
+runtime con componentes nativos de Windows.
 
 ```text
 Poderalia -> API 127.0.0.1 -> SQLite/WAL -> worker secuencial
@@ -61,10 +62,11 @@ Antes del primer arranque, inicializar el repositorio restic sin política de
 pruning:
 
 ```bash
-sudo -u cbrs bash -lc 'set -a; source /etc/cbrs/cbrs.env; restic init'
+sudo -u cbrs /opt/cbrs/.venv/bin/python /opt/cbrs/deploy/run_with_env.py \
+  /etc/cbrs/cbrs.env -- restic init
 ```
 
-## WSL2 y depuración visual
+## WSL2 y visualización local
 
 Dentro de Ubuntu/WSL2:
 
@@ -74,8 +76,9 @@ export CBRS_HEADLESS=0
 .venv/bin/python -m cbrs doctor
 ```
 
-Chrome Linux aparece mediante WSLg. Este camino reproduce el entorno Ubuntu;
-el runtime Windows nativo queda fuera del soporte productivo.
+El browser de las cuentas sigue siendo Chrome Linux dentro de Xvfb. Solamente el
+dashboard se abre en el navegador nativo mediante loopback; el runtime Windows
+nativo queda fuera del soporte productivo.
 
 ## Preparación única
 
@@ -84,11 +87,11 @@ Ejecutar con el mismo usuario, configuración y display del servicio:
 ```bash
 sudo systemctl start cbrs-display.service cbrs-x11vnc.service cbrs-novnc.service
 sudo -u cbrs bash -lc '
-  set -a
-  source /etc/cbrs/cbrs.env
   cd /opt/cbrs
-  .venv/bin/python -m cbrs doctor
-  .venv/bin/python -m cbrs pool proxy-health \
+  .venv/bin/python deploy/run_with_env.py /etc/cbrs/cbrs.env -- \
+    .venv/bin/python -m cbrs doctor
+  .venv/bin/python deploy/run_with_env.py /etc/cbrs/cbrs.env -- \
+    .venv/bin/python -m cbrs pool proxy-health \
     --config /var/lib/cbrs/account-pool.json \
     --approve-egress-baseline
 '

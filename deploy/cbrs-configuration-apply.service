@@ -1,0 +1,8 @@
+[Unit]
+Description=Apply a fixed local CBRS account-configuration request
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/cbrs/.venv/bin/python /opt/cbrs/deploy/configure_runtime.py --update-accounts-only --request-file /var/lib/cbrs/control/account-configuration.json
+ExecStartPost=/usr/bin/systemctl try-restart cbrs-dashboard.service

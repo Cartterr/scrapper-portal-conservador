@@ -141,6 +141,45 @@ def test_job_store_idempotency_and_input_privacy(tmp_path):
         assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
+def test_priority_job_is_claimed_before_older_queued_work(tmp_path):
+    path = tmp_path / "pool.sqlite3"
+    AccountPoolStore(path)
+    store = JobStore(path)
+    ordinary, _ = store.create_job(kind="text", input_data={"text": "Ordinary"})
+    priority, _ = store.create_job(
+        kind="fna",
+        input_data={"foja": 1, "numero": 2, "year": 2020},
+        priority=1,
+    )
+
+    claimed = store.claim_next("worker")
+
+    assert claimed is not None
+    assert claimed.job_id == priority["job_id"]
+    assert ordinary["job_id"] != priority["job_id"]
+
+
+def test_successful_fna_examples_are_deduplicated(tmp_path):
+    path = tmp_path / "pool.sqlite3"
+    AccountPoolStore(path)
+    store = JobStore(path)
+    first, _ = store.create_job(
+        kind="fna", input_data={"foja": 10, "numero": 20, "year": 2020}
+    )
+    duplicate, _ = store.create_job(
+        kind="fna", input_data={"foja": 10, "numero": 20, "year": 2020}
+    )
+    with store.connect() as db:
+        db.execute(
+            "UPDATE jobs SET status = 'completed', completed_items = 1, finished_at = ? WHERE job_id IN (?, ?)",
+            ("2026-01-01T00:00:00+00:00", first["job_id"], duplicate["job_id"]),
+        )
+
+    assert store.successful_fna_examples() == [
+        {"foja": 10, "numero": 20, "year": 2020, "success_count": 2}
+    ]
+
+
 def test_recover_abandoned_job_and_item(tmp_path):
     path = tmp_path / "pool.sqlite3"
     AccountPoolStore(path)
@@ -281,7 +320,13 @@ def test_worker_restart_registers_an_atomically_published_pdf_without_redownload
         proxy_health_runner=_gate,
     )
 
-    assert store.get_job(job["job_id"])["status"] == "completed"
+    completed = store.get_job(job["job_id"])
+    assert completed["status"] == "completed"
+    assert completed["account_id"] == "a1"
+    assert len(completed["attempts"]) == 1
+    assert completed["attempts"][0]["account_id"] == "a1"
+    assert completed["attempts"][0]["status"] == "completed"
+    assert completed["attempts"][0]["reason"] == "completed"
     assert final_path.read_bytes() == original
     assert len(store.artifacts(job_id=job["job_id"])) == 1
 
@@ -487,9 +532,10 @@ def test_global_rate_limit_stops_worker(tmp_path, monkeypatch):
     assert store.get_control("global_safety_stop")["value"] == "rate_limit"
 
 
-def test_jobs_api_is_loopback_idempotent_and_cancellable(tmp_path):
+def test_jobs_api_is_loopback_idempotent_and_cancellable(tmp_path, monkeypatch):
     settings = _settings(tmp_path)
     config = _config()
+    _credentials(monkeypatch, config)
     path = tmp_path / "pool.sqlite3"
     pool_store = AccountPoolStore(path)
     store = JobStore(path)
@@ -539,6 +585,30 @@ def test_jobs_api_is_loopback_idempotent_and_cancellable(tmp_path):
             repeated = json.load(response)
         assert repeated["job_id"] == created["job_id"]
 
+        instant = Request(
+            f"{dashboard.url}/api/jobs/instant",
+            data=json.dumps(
+                {"kind": "fna", "foja": 10, "numero": 20, "year": 2020}
+            ).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(instant) as response:
+            instant_created = json.load(response)
+        assert instant_created["priority"] == 1
+        assert instant_created["worker_requested"] is True
+        assert (settings.profile_dir.parent / "control" / "resume.request").read_text() == "resume\n"
+
+        instant_text = Request(
+            f"{dashboard.url}/api/jobs/instant",
+            data=json.dumps({"kind": "text", "text": "Immediate company"}).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(instant_text) as response:
+            instant_text_created = json.load(response)
+        assert instant_text_created["priority"] == 1
+
         conflict_body = json.dumps(
             {"kind": "text", "text": "Different query", "idempotency_key": "api-1"}
         ).encode()
@@ -556,6 +626,12 @@ def test_jobs_api_is_loopback_idempotent_and_cancellable(tmp_path):
             status = json.load(response)
         assert status["request"] == {"text_saved": True}
         assert "Private query" not in json.dumps(status)
+
+        with urlopen(f"{dashboard.url}/api/status") as response:
+            dashboard_status = json.load(response)
+        accounts = {row["account_id"]: row for row in dashboard_status["accounts"]}
+        assert accounts["a1"]["username_prefix"] == "a1"
+        assert "a1@example.test" not in json.dumps(dashboard_status)
 
         cancel = Request(
             f"{dashboard.url}/api/jobs/{created['job_id']}/cancel",

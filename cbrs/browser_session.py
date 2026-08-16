@@ -121,6 +121,10 @@ class BrowserSession:
         if not self.page.url.startswith(self.settings.commerce_url):
             self.page.goto(self.settings.commerce_url, wait_until="domcontentloaded", timeout=60000)
 
+    def reload_current_page(self) -> None:
+        """Reload the visible page after browser-owned authentication changes."""
+        self.page.reload(wait_until="domcontentloaded", timeout=60000)
+
     def has_login_cookie(self) -> bool:
         cookies = self.context.cookies(
             [
@@ -231,6 +235,45 @@ class BrowserSession:
             "Automatic CBRS login did not establish an active session.",
             context="auth",
         ) from fetch_error
+
+    def prepare_interactive_login(self, username: str, password: str) -> None:
+        """Open CBRS login and prefill credentials without submitting them.
+
+        CAPTCHA recovery uses this after an automatic browser-origin login is
+        rejected by the portal.  Submission remains under operator control so
+        any visual challenge is handled in the real browser, while credentials
+        still come only from the configured in-memory environment values.
+        """
+        self.open()
+        self.page.goto(
+            self._url("/login"),
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        email = self.page.locator("#email, input[type=email], input[name=email]").first
+        password_input = self.page.locator(
+            "#password, input[type=password], input[name=password]"
+        ).first
+        try:
+            email.wait_for(state="visible", timeout=10000)
+        except Exception:
+            login_button = self.page.get_by_role("button", name=re.compile("iniciar sesi", re.I))
+            login_button.first.click(timeout=5000)
+            email.wait_for(state="visible", timeout=10000)
+        email.fill(username)
+        password_input.fill(password)
+
+    def login_with_visible_form(self, username: str, password: str) -> str:
+        """Fill and submit CBRS's real login form in the visible browser."""
+        self.open()
+        self._login_with_form(username, password)
+        if not self.has_active_login():
+            raise SafetyStopException(
+                StopReason.AUTH_REQUIRED,
+                "Visible CBRS login completed without an active session.",
+                context="visual auth",
+            )
+        return "browser_form"
 
     def generate_recaptcha_token(self, action: str) -> str:
         self._ensure_recaptcha_ready()
