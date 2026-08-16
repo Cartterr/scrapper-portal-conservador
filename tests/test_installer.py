@@ -172,3 +172,14 @@ def test_windows_installer_has_required_safety_gates() -> None:
     assert "¿Autoriza habilitar e iniciar ahora el worker CBRS?" in powershell
     assert "Start-Transcript" not in powershell
     assert "source /etc/cbrs/cbrs.env" not in powershell
+
+
+def test_windows_wsl_helpers_strip_cr_before_bash() -> None:
+    for relative_path in (
+        "deploy/windows/Get-CbrsIndefiniteStatus.ps1",
+        "deploy/windows/Start-CbrsIndefiniteTest.ps1",
+        "deploy/windows/Stop-CbrsIndefiniteTest.ps1",
+        "deploy/windows/Install-CbrsE2E.ps1",
+    ):
+        source = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert '-replace "`r", \'\'' in source

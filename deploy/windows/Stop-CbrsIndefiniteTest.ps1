@@ -15,6 +15,7 @@ systemctl stop cbrs-worker.service
 systemctl stop cbrs-dashboard.service cbrs-novnc.service cbrs-x11vnc.service cbrs-display.service
 '@
 }
+$command = $command -replace "`r", ''
 
 & wsl.exe --distribution $DistroName --user root --exec bash -lc $command
 if ($LASTEXITCODE -ne 0) {

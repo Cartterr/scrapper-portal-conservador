@@ -155,7 +155,10 @@ function Invoke-WslRootScript {
         [string]$Script,
         [string[]]$Arguments = @(),
         [switch]$AllowFailure
-    )
+)
+    # Here-strings read from a Windows checkout use CRLF. Bash accepts LF only
+    # for control keywords such as `set -o pipefail`.
+    $Script = $Script -replace "`r", ''
     $oldEncoding = $OutputEncoding
     try {
         $OutputEncoding = New-Object Text.UTF8Encoding($false)

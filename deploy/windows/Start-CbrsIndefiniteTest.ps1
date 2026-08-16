@@ -37,6 +37,7 @@ runuser -u cbrs -- /opt/cbrs/.venv/bin/python -m cbrs readiness \
   --config /var/lib/cbrs/account-pool.json \
   --json-report /var/lib/cbrs/readiness/pre-live.json
 '@
+$readinessCommand = $readinessCommand -replace "`r", ''
 & wsl.exe --distribution $DistroName --user root --exec bash -lc $readinessCommand
 if ($LASTEXITCODE -ne 0) {
     throw 'Live readiness failed. No CBRS services were started.'
@@ -50,6 +51,7 @@ systemctl start cbrs-dashboard.service cbrs-backup.timer
 systemctl start cbrs-worker.service
 systemctl --no-pager --plain status cbrs-worker.service cbrs-dashboard.service
 '@
+$startCommand = $startCommand -replace "`r", ''
 & wsl.exe --distribution $DistroName --user root --exec bash -lc $startCommand
 if ($LASTEXITCODE -ne 0) {
     throw 'One or more CBRS services failed to start. Inspect the systemd status output.'

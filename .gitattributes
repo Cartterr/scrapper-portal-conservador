@@ -1,0 +1,12 @@
+# Deployment assets are executed by Bash/systemd inside Ubuntu. Keep their
+# checkout form POSIX-safe even when the repository is used from Windows.
+*.sh text eol=lf
+deploy/*.service text eol=lf
+deploy/*.path text eol=lf
+deploy/*.conf text eol=lf
+*.py text eol=lf
+
+# Native Windows launchers retain Windows line endings.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.vbs text eol=crlf

@@ -14,6 +14,7 @@ runuser -u cbrs -- /opt/cbrs/.venv/bin/python deploy/run_with_env.py /etc/cbrs/c
   /opt/cbrs/.venv/bin/python -m cbrs jobs status \
   --config /var/lib/cbrs/account-pool.json
 '@
+$command = $command -replace "`r", ''
 
 & wsl.exe --distribution $DistroName --user root --exec bash -lc $command
 if ($LASTEXITCODE -ne 0) {
