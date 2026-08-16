@@ -28,6 +28,7 @@ def test_relative_paths_resolve_under_repo_root(tmp_path: Path) -> None:
             "CBRS_PROFILE_DIR": ".local/profile",
             "CBRS_CLOAK_CACHE_DIR": ".local/cache",
             "CBRS_OUTPUT_DIR": "downloads",
+            "CBRS_LOG_DIR": "runtime-logs",
         },
         root=tmp_path,
     )
@@ -35,6 +36,7 @@ def test_relative_paths_resolve_under_repo_root(tmp_path: Path) -> None:
     assert settings.profile_dir == tmp_path / ".local" / "profile"
     assert settings.cloak_cache_dir == tmp_path / ".local" / "cache"
     assert settings.output_dir == tmp_path / "downloads"
+    assert settings.log_dir == tmp_path / "runtime-logs"
 
 
 def test_settings_parse_production_defaults(tmp_path: Path) -> None:
@@ -49,6 +51,7 @@ def test_settings_parse_production_defaults(tmp_path: Path) -> None:
     assert settings.profile_dir == tmp_path / ".cbrs" / "chrome-profile"
     assert settings.cloak_cache_dir == tmp_path / ".cbrs" / "cloak-cache"
     assert settings.output_dir == tmp_path / "outputs"
+    assert settings.log_dir == tmp_path / ".cbrs" / "logs"
     assert settings.allow_cloak_auto_update is False
 
 

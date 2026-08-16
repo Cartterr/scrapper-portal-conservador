@@ -15,7 +15,7 @@ from typing import Any, Callable, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 from .config import SETTINGS, Settings
-from .safety import redact, redact_text
+from .safety import SafetyStopException, StopReason, redact, redact_text
 from .validation import (
     ValidationRunResult,
     finish_validation_report,
@@ -34,6 +34,8 @@ DEFAULT_TARGET_QUERY = "BANCO DE CHILE"
 CAPTCHA_REJECTED_REASON = "captcha_rejected"
 CAPTCHA_PENDING_STATUS = "captcha_pending"
 CAPTCHA_SOLVING_STATUS = "captcha_solving"
+ACTIVE_RUN_STATUSES = frozenset({"running", "waiting", "waiting_capacity", "waiting_captcha"})
+RUN_STALE_AFTER_SECONDS = 120.0
 LOCAL_TZ = ZoneInfo("America/Santiago")
 SECRET_ACCOUNT_KEYS = {
     "email",
@@ -58,6 +60,11 @@ class PoolAccount:
     label: str
     enabled: bool = True
     proxy_url_env: str | None = None
+    username_env: str | None = None
+    password_env: str | None = None
+    profile_dir: Path | None = None
+    daily_quota: int | None = None
+    egress_group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -78,10 +85,16 @@ class PoolConfig:
     dashboard_host: str
     dashboard_port: int
     targets: tuple[PoolTarget, ...]
+    job_interval_min_seconds: float = 0.0
+    job_interval_max_seconds: float = 0.0
+    allow_live_repetition: bool = False
 
     @property
     def pool_daily_quota(self) -> int:
-        return self.daily_quota_per_account * len([a for a in self.accounts if a.enabled])
+        return sum(self.quota_for(account) for account in self.accounts if account.enabled)
+
+    def quota_for(self, account: PoolAccount) -> int:
+        return account.daily_quota or self.daily_quota_per_account
 
 
 @dataclass(frozen=True)
@@ -97,6 +110,36 @@ DEFAULT_ACCOUNTS = (
     PoolAccount("ejecutivo_2", "Ejecutivo 2"),
     PoolAccount("ejecutivo_3", "Ejecutivo 3"),
 )
+
+
+def _initial_account_state(
+    account: PoolAccount,
+    prior: dict[str, Any] | None,
+    *,
+    quota_date: str,
+) -> tuple[str, str | None, str | None]:
+    if not account.enabled:
+        return "disabled", None, None
+    if not prior:
+        return "available", None, None
+
+    status = str(prior.get("status") or "available")
+    reason = str(prior.get("paused_reason") or "") or None
+    paused_at = str(prior.get("paused_at") or "") or None
+    prior_quota_date = str(prior.get("quota_date") or "")
+
+    # A process crash while the headed recovery window was open must not make
+    # the account schedulable again on restart.
+    if status == CAPTCHA_SOLVING_STATUS:
+        return CAPTCHA_PENDING_STATUS, reason or CAPTCHA_REJECTED_REASON, paused_at
+
+    # Portal daily limits expire with the Chilean quota day. Security, auth and
+    # CAPTCHA pauses remain durable until an operator explicitly clears them.
+    if status == "paused" and reason == "daily_limit" and prior_quota_date != quota_date:
+        return "available", None, None
+    if status in {"paused", CAPTCHA_PENDING_STATUS}:
+        return status, reason, paused_at
+    return "available", None, None
 
 
 class AccountPoolStore:
@@ -201,6 +244,40 @@ class AccountPoolStore:
         now = utc_now()
         quota_date = local_today()
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not dry_run:
+                active = db.execute(
+                    """
+                    SELECT run_id, status, heartbeat_at
+                    FROM runs
+                    WHERE dry_run = 0 AND finished_at IS NULL
+                    ORDER BY started_at DESC, rowid DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if active and str(active["status"]) in ACTIVE_RUN_STATUSES:
+                    heartbeat_age = seconds_since(str(active["heartbeat_at"]))
+                    if heartbeat_age <= RUN_STALE_AFTER_SECONDS:
+                        raise RuntimeError(
+                            "An account pool runner is already active "
+                            f"(run_id={active['run_id']}). Stop it before starting another."
+                        )
+                    db.execute(
+                        """
+                        UPDATE runs
+                        SET status = 'stale', finished_at = ?, heartbeat_at = ?,
+                            blocked_reason = ?
+                        WHERE run_id = ?
+                        """,
+                        (
+                            now,
+                            now,
+                            "runner heartbeat expired before a replacement run started",
+                            active["run_id"],
+                        ),
+                    )
+
+            prior_states = self._latest_live_account_states(db) if not dry_run else {}
             db.execute(
                 """
                 INSERT INTO runs (
@@ -220,27 +297,53 @@ class AccountPoolStore:
                     config.daily_quota_per_account,
                 ),
             )
-            db.executemany(
-                """
-                INSERT INTO accounts (
-                    run_id, account_id, label, status, quota_date,
-                    daily_quota, updated_at
+            account_rows = []
+            for account in config.accounts:
+                status, paused_reason, paused_at = _initial_account_state(
+                    account,
+                    prior_states.get(account.account_id),
+                    quota_date=quota_date,
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
+                account_rows.append(
                     (
                         run_id,
                         account.account_id,
                         account.label,
-                        "available" if account.enabled else "disabled",
+                        status,
+                        paused_reason,
+                        paused_at,
                         quota_date,
-                        config.daily_quota_per_account,
+                        config.quota_for(account),
                         now,
                     )
-                    for account in config.accounts
-                ],
+                )
+            db.executemany(
+                """
+                INSERT INTO accounts (
+                    run_id, account_id, label, status, paused_reason, paused_at,
+                    quota_date, daily_quota, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                account_rows,
             )
+
+    @staticmethod
+    def _latest_live_account_states(db: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+        rows = db.execute(
+            """
+            SELECT a.*
+            FROM accounts AS a
+            JOIN runs AS r ON r.run_id = a.run_id
+            WHERE r.dry_run = 0
+            ORDER BY r.started_at DESC, r.rowid DESC
+            """
+        ).fetchall()
+        states: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            account_id = str(row["account_id"])
+            states.setdefault(account_id, dict(row))
+        return states
 
     def update_run(
         self,
@@ -443,10 +546,38 @@ class AccountPoolStore:
                 ("available", now, run_id, account_id),
             )
 
-    def latest_run(self) -> dict[str, Any] | None:
+    def reset_quota_day(self, run_id: str, quota_date: str) -> None:
+        """Advance quota metadata and release only portal daily-limit pauses."""
+        now = utc_now()
+        with self._connect() as db:
+            db.execute(
+                """
+                UPDATE accounts
+                SET status = CASE
+                        WHEN status = 'paused' AND paused_reason = 'daily_limit'
+                        THEN 'available' ELSE status END,
+                    paused_reason = CASE
+                        WHEN status = 'paused' AND paused_reason = 'daily_limit'
+                        THEN NULL ELSE paused_reason END,
+                    paused_at = CASE
+                        WHEN status = 'paused' AND paused_reason = 'daily_limit'
+                        THEN NULL ELSE paused_at END,
+                    quota_date = ?, updated_at = ?
+                WHERE run_id = ? AND quota_date != ?
+                """,
+                (quota_date, now, run_id, quota_date),
+            )
+
+    def latest_run(self, *, dry_run: bool | None = None) -> dict[str, Any] | None:
+        where = ""
+        params: tuple[Any, ...] = ()
+        if dry_run is not None:
+            where = "WHERE dry_run = ?"
+            params = (1 if dry_run else 0,)
         with self._connect() as db:
             row = db.execute(
-                "SELECT * FROM runs ORDER BY started_at DESC, rowid DESC LIMIT 1"
+                f"SELECT * FROM runs {where} ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                params,
             ).fetchone()
         return dict(row) if row else None
 
@@ -464,15 +595,33 @@ class AccountPoolStore:
 
     def usage_by_account(self, run_id: str, quota_date: str) -> dict[str, int]:
         with self._connect() as db:
-            rows = db.execute(
-                """
-                SELECT account_id, COUNT(*) AS count
-                FROM cycles
-                WHERE quota_date = ? AND status = 'passed'
-                GROUP BY account_id
-                """,
-                (quota_date,),
-            ).fetchall()
+            run = db.execute(
+                "SELECT dry_run FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                return {}
+            if bool(run["dry_run"]):
+                rows = db.execute(
+                    """
+                    SELECT account_id, COUNT(*) AS count
+                    FROM cycles
+                    WHERE run_id = ? AND quota_date = ?
+                    GROUP BY account_id
+                    """,
+                    (run_id, quota_date),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    """
+                    SELECT c.account_id, COUNT(*) AS count
+                    FROM cycles AS c
+                    JOIN runs AS r ON r.run_id = c.run_id
+                    WHERE c.quota_date = ? AND r.dry_run = 0
+                    GROUP BY c.account_id
+                    """,
+                    (quota_date,),
+                ).fetchall()
         return {str(row["account_id"]): int(row["count"]) for row in rows}
 
     def recent_cycles(
@@ -582,8 +731,11 @@ class AccountPoolStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(self.path)
+        db = sqlite3.connect(self.path, timeout=30)
         db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys = ON")
+        db.execute("PRAGMA busy_timeout = 30000")
+        db.execute("PRAGMA journal_mode = WAL")
         try:
             yield db
             db.commit()
@@ -598,8 +750,13 @@ def load_account_pool_config(
 ) -> PoolConfig:
     path = path or settings.profile_dir.parent / "account-pool.json"
     raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    accounts = tuple(_parse_accounts(raw.get("accounts")))
+    accounts = tuple(
+        _parse_accounts(raw.get("accounts"), profile_root=settings.profile_dir.parent / "accounts")
+    )
     targets = tuple(_parse_targets(raw.get("targets")))
+    allow_live_repetition = raw.get("allow_live_repetition", False)
+    if not isinstance(allow_live_repetition, bool):
+        raise ValueError("allow_live_repetition must be a JSON boolean")
     config = PoolConfig(
         accounts=accounts or DEFAULT_ACCOUNTS,
         daily_quota_per_account=int(
@@ -612,18 +769,52 @@ def load_account_pool_config(
         or (
             PoolTarget(label=DEFAULT_TARGET_LABEL, kind="text", query=DEFAULT_TARGET_QUERY),
         ),
+        job_interval_min_seconds=float(raw.get("job_interval_min_seconds", 0)),
+        job_interval_max_seconds=float(raw.get("job_interval_max_seconds", 0)),
+        allow_live_repetition=allow_live_repetition,
     )
     if config.daily_quota_per_account <= 0:
         raise ValueError("daily_quota_per_account must be greater than zero")
     if config.interval_minutes < 0:
         raise ValueError("interval_minutes must be zero or greater")
+    if config.job_interval_min_seconds < 0:
+        raise ValueError("job_interval_min_seconds must be zero or greater")
+    if config.job_interval_max_seconds < config.job_interval_min_seconds:
+        raise ValueError(
+            "job_interval_max_seconds must be greater than or equal to the minimum"
+        )
     if not any(account.enabled for account in config.accounts):
         raise ValueError("account pool requires at least one enabled account")
+    proxy_refs = [
+        account.proxy_url_env
+        for account in config.accounts
+        if account.enabled and account.proxy_url_env
+    ]
+    if len(proxy_refs) != len(set(proxy_refs)):
+        raise ValueError("enabled pool accounts must use distinct proxy_url_env references")
+    accounts_by_proxy: dict[str, list[PoolAccount]] = {}
+    for account in config.accounts:
+        if not account.enabled or not account.proxy_url_env:
+            continue
+        proxy_value = os.environ.get(account.proxy_url_env)
+        if proxy_value:
+            accounts_by_proxy.setdefault(proxy_value, []).append(account)
+    for shared_accounts in accounts_by_proxy.values():
+        if len(shared_accounts) < 2:
+            continue
+        groups = {account.egress_group for account in shared_accounts}
+        if None in groups or len(groups) != 1:
+            raise ValueError(
+                "enabled pool accounts may resolve to the same proxy URL only when "
+                "every affected account declares the same egress_group"
+            )
     return config
 
 
 def account_settings(settings: Settings, account: PoolAccount) -> Settings:
-    profile_root = settings.profile_dir.parent / "accounts" / account.account_id
+    profile_dir = account.profile_dir
+    if profile_dir is None:
+        profile_dir = settings.profile_dir.parent / "accounts" / account.account_id / "chrome-profile"
     proxy_url = settings.proxy_url
     if account.proxy_url_env:
         proxy_url = os.environ.get(account.proxy_url_env)
@@ -634,9 +825,33 @@ def account_settings(settings: Settings, account: PoolAccount) -> Settings:
             )
     return replace(
         settings,
-        profile_dir=(profile_root / "chrome-profile").resolve(),
+        profile_dir=profile_dir.resolve(),
         proxy_url=proxy_url,
     )
+
+
+def account_credentials(account: PoolAccount) -> tuple[str, str]:
+    if not account.username_env or not account.password_env:
+        raise ValueError(
+            f"Pool account {account.account_id} requires username_env and password_env "
+            "for unattended authentication."
+        )
+    username = os.environ.get(account.username_env)
+    password = os.environ.get(account.password_env)
+    missing = [
+        name
+        for name, value in (
+            (account.username_env, username),
+            (account.password_env, password),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(
+            f"Pool account {account.account_id} requires environment variable(s): "
+            f"{', '.join(missing)}."
+        )
+    return str(username), str(password)
 
 
 def default_pool_store(settings: Settings = SETTINGS) -> AccountPoolStore:
@@ -688,11 +903,11 @@ def resolve_account_captcha(
     store: AccountPoolStore | None = None,
     run_id: str | None = None,
     account_id: str,
-    validation_runner: Callable[..., ValidationRunResult] = run_controlled_validation,
+    validation_runner: Callable[..., ValidationRunResult] | None = None,
 ) -> dict[str, Any]:
     config = config or load_account_pool_config(settings)
     store = store or default_pool_store(settings)
-    run = store.latest_run() if run_id is None else {"run_id": run_id}
+    run = store.latest_run(dry_run=False) if run_id is None else {"run_id": run_id}
     if not run:
         raise ValueError("No active pool run exists for captcha recovery.")
     resolved_run_id = str(run["run_id"])
@@ -715,18 +930,25 @@ def resolve_account_captcha(
         message="pool captcha recovery started",
         data={"target_label": target.label, "target_kind": target.kind},
     )
-    result = validation_runner(
-        settings=runtime_settings,
-        search_kind=target.kind,
-        query=target.query,
-        foja=target.foja,
-        numero=target.numero,
-        ano=target.ano,
-        download_first=False,
-        output_dir=output_dir,
-        keep_images=False,
-        headless=False,
-    )
+    if validation_runner is None:
+        result = _run_account_session_validation(
+            runtime_settings,
+            account,
+            search_kind=target.kind,
+        )
+    else:
+        result = validation_runner(
+            settings=runtime_settings,
+            search_kind=target.kind,
+            query=target.query,
+            foja=target.foja,
+            numero=target.numero,
+            ano=target.ano,
+            download_first=False,
+            output_dir=output_dir,
+            keep_images=False,
+            headless=False,
+        )
     if result.exit_code == 0:
         store.mark_account_available(resolved_run_id, account.account_id)
         store.add_event(
@@ -756,6 +978,128 @@ def resolve_account_captcha(
     return {"ok": False, "status": status, "account_id": account.account_id, "reason": reason}
 
 
+def _run_account_session_validation(
+    settings: Settings,
+    account: PoolAccount,
+    *,
+    search_kind: str,
+) -> ValidationRunResult:
+    """Validate session and browser-owned reCAPTCHA without consuming a search."""
+    from .browser_session import CredentialsRejectedError
+    from .preflight import preflight_validation_metadata, run_preflight
+    from .proxy_health import proxy_health_validation_metadata, run_proxy_health
+    from .scraper import CBRSScraper
+
+    preflight = run_preflight(settings, write_report=True)
+    report = new_validation_report(
+        settings,
+        search_kind=f"captcha_recovery_{search_kind}",
+        download_first=False,
+        preflight_metadata=preflight_validation_metadata(preflight),
+        headless=False,
+    )
+    report["captcha_recovery_validation"] = "session_and_browser_recaptcha_only"
+    if not preflight.ok:
+        finish_validation_report(
+            report,
+            status="safety_stop",
+            safety_stop="egress_preflight_failed",
+            error="Fixed-egress preflight failed during CAPTCHA recovery.",
+        )
+        path = write_validation_report(report, settings)
+        return ValidationRunResult(
+            exit_code=2,
+            status="safety_stop",
+            report=report,
+            report_path=path,
+            preflight_report_path=preflight.report_path,
+            safety_stop="egress_preflight_failed",
+            error="Fixed-egress preflight failed during CAPTCHA recovery.",
+        )
+    if settings.proxy_url:
+        proxy = run_proxy_health(settings, write_report=True)
+        report.update(proxy_health_validation_metadata(proxy))
+        if not proxy.ok:
+            finish_validation_report(
+                report,
+                status="safety_stop",
+                safety_stop="proxy_health_failed",
+                error="Proxy health failed during CAPTCHA recovery.",
+            )
+            path = write_validation_report(report, settings)
+            return ValidationRunResult(
+                exit_code=2,
+                status="safety_stop",
+                report=report,
+                report_path=path,
+                preflight_report_path=preflight.report_path,
+                safety_stop="proxy_health_failed",
+                error="Proxy health failed during CAPTCHA recovery.",
+            )
+    try:
+        with CBRSScraper(headless=False, settings=settings) as scraper:
+            if account.username_env and account.password_env:
+                username, password = account_credentials(account)
+                scraper.ensure_authenticated(username, password)
+            elif not scraper.browser.has_active_login():
+                raise SafetyStopException(
+                    StopReason.AUTH_REQUIRED,
+                    "The recovered profile does not have an active session.",
+                    context="captcha recovery",
+                )
+            scraper.browser.generate_recaptcha_token("indice_com_texto")
+        finish_validation_report(report, status="passed")
+        path = write_validation_report(report, settings)
+        return ValidationRunResult(
+            exit_code=0,
+            status="passed",
+            report=report,
+            report_path=path,
+            preflight_report_path=preflight.report_path,
+            result_count=0,
+        )
+    except CredentialsRejectedError as exc:
+        finish_validation_report(report, status="failed", error=str(exc))
+        path = write_validation_report(report, settings)
+        return ValidationRunResult(
+            exit_code=1,
+            status="failed",
+            report=report,
+            report_path=path,
+            preflight_report_path=preflight.report_path,
+            error=str(exc),
+        )
+    except SafetyStopException as exc:
+        finish_validation_report(
+            report,
+            status="safety_stop",
+            safety_stop=exc.reason.value,
+            error=str(exc),
+        )
+        path = write_validation_report(report, settings)
+        return ValidationRunResult(
+            exit_code=2,
+            status="safety_stop",
+            report=report,
+            report_path=path,
+            preflight_report_path=preflight.report_path,
+            safety_stop=exc.reason.value,
+            error=str(exc),
+        )
+    except Exception as exc:
+        safe_error = f"CAPTCHA recovery session validation failed ({type(exc).__name__})."
+        finish_validation_report(report, status="failed", error=safe_error)
+        path = write_validation_report(report, settings)
+        return ValidationRunResult(
+            exit_code=1,
+            status="failed",
+            report=report,
+            report_path=path,
+            preflight_report_path=preflight.report_path,
+            error=safe_error,
+        )
+
+
 def run_account_pool(
     *,
     settings: Settings = SETTINGS,
@@ -773,6 +1117,16 @@ def run_account_pool(
 
     config = config or load_account_pool_config(settings)
     store = store or default_pool_store(settings)
+    if (
+        not dry_run
+        and validation_runner is run_controlled_validation
+        and not config.allow_live_repetition
+    ):
+        raise ValueError(
+            "Live pool repetition is disabled. The pool runner repeats static validation "
+            "targets and is not a production job queue. Set allow_live_repetition=true "
+            "only for an explicitly approved bounded validation run."
+        )
     run_id = (
         f"pool-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
         f"{secrets.token_hex(3)}"
@@ -931,6 +1285,20 @@ def run_account_pool(
                         message="pool account paused",
                         data={"reason": reason},
                     )
+            elif result.exit_code != 0:
+                # Unknown failures are not safe to retry indefinitely. Without
+                # this pause the least-used account is selected again forever,
+                # producing a slow request storm and repeatedly locking the same
+                # persistent profile.
+                reason = result.error or "unexpected_cycle_failure"
+                store.pause_account(run_id, account.account_id, reason=reason)
+                store.add_event(
+                    run_id,
+                    account_id=account.account_id,
+                    level="warning",
+                    message="pool account paused after unexpected failure",
+                    data={"reason": reason},
+                )
 
             if store.stop_requested():
                 final_status = "stopped"
@@ -992,6 +1360,23 @@ def dashboard_status(
     run = store.latest_run()
     if not run:
         quota = (config.pool_daily_quota if config else DEFAULT_DAILY_QUOTA_PER_ACCOUNT * 3)
+        configured_accounts = config.accounts if config else DEFAULT_ACCOUNTS
+        egress_groups = {
+            account.egress_group or f"account:{account.account_id}"
+            for account in configured_accounts
+            if account.enabled
+        }
+        shared_egress = any(
+            account.egress_group
+            and sum(
+                1
+                for candidate in configured_accounts
+                if candidate.enabled and candidate.egress_group == account.egress_group
+            )
+            > 1
+            for account in configured_accounts
+            if account.enabled
+        )
         return {
             "schema": "cbrs-account-pool-status-v1",
             "status": "not_started",
@@ -1003,6 +1388,8 @@ def dashboard_status(
                 "paused_accounts": 0,
                 "captcha_pending_accounts": 0,
                 "available_accounts": len(config.accounts) if config else 3,
+                "egress_routes": len(egress_groups),
+                "shared_egress": shared_egress,
             },
             "accounts": _default_account_status(config),
             "stats": {},
@@ -1026,6 +1413,29 @@ def dashboard_status(
         status = str(row["status"])
         if status == "available" and used >= quota:
             status = "quota_reached"
+        configured_account = (
+            next(
+                (
+                    account
+                    for account in config.accounts
+                    if account.account_id == str(row["account_id"])
+                ),
+                None,
+            )
+            if config
+            else None
+        )
+        egress_group = configured_account.egress_group if configured_account else None
+        egress_shared = bool(
+            config
+            and egress_group
+            and sum(
+                1
+                for account in config.accounts
+                if account.enabled and account.egress_group == egress_group
+            )
+            > 1
+        )
         account_payload.append(
             {
                 "account_id": row["account_id"],
@@ -1036,6 +1446,8 @@ def dashboard_status(
                 "remaining_today": max(0, quota - used),
                 "paused_reason": row["paused_reason"],
                 "paused_at": row["paused_at"],
+                "egress_group": egress_group,
+                "egress_shared": egress_shared,
             }
         )
 
@@ -1053,9 +1465,14 @@ def dashboard_status(
     captcha_pending_accounts = len(
         [account for account in account_payload if account["status"] == CAPTCHA_PENDING_STATUS]
     )
+    egress_groups = {
+        account.egress_group or f"account:{account.account_id}"
+        for account in config.accounts
+        if account.enabled
+    } if config else set()
     status = str(run["status"])
     heartbeat_age = seconds_since(str(run["heartbeat_at"]))
-    if status in {"running", "waiting", "waiting_capacity"} and heartbeat_age > 120:
+    if status in {"running", "waiting", "waiting_capacity", "waiting_captcha"} and heartbeat_age > 120:
         status = "stale"
     passed = sum(1 for cycle in cycles if cycle["status"] == "passed")
     failed = sum(1 for cycle in cycles if cycle["status"] == "failed")
@@ -1083,10 +1500,13 @@ def dashboard_status(
                 "quota_date": quota_date,
                 "next_account_id": next_account.account_id if next_account else None,
                 "next_account_label": next_account.label if next_account else None,
+                "egress_routes": len(egress_groups) if egress_groups else len(account_payload),
+                "shared_egress": any(account["egress_shared"] for account in account_payload),
             },
             "accounts": account_payload,
             "alert": _active_alert(
                 status=status,
+                pool_daily_quota=pool_daily_quota,
                 remaining_today=remaining_today,
                 available_accounts=available_accounts,
                 paused_accounts=paused_accounts,
@@ -1114,6 +1534,7 @@ def dashboard_status(
 def _active_alert(
     *,
     status: str,
+    pool_daily_quota: int,
     remaining_today: int,
     available_accounts: int,
     paused_accounts: int,
@@ -1125,7 +1546,7 @@ def _active_alert(
             "active": True,
             "severity": "warning",
             "title": "Pool diario agotado",
-            "message": "Las 60 consultas teóricas del día ya fueron consumidas o reservadas por cuenta. No se generará más tráfico hasta el próximo día.",
+            "message": f"Las {pool_daily_quota} consultas configuradas del día ya fueron consumidas o reservadas por cuenta. No se generará más tráfico hasta el próximo día.",
             "reason": "daily_pool_exhausted",
         }
     if status == "waiting_capacity" and available_accounts == 0 and captcha_pending_accounts:
@@ -1168,14 +1589,21 @@ def _active_alert(
     return None
 
 
-def _parse_accounts(raw_accounts: Any) -> Iterable[PoolAccount]:
+def _parse_accounts(raw_accounts: Any, *, profile_root: Path) -> Iterable[PoolAccount]:
     if not raw_accounts:
         return []
     accounts = []
     for raw in raw_accounts:
         if not isinstance(raw, dict):
             raise ValueError("each pool account must be an object")
-        forbidden = SECRET_ACCOUNT_KEYS.intersection({str(key).lower() for key in raw})
+        allowed_secret_references = {"username_env", "password_env", "proxy_url_env"}
+        keys = {str(key).lower() for key in raw}
+        forbidden = {
+            key
+            for key in keys
+            if key not in allowed_secret_references
+            and any(secret in key for secret in SECRET_ACCOUNT_KEYS)
+        }
         if forbidden:
             raise ValueError(
                 "account pool config must not contain credentials, emails, RUTs, "
@@ -1187,12 +1615,34 @@ def _parse_accounts(raw_accounts: Any) -> Iterable[PoolAccount]:
         label = str(raw.get("label") or account_id).strip()
         enabled = bool(raw.get("enabled", True))
         proxy_url_env = _safe_env_var(str(raw.get("proxy_url_env") or "").strip())
+        username_env = _safe_env_var(str(raw.get("username_env") or "").strip())
+        password_env = _safe_env_var(str(raw.get("password_env") or "").strip())
+        raw_profile_dir = str(raw.get("profile_dir") or "").strip()
+        profile_dir = None
+        if raw_profile_dir:
+            profile_dir = Path(raw_profile_dir).expanduser()
+            if not profile_dir.is_absolute():
+                profile_dir = profile_root / profile_dir
+            profile_dir = profile_dir.resolve()
+        raw_quota = raw.get("daily_quota")
+        daily_quota = int(raw_quota) if raw_quota is not None else None
+        if daily_quota is not None and daily_quota <= 0:
+            raise ValueError("account daily_quota must be greater than zero")
+        raw_egress_group = str(raw.get("egress_group") or "").strip()
+        egress_group = _safe_account_id(raw_egress_group) if raw_egress_group else None
+        if raw_egress_group and not egress_group:
+            raise ValueError("account egress_group must contain only letters, digits, or underscores")
         accounts.append(
             PoolAccount(
                 account_id=account_id,
                 label=label,
                 enabled=enabled,
                 proxy_url_env=proxy_url_env,
+                username_env=username_env,
+                password_env=password_env,
+                profile_dir=profile_dir,
+                daily_quota=daily_quota,
+                egress_group=egress_group,
             )
         )
     return accounts
@@ -1263,7 +1713,7 @@ def _safe_env_var(value: str) -> str | None:
     if not value:
         return None
     if not re.fullmatch(r"[A-Z][A-Z0-9_]*", value):
-        raise ValueError("proxy_url_env must be an uppercase environment variable name")
+        raise ValueError("secret references must be uppercase environment variable names")
     return value
 
 
@@ -1275,10 +1725,20 @@ def _default_account_status(config: PoolConfig | None) -> list[dict[str, Any]]:
             "label": account.label,
             "status": "available" if account.enabled else "disabled",
             "used_today": 0,
-            "daily_quota": config.daily_quota_per_account if config else DEFAULT_DAILY_QUOTA_PER_ACCOUNT,
-            "remaining_today": config.daily_quota_per_account if config else DEFAULT_DAILY_QUOTA_PER_ACCOUNT,
+            "daily_quota": config.quota_for(account) if config else DEFAULT_DAILY_QUOTA_PER_ACCOUNT,
+            "remaining_today": config.quota_for(account) if config else DEFAULT_DAILY_QUOTA_PER_ACCOUNT,
             "paused_reason": None,
             "paused_at": None,
+            "egress_group": account.egress_group,
+            "egress_shared": bool(
+                account.egress_group
+                and sum(
+                    1
+                    for candidate in accounts
+                    if candidate.enabled and candidate.egress_group == account.egress_group
+                )
+                > 1
+            ),
         }
         for account in accounts
     ]

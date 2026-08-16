@@ -1,0 +1,23 @@
+[Unit]
+Description=CBRS loopback dashboard and jobs API
+After=network.target
+
+[Service]
+Type=simple
+User=cbrs
+Group=cbrs
+WorkingDirectory=/opt/cbrs
+EnvironmentFile=/etc/cbrs/cbrs.env
+Environment=HOME=/var/lib/cbrs
+UMask=0027
+ExecStart=/opt/cbrs/.venv/bin/python -m cbrs jobs dashboard --config /var/lib/cbrs/account-pool.json --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/cbrs /var/log/cbrs
+
+[Install]
+WantedBy=multi-user.target

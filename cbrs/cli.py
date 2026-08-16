@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import config
 from .browser_runtime import get_browser_status
@@ -14,6 +16,9 @@ from .safety import SafetyStopException, StopReason, redact_text
 from .validation import (
     run_controlled_validation,
 )
+
+if TYPE_CHECKING:
+    from .scraper import CBRSScraper
 
 
 class RedactingFormatter(logging.Formatter):
@@ -125,6 +130,11 @@ def cmd_doctor() -> int:
             "headless" if settings.headless else f"headed/{settings.window_mode}",
         ),
         (
+            "browser display",
+            _browser_display_allowed(settings),
+            _browser_display_detail(settings),
+        ),
+        (
             "expected egress country",
             settings.expected_egress_country == "CL",
             settings.expected_egress_country,
@@ -180,6 +190,21 @@ def _browser_status_detail(status) -> str:
     if not status.available:
         return "missing"
     return f"{status.family} ({status.source})"
+
+
+def _browser_display_allowed(settings: config.Settings) -> bool:
+    if not sys.platform.startswith("linux") or settings.headless:
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _browser_display_detail(settings: config.Settings) -> str:
+    if not sys.platform.startswith("linux"):
+        return "not required on this platform"
+    if settings.headless:
+        return "not required in headless mode"
+    display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    return display or "headed Linux requires DISPLAY or WAYLAND_DISPLAY"
 
 
 def _egress_mode_allowed(settings: config.Settings) -> bool:
@@ -439,8 +464,21 @@ def cmd_pool(args: argparse.Namespace) -> int:
         exit_code = 0
         for account in accounts:
             settings = account_settings(config.SETTINGS, account)
-            result = run_proxy_health(settings, write_report=True)
             print(f"{account.label} ({account.account_id})")
+            preflight = run_preflight(
+                settings,
+                write_report=True,
+                approve_baseline=args.approve_egress_baseline,
+            )
+            for check in preflight.report.get("checks", []):
+                status = "OK" if check.get("ok") else "FAIL"
+                print(f"{status:4} {check.get('name')}: {check.get('detail')}")
+            if preflight.report_path:
+                print(f"Preflight report: {preflight.report_path}")
+            if not preflight.ok:
+                exit_code = 1
+                continue
+            result = run_proxy_health(settings, write_report=True)
             _print_proxy_health(result)
             if result.report_path:
                 print(f"Proxy health report: {result.report_path}")
@@ -544,6 +582,123 @@ def cmd_pool(args: argparse.Namespace) -> int:
     return result.exit_code
 
 
+def cmd_jobs(args: argparse.Namespace) -> int:
+    from .account_pool import AccountPoolStore, load_account_pool_config
+    from .jobs import IdempotencyConflictError, default_job_store, run_job_worker
+
+    store = default_job_store(config.SETTINGS)
+    pool_config = load_account_pool_config(
+        config.SETTINGS,
+        path=Path(args.config) if getattr(args, "config", None) else None,
+    )
+
+    if args.jobs_command == "enqueue":
+        kind = "text" if args.text is not None else "fna"
+        input_data = (
+            {"text": args.text}
+            if kind == "text"
+            else {"foja": args.foja, "numero": args.numero, "year": args.ano}
+        )
+        try:
+            job, created = store.create_job(
+                kind=kind,
+                input_data=input_data,
+                idempotency_key=args.idempotency_key,
+            )
+        except IdempotencyConflictError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(
+            json.dumps(
+                {
+                    "created": created,
+                    "job_id": job["job_id"],
+                    "status": job["status"],
+                    "status_url": f"/api/jobs/{job['job_id']}",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.jobs_command == "list":
+        print(json.dumps({"jobs": store.list_jobs(limit=args.limit)}, ensure_ascii=False, indent=2))
+        return 0
+    if args.jobs_command == "show":
+        job = store.get_job(args.job_id)
+        if not job:
+            print(f"Unknown job: {args.job_id}", file=sys.stderr)
+            return 1
+        job["artifacts"] = store.artifacts(job_id=args.job_id)
+        print(json.dumps(job, ensure_ascii=False, indent=2))
+        return 0
+    if args.jobs_command == "cancel":
+        job = store.request_cancel(args.job_id)
+        if not job:
+            print(f"Unknown job: {args.job_id}", file=sys.stderr)
+            return 1
+        print(json.dumps(job, ensure_ascii=False, indent=2))
+        return 0
+    if args.jobs_command == "status":
+        print(json.dumps(store.summary(), ensure_ascii=False, indent=2))
+        return 0
+    if args.jobs_command == "safety-clear":
+        store.clear_control("global_safety_stop")
+        store.add_event(
+            "global_safety_stop_cleared",
+            data={"operator_reason": args.reason},
+        )
+        print(json.dumps({"ok": True, "status": "safety_stop_cleared"}, indent=2))
+        return 0
+    if args.jobs_command == "dashboard":
+        from .account_pool_dashboard import start_pool_dashboard
+
+        account_store = AccountPoolStore(store.path)
+        host = args.host or pool_config.dashboard_host
+        port = args.port if args.port is not None else pool_config.dashboard_port
+        dashboard = start_pool_dashboard(
+            account_store,
+            settings=config.SETTINGS,
+            config=pool_config,
+            host=host,
+            port=port,
+            job_store=store,
+            allow_private_bind=args.allow_private_bind,
+        )
+        print(f"CBRS jobs dashboard and API: {dashboard.url}")
+        scope = "private-network" if args.allow_private_bind else "loopback-only"
+        print(f"The listener is {scope}. Press Ctrl+C to stop it.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            dashboard.stop()
+            print("\nDashboard stopped.")
+        return 0
+    if args.jobs_command == "backup":
+        from .backup import run_backup
+
+        result = run_backup(settings=config.SETTINGS, database_path=store.path)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else 1
+
+    result = run_job_worker(
+        settings=config.SETTINGS,
+        config=pool_config,
+        store=store,
+        pool_store=AccountPoolStore(store.path),
+        headless=_runtime_headless(args),
+        once=args.once,
+        max_jobs=args.max_jobs,
+        poll_seconds=args.poll_seconds,
+    )
+    print(
+        f"Job worker {result.status}: {result.processed_jobs} job(s) processed "
+        f"(worker_id={result.worker_id})"
+    )
+    return result.exit_code
+
+
 def _pool_account_by_id(pool_config, account_id: str):
     for account in pool_config.accounts:
         if account.account_id == account_id:
@@ -566,6 +721,35 @@ def _print_proxy_health(result) -> None:
     for check in result.report.get("checks", []):
         status = "OK" if check.get("ok") else "FAIL"
         print(f"{status:4} {check.get('name')}: {check.get('detail')}")
+
+
+def cmd_readiness(args: argparse.Namespace) -> int:
+    from .readiness import (
+        build_readiness_report,
+        format_readiness_report,
+        write_readiness_report,
+    )
+
+    repo_root = Path.cwd().resolve()
+    env_file = Path(args.env_file) if args.env_file else None
+    pool_config_path = Path(args.config)
+    report = build_readiness_report(
+        repo_root=repo_root,
+        env_file=env_file,
+        pool_config_path=pool_config_path,
+        target=args.target,
+        distro=args.distro,
+        probe_wsl_runtime=args.probe_wsl_runtime,
+        minimum_free_gib=args.minimum_free_gib,
+    )
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(format_readiness_report(report))
+    if args.json_report:
+        output = write_readiness_report(report, Path(args.json_report))
+        print(f"Readiness report: {output}", file=sys.stderr if args.json else sys.stdout)
+    return 0 if report["summary"]["live_test_ready"] else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -607,6 +791,52 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("doctor", help="Run local safety/configuration checks")
+    readiness_parser = subparsers.add_parser(
+        "readiness",
+        help="Run an offline readiness gate for the indefinite Ubuntu test",
+    )
+    readiness_parser.add_argument(
+        "--target",
+        choices=("current", "wsl", "ubuntu"),
+        default="wsl" if os.name == "nt" else "ubuntu",
+        help="Runtime to inspect; defaults to WSL on Windows and Ubuntu elsewhere",
+    )
+    readiness_parser.add_argument(
+        "--distro",
+        default="Ubuntu-24.04",
+        help="Expected WSL distribution name",
+    )
+    readiness_parser.add_argument(
+        "--probe-wsl-runtime",
+        action="store_true",
+        help="Start the installed WSL distro only long enough for read-only package checks",
+    )
+    readiness_parser.add_argument(
+        "--config",
+        default=str(config.SETTINGS.profile_dir.parent / "account-pool.json"),
+        help="Account-pool JSON to validate without using it",
+    )
+    readiness_parser.add_argument(
+        "--env-file",
+        default=".env",
+        help="Environment file to inspect without exposing its values",
+    )
+    readiness_parser.add_argument(
+        "--minimum-free-gib",
+        type=float,
+        default=20.0,
+        help="Warn when the current workspace volume has less free space",
+    )
+    readiness_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the sanitized report as JSON",
+    )
+    readiness_parser.add_argument(
+        "--json-report",
+        default=None,
+        help="Atomically write the sanitized report to this path",
+    )
     preflight_parser = subparsers.add_parser("preflight", help="Run fixed-egress safety checks")
     preflight_parser.add_argument(
         "--approve-egress-baseline",
@@ -752,6 +982,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to .cbrs/account-pool.json override",
     )
+    pool_proxy_health_parser.add_argument(
+        "--approve-egress-baseline",
+        action="store_true",
+        help="Approve each account's current fixed Chilean egress hash",
+    )
 
     pool_init_parser = pool_subparsers.add_parser(
         "init",
@@ -850,6 +1085,59 @@ def build_parser() -> argparse.ArgumentParser:
         "stop",
         help="Request the active pool runner to stop after the current safe point",
     )
+
+    jobs_parser = subparsers.add_parser("jobs", help="Manage the durable production job queue")
+    jobs_subparsers = jobs_parser.add_subparsers(dest="jobs_command", required=True)
+    jobs_enqueue = jobs_subparsers.add_parser("enqueue", help="Queue an authorized CBRS request")
+    jobs_enqueue_group = jobs_enqueue.add_mutually_exclusive_group(required=True)
+    jobs_enqueue_group.add_argument("--text", type=str, help="Search by razon social")
+    jobs_enqueue_group.add_argument("--foja", type=int, help="Foja number")
+    jobs_enqueue.add_argument("--numero", type=int, help="Numero")
+    jobs_enqueue.add_argument("--year", "--ano", dest="ano", type=int, help="Inscription year")
+    jobs_enqueue.add_argument(
+        "--idempotency-key",
+        default=None,
+        help="Caller-provided key used to return the same job for repeated submissions",
+    )
+    jobs_enqueue.add_argument("--config", default=None, help="Account-pool JSON override")
+
+    jobs_list = jobs_subparsers.add_parser("list", help="List recent jobs")
+    jobs_list.add_argument("--limit", type=int, default=100)
+    jobs_list.add_argument("--config", default=None, help=argparse.SUPPRESS)
+    jobs_show = jobs_subparsers.add_parser("show", help="Show one job and its artifacts")
+    jobs_show.add_argument("job_id")
+    jobs_show.add_argument("--config", default=None, help=argparse.SUPPRESS)
+    jobs_cancel = jobs_subparsers.add_parser("cancel", help="Cancel a queued or active job")
+    jobs_cancel.add_argument("job_id")
+    jobs_cancel.add_argument("--config", default=None, help=argparse.SUPPRESS)
+    jobs_status = jobs_subparsers.add_parser("status", help="Show queue and worker status")
+    jobs_status.add_argument("--config", default=None, help=argparse.SUPPRESS)
+    jobs_safety_clear = jobs_subparsers.add_parser(
+        "safety-clear",
+        help="Clear a reviewed global safety stop before restarting the worker",
+    )
+    jobs_safety_clear.add_argument("--reason", required=True, help="Sanitized operator reason")
+    jobs_safety_clear.add_argument("--config", default=None, help=argparse.SUPPRESS)
+
+    jobs_worker = jobs_subparsers.add_parser("worker", help="Run the sequential production worker")
+    jobs_worker.add_argument("--once", action="store_true", help="Process at most one claim and exit")
+    jobs_worker.add_argument("--max-jobs", type=int, default=None)
+    jobs_worker.add_argument("--poll-seconds", type=float, default=5.0)
+    jobs_worker.add_argument("--config", default=None, help="Account-pool JSON override")
+
+    jobs_dashboard = jobs_subparsers.add_parser(
+        "dashboard", help="Serve the loopback jobs API and operational dashboard"
+    )
+    jobs_dashboard.add_argument("--config", default=None, help="Account-pool JSON override")
+    jobs_dashboard.add_argument("--host", default=None, help="Listener address")
+    jobs_dashboard.add_argument(
+        "--allow-private-bind",
+        action="store_true",
+        help="Explicitly allow a non-loopback bind (WSL/private network only)",
+    )
+    jobs_dashboard.add_argument("--port", type=int, default=None)
+    jobs_backup = jobs_subparsers.add_parser("backup", help="Back up SQLite and permanent PDFs")
+    jobs_backup.add_argument("--config", default=None, help=argparse.SUPPRESS)
     return parser
 
 
@@ -869,6 +1157,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "doctor":
             return cmd_doctor()
+        if args.command == "readiness":
+            return cmd_readiness(args)
         if args.command == "preflight":
             return cmd_preflight(args)
         if args.command == "init":
@@ -880,6 +1170,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_soak(args)
         if args.command == "pool":
             return cmd_pool(args)
+        if args.command == "jobs":
+            return cmd_jobs(args)
 
         from .scraper import CBRSScraper
 

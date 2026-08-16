@@ -128,13 +128,6 @@ def test_status_counts_only_latest_run(tmp_path: Path) -> None:
 
 
 def test_success_rate_ignores_current_running_cycle(tmp_path: Path) -> None:
-    settings = load_settings(
-        {
-            "CBRS_PROFILE_DIR": ".cbrs/chrome-profile",
-            "CBRS_OUTPUT_DIR": "outputs",
-        },
-        root=tmp_path,
-    )
     store = SoakStore(tmp_path / ".cbrs" / "soak" / "soak.sqlite3")
     config = _fast_config()
     run_id = "run-success-rate"

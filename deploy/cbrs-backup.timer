@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the CBRS permanent evidence backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 America/Santiago
+Persistent=true
+RandomizedDelaySec=900
+Unit=cbrs-backup.service
+
+[Install]
+WantedBy=timers.target

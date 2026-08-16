@@ -2,12 +2,10 @@
 
 ## Decision
 
-Production uses normal Chrome/Edge with one clean persistent profile and a
-declared non-personal Chilean egress path. That path can be a client VPN,
-client office connection, or a dedicated static Chile ISP proxy. This aligns
-the automated flow with the operator's authorized access pattern while avoiding
-the user's personal/home IP, rotating residential proxy trust, and
-stealth-browser reputation.
+Production uses Google Chrome on Ubuntu with one clean persistent profile and a
+declared Chilean egress path per authorized account. Development uses the same
+Ubuntu runtime inside WSL2. This avoids a second Windows production codepath,
+personal/home IPs, rotating residential trust, and stealth-browser reputation.
 
 IPRoyal Residential is not the production path because residential proxy pools
 can rotate, inherit unrelated reputation, and trigger portal risk controls even
@@ -16,19 +14,20 @@ connectivity experiments, never for production validation.
 
 ## Runtime Contract
 
-- Browser: installed Chrome first, installed Edge second, or
-  `CBRS_BROWSER_EXECUTABLE_PATH`.
-- Profile: `.cbrs/chrome-profile`.
+- Browser: installed Google Chrome stable or `CBRS_BROWSER_EXECUTABLE_PATH`.
+- Profile: one isolated directory per account under `/var/lib/cbrs/accounts`.
 - Egress mode: mandatory `client_vpn`, `client_office`, or
   `dedicated_static_isp`.
 - Proxy URL: allowed only with `CBRS_EGRESS_MODE=dedicated_static_isp`.
   Reports store only sanitized proxy metadata.
 - Egress hash: expected country `CL`, with a saved hash baseline after explicit
   approval from the intended non-personal path.
-- Login: manual only.
+- Login: refresh first, then browser-origin credential login from environment
+  references; manual intervention only for CAPTCHA or diagnostics.
 - Pacing: fixed `5.0s` minimum-safe delay by default.
 - Reports: sanitized JSON under `.cbrs/logs/`.
-- Stops: no retry, no identity change, no proxy fallback.
+- Stops: one auth recovery attempt; no proxy fallback. CAPTCHA removes only the
+  affected account, while rate-limit/WAF signals stop the complete worker.
 
 ## Dedicated Static ISP Proxy
 
@@ -60,9 +59,9 @@ We need to operate a low-volume, single-operator automation against the CBRS
 commerce portal from a stable Chilean office/client network or client VPN.
 
 The automation does not bypass login, does not solve CAPTCHA externally, does
-not rotate accounts, does not rotate IPs, and stops immediately on rate-limit,
-challenge, or authorization signals. It uses a normal Chrome/Edge profile with
-manual login and fixed sequential pacing.
+not rotate IPs, and stops immediately on rate-limit or WAF signals. It schedules
+only separately authorized named accounts, each with its own fixed Chrome
+profile and egress, using automatic normal login and fixed sequential pacing.
 
 Can you confirm the recommended production access model for this workflow, and
 whether the client-owned Chilean egress IP/path can be allowlisted or otherwise
@@ -83,7 +82,7 @@ residential pool.
 Please confirm whether your service provides a dedicated/static Chile ISP
 egress suitable for persistent logged-in browser sessions, whether the IP can
 remain stable for at least several days, and whether it is appropriate for
-accessing government/registry portals with manual login and low request volume.
+accessing registry portals with named accounts and low sequential request volume.
 ```
 
 ## Incident Evidence

@@ -1,0 +1,21 @@
+[Unit]
+Description=CBRS encrypted permanent evidence backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=cbrs
+Group=cbrs
+WorkingDirectory=/opt/cbrs
+EnvironmentFile=/etc/cbrs/cbrs.env
+Environment=HOME=/var/lib/cbrs
+UMask=0027
+ExecStart=/opt/cbrs/.venv/bin/python -m cbrs jobs backup
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Production uses /srv. This WSL workstation keeps its secondary encrypted
+# repository on the dedicated E: volume mounted at /mnt/e.
+ReadWritePaths=/var/lib/cbrs /var/log/cbrs -/srv/cbrs-backup -/mnt/e/cbrs-backup

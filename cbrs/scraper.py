@@ -34,6 +34,17 @@ class CBRSScraper:
         self.browser.open()
         self.browser.wait_for_login(timeout_seconds=timeout_seconds)
 
+    def ensure_authenticated(
+        self,
+        username: str | None,
+        password: str | None,
+        *,
+        force: bool = False,
+    ) -> str:
+        if force:
+            self.client.invalidate_auth()
+        return self.browser.ensure_authenticated(username, password, force=force)
+
     def search_by_text(self, texto: str) -> list[dict[str, Any]]:
         logger.info("Searching commerce index by text")
         body = {

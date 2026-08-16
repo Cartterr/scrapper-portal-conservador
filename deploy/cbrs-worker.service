@@ -1,0 +1,29 @@
+[Unit]
+Description=CBRS durable sequential job worker
+Wants=network-online.target
+Requires=cbrs-display.service
+After=network-online.target cbrs-display.service
+StartLimitIntervalSec=300
+StartLimitBurst=12
+
+[Service]
+Type=simple
+User=cbrs
+Group=cbrs
+WorkingDirectory=/opt/cbrs
+EnvironmentFile=/etc/cbrs/cbrs.env
+Environment=HOME=/var/lib/cbrs
+Environment=DISPLAY=:99
+Environment=TMPDIR=/var/lib/cbrs/tmp
+UMask=0027
+ExecStart=/opt/cbrs/.venv/bin/python -m cbrs jobs worker --config /var/lib/cbrs/account-pool.json
+Restart=on-failure
+RestartSec=20
+KillSignal=SIGINT
+TimeoutStopSec=120
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/cbrs /var/log/cbrs
+
+[Install]
+WantedBy=multi-user.target

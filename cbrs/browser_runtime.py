@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -12,6 +13,25 @@ WINDOWS_BROWSER_PATHS: tuple[tuple[str, str], ...] = (
     ("chrome", r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
     ("edge", r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
     ("edge", r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+)
+
+LINUX_BROWSER_PATHS: tuple[tuple[str, str], ...] = (
+    ("chrome", "/usr/bin/google-chrome-stable"),
+    ("chrome", "/usr/bin/google-chrome"),
+    ("chrome", "/usr/bin/chromium"),
+    ("chrome", "/usr/bin/chromium-browser"),
+    ("chrome", "/snap/bin/chromium"),
+    ("edge", "/usr/bin/microsoft-edge-stable"),
+    ("edge", "/usr/bin/microsoft-edge"),
+)
+
+PATH_BROWSER_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("chrome", "google-chrome-stable"),
+    ("chrome", "google-chrome"),
+    ("chrome", "chromium"),
+    ("chrome", "chromium-browser"),
+    ("edge", "microsoft-edge-stable"),
+    ("edge", "microsoft-edge"),
 )
 
 
@@ -34,7 +54,7 @@ class BrowserStatus:
 def detect_browser(
     settings: Settings = SETTINGS,
     *,
-    candidates: Iterable[tuple[str, str]] = WINDOWS_BROWSER_PATHS,
+    candidates: Iterable[tuple[str, str]] | None = None,
 ) -> BrowserExecutable:
     if settings.browser_executable_path is not None:
         path = settings.browser_executable_path
@@ -43,10 +63,23 @@ def detect_browser(
         family = _browser_family(path)
         return BrowserExecutable(family=family, path=path, source="env")
 
-    for family, raw_path in candidates:
+    configured_candidates = candidates
+    if configured_candidates is None:
+        configured_candidates = (*WINDOWS_BROWSER_PATHS, *LINUX_BROWSER_PATHS)
+
+    for family, raw_path in configured_candidates:
         path = Path(raw_path)
         if path.exists():
             return BrowserExecutable(family=family, path=path, source="auto")
+
+    # Linux distributions and managed images do not always install Chrome in a
+    # canonical location. PATH discovery keeps Ubuntu deployments portable,
+    # while explicit test candidates remain deterministic.
+    if candidates is None:
+        for family, command in PATH_BROWSER_COMMANDS:
+            resolved = shutil.which(command)
+            if resolved:
+                return BrowserExecutable(family=family, path=Path(resolved), source="path")
 
     raise RuntimeError(
         "No Chrome or Edge executable found. Set CBRS_BROWSER_EXECUTABLE_PATH."

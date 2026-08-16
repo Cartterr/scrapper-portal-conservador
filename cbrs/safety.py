@@ -140,7 +140,6 @@ def classify_response(
     expected: str = "json",
 ) -> StopReason | None:
     headers = headers or {}
-    header_text = json.dumps(dict(headers), ensure_ascii=False).lower()
     text = _body_to_text(body)
     lower_text = text.lower()
     data = body if isinstance(body, Mapping) else _try_json(text)

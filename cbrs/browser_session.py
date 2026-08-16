@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -10,7 +11,7 @@ from urllib.parse import unquote, urlparse
 from .browser_runtime import detect_browser
 from .cloak import apply_cloak_environment, cloak_launch_args, cloak_proxy
 from .config import SETTINGS, Settings
-from .safety import SafetyStopException, StopReason
+from .safety import SafetyStopException, StopReason, classify_response
 
 logger = logging.getLogger(__name__)
 LOGIN_COOKIE_NAMES = {
@@ -29,6 +30,10 @@ class BrowserFetchResponse:
     headers: dict[str, str]
     body_text: str | None = None
     body_base64: str | None = None
+
+
+class CredentialsRejectedError(RuntimeError):
+    """The portal rejected configured credentials without exposing their values."""
 
 
 class BrowserSession:
@@ -57,16 +62,23 @@ class BrowserSession:
             from playwright.sync_api import sync_playwright
 
             self._playwright = sync_playwright().start()
-            self._context = self._playwright.chromium.launch_persistent_context(
-                str(self.settings.profile_dir),
-                executable_path=str(executable.path),
-                headless=self.headless,
-                accept_downloads=True,
-                bypass_csp=False,
-                chromium_sandbox=True,
-                proxy=proxy,
-                args=_chrome_launch_args(self.settings, headless=self.headless),
-            )
+            try:
+                self._context = self._playwright.chromium.launch_persistent_context(
+                    str(self.settings.profile_dir),
+                    executable_path=str(executable.path),
+                    headless=self.headless,
+                    accept_downloads=True,
+                    bypass_csp=False,
+                    chromium_sandbox=True,
+                    proxy=proxy,
+                    args=_chrome_launch_args(self.settings, headless=self.headless),
+                )
+            except Exception:
+                # A failed persistent-context launch otherwise leaves the sync
+                # Playwright event loop alive and poisons the next account.
+                self._playwright.stop()
+                self._playwright = None
+                raise
             return self
 
         if self.settings.browser_backend != "cloak":
@@ -147,6 +159,10 @@ class BrowserSession:
     def has_active_login(self) -> bool:
         if not self.has_login_cookie():
             return False
+        # A newly opened persistent context starts on about:blank even when its
+        # profile contains valid auth cookies.  Refresh is a browser-origin
+        # request, so establish the CBRS origin before evaluating fetch().
+        self.goto_index()
         response = self.fetch_json(
             "/api/v1/auth/refresh",
             headers={"Accept": "application/json", "Content-Type": "application/json"},
@@ -164,6 +180,58 @@ class BrowserSession:
         self.set_auth_cookie(token)
         return True
 
+    def ensure_authenticated(
+        self,
+        username: str | None,
+        password: str | None,
+        *,
+        force: bool = False,
+    ) -> str:
+        """Refresh an existing session or perform one browser-origin login.
+
+        Credentials are accepted only as in-memory values supplied by the caller.
+        They are never persisted by this class or included in errors and logs.
+        """
+        self.open()
+        if not force and self.has_active_login():
+            return "refreshed"
+        if not username or not password:
+            raise SafetyStopException(
+                StopReason.AUTH_REQUIRED,
+                "No unattended credentials are configured for this account.",
+                context="auth",
+            )
+
+        fetch_error: Exception | None = None
+        try:
+            self._login_with_fetch(username, password)
+            if self.has_active_login():
+                return "browser_fetch"
+            fetch_error = RuntimeError("CBRS login completed without an active session.")
+        except (CredentialsRejectedError, SafetyStopException):
+            raise
+        except Exception as exc:
+            fetch_error = exc
+
+        try:
+            self._login_with_form(username, password)
+            if self.has_active_login():
+                return "browser_form"
+        except (CredentialsRejectedError, SafetyStopException):
+            raise
+        except Exception as exc:
+            raise SafetyStopException(
+                StopReason.AUTH_REQUIRED,
+                "Automatic CBRS login failed using both supported browser flows.",
+                context="auth",
+            ) from exc
+
+        raise SafetyStopException(
+            StopReason.AUTH_REQUIRED,
+            "Automatic CBRS login did not establish an active session.",
+            context="auth",
+        ) from fetch_error
+
     def generate_recaptcha_token(self, action: str) -> str:
         self._ensure_recaptcha_ready()
         token = self.page.evaluate(
@@ -180,6 +248,85 @@ class BrowserSession:
             )
         logger.debug("Generated reCAPTCHA token for action=%s", action)
         return token
+
+    def _login_with_fetch(self, username: str, password: str) -> None:
+        self.goto_index()
+        home = self.fetch_json(
+            "/api/v1/home/start",
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            body={"preHint": ""},
+        )
+        if home.status != 200:
+            raise RuntimeError(f"CBRS home bootstrap returned HTTP {home.status}.")
+        token = self.generate_recaptcha_token("login")
+        response = self.fetch_json(
+            "/api/v1/auth/login",
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json",
+                "recaptcha-token": token,
+            },
+            body={"email": username, "password": password},
+        )
+        self._check_login_response(response)
+
+    def _login_with_form(self, username: str, password: str) -> None:
+        self.page.goto(
+            self._url("/login"),
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        email = self.page.locator("#email, input[type=email], input[name=email]").first
+        password_input = self.page.locator(
+            "#password, input[type=password], input[name=password]"
+        ).first
+        try:
+            email.wait_for(state="visible", timeout=10000)
+        except Exception:
+            login_button = self.page.get_by_role("button", name=re.compile("iniciar sesi", re.I))
+            login_button.first.click(timeout=5000)
+            email.wait_for(state="visible", timeout=10000)
+        email.fill(username)
+        password_input.fill(password)
+        submit = self.page.locator("button[type=submit]").first
+        with self.page.expect_response(
+            lambda response: "/api/v1/auth/login" in response.url,
+            timeout=45000,
+        ) as response_info:
+            submit.click()
+        response = response_info.value
+        try:
+            body_text = response.text()
+        except Exception:
+            body_text = ""
+        self._check_login_response(
+            BrowserFetchResponse(
+                status=int(response.status),
+                headers=dict(response.headers),
+                body_text=body_text,
+            )
+        )
+
+    @staticmethod
+    def _check_login_response(response: BrowserFetchResponse) -> None:
+        reason = classify_response(
+            response.status,
+            response.headers,
+            response.body_text,
+        )
+        if reason in {StopReason.CAPTCHA_REJECTED, StopReason.WAF_CHALLENGE}:
+            raise SafetyStopException(
+                reason,
+                f"CBRS login stopped: {reason.value}.",
+                status=response.status,
+                context="auth login",
+            )
+        if response.status == 200:
+            return
+        if response.status in {400, 401, 422}:
+            raise CredentialsRejectedError("CBRS rejected the configured account credentials.")
+        detail = f"CBRS login returned unexpected HTTP {response.status}."
+        raise RuntimeError(detail)
 
     def fetch_json(
         self,

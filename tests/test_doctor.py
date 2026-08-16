@@ -57,6 +57,43 @@ def test_doctor_fails_when_proxy_is_configured(monkeypatch, capsys, tmp_path: Pa
     assert "FAIL browser proxy route: CBRS_CLOAK_PROXY_URL configured" in out
 
 
+def test_doctor_fails_for_headed_linux_without_display(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    _write_safe_gitignore(tmp_path)
+    browser = tmp_path / "google-chrome"
+    browser.write_text("", encoding="utf-8")
+    settings = load_settings(
+        {
+            "CBRS_BROWSER_EXECUTABLE_PATH": str(browser),
+            "CBRS_EGRESS_MODE": "client_office",
+        },
+        root=tmp_path,
+    )
+    status = SimpleNamespace(
+        available=True,
+        family="chrome",
+        path=browser,
+        source="env",
+        error=None,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.config, "SETTINGS", settings)
+    monkeypatch.setattr(cli, "get_browser_status", lambda loaded_settings: status)
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+
+    result = cli.cmd_doctor()
+    out = capsys.readouterr().out
+
+    assert result == 1
+    assert "FAIL browser display: headed Linux requires DISPLAY" in out
+
+
 def _write_safe_gitignore(path: Path) -> None:
     path.joinpath(".gitignore").write_text(
         "\n".join(

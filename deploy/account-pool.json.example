@@ -1,0 +1,37 @@
+{
+  "daily_quota_per_account": 20,
+  "interval_minutes": 0,
+  "job_interval_min_seconds": 10,
+  "job_interval_max_seconds": 30,
+  "dashboard_host": "127.0.0.1",
+  "dashboard_port": 8765,
+  "accounts": [
+    {
+      "id": "ejecutivo_1",
+      "label": "Ejecutivo 1",
+      "username_env": "CBRS_ACCOUNT_1_USERNAME",
+      "password_env": "CBRS_ACCOUNT_1_PASSWORD",
+      "proxy_url_env": "CBRS_ACCOUNT_1_PROXY_URL",
+      "profile_dir": "/var/lib/cbrs/accounts/ejecutivo_1/chrome-profile",
+      "daily_quota": 20
+    },
+    {
+      "id": "ejecutivo_2",
+      "label": "Ejecutivo 2",
+      "username_env": "CBRS_ACCOUNT_2_USERNAME",
+      "password_env": "CBRS_ACCOUNT_2_PASSWORD",
+      "proxy_url_env": "CBRS_ACCOUNT_2_PROXY_URL",
+      "profile_dir": "/var/lib/cbrs/accounts/ejecutivo_2/chrome-profile",
+      "daily_quota": 20
+    },
+    {
+      "id": "ejecutivo_3",
+      "label": "Ejecutivo 3",
+      "username_env": "CBRS_ACCOUNT_3_USERNAME",
+      "password_env": "CBRS_ACCOUNT_3_PASSWORD",
+      "proxy_url_env": "CBRS_ACCOUNT_3_PROXY_URL",
+      "profile_dir": "/var/lib/cbrs/accounts/ejecutivo_3/chrome-profile",
+      "daily_quota": 20
+    }
+  ]
+}

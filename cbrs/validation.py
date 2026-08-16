@@ -89,7 +89,7 @@ def write_validation_report(
     report: dict[str, Any],
     settings: Settings = SETTINGS,
 ) -> Path:
-    log_dir = settings.profile_dir.parent / "logs"
+    log_dir = settings.log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = _unique_report_path(log_dir, "validation", timestamp)

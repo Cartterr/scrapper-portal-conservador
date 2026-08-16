@@ -55,3 +55,25 @@ def test_detect_browser_fails_clearly_when_missing(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="No Chrome or Edge executable"):
         detect_browser(settings, candidates=())
+
+
+def test_detect_browser_finds_linux_chrome_on_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings({}, root=tmp_path)
+    chrome = tmp_path / "google-chrome"
+    chrome.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "cbrs.browser_runtime.shutil.which",
+        lambda command: str(chrome) if command == "google-chrome-stable" else None,
+    )
+    monkeypatch.setattr("cbrs.browser_runtime.WINDOWS_BROWSER_PATHS", ())
+    monkeypatch.setattr("cbrs.browser_runtime.LINUX_BROWSER_PATHS", ())
+
+    executable = detect_browser(settings)
+
+    assert executable.family == "chrome"
+    assert executable.path == chrome
+    assert executable.source == "path"

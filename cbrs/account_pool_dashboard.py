@@ -2,17 +2,27 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import threading
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import parse_qs, urlparse
 
-from .account_pool import AccountPoolStore, PoolConfig, dashboard_status, resolve_account_captcha
+from .account_pool import (
+    AccountPoolStore,
+    PoolConfig,
+    dashboard_status,
+    local_today,
+    resolve_account_captcha,
+)
 from .config import SETTINGS, Settings
 from .safety import redact
+
+if TYPE_CHECKING:
+    from .jobs import JobStore
 
 
 @dataclass(frozen=True)
@@ -35,8 +45,25 @@ def start_pool_dashboard(
     host: str = "127.0.0.1",
     port: int = 8765,
     captcha_resolver: Callable[..., dict[str, Any]] | None = None,
+    job_store: "JobStore | None" = None,
+    allow_private_bind: bool = False,
 ) -> PoolDashboardHandle:
-    handler = _handler_factory(store, settings, config, captcha_resolver=captcha_resolver)
+    if (
+        job_store is not None
+        and host not in {"127.0.0.1", "localhost"}
+        and not allow_private_bind
+    ):
+        raise ValueError(
+            "The jobs API must bind to a loopback address unless "
+            "--allow-private-bind is explicitly set."
+        )
+    handler = _handler_factory(
+        store,
+        settings,
+        config,
+        captcha_resolver=captcha_resolver,
+        job_store=job_store,
+    )
     server = ThreadingHTTPServer((host, port), handler)
     actual_host, actual_port = server.server_address[:2]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -54,9 +81,12 @@ def _handler_factory(
     config: PoolConfig,
     *,
     captcha_resolver: Callable[..., dict[str, Any]] | None = None,
+    job_store: "JobStore | None" = None,
 ):
     resolver = captcha_resolver or resolve_account_captcha
+    visual_confirmation_required = captcha_resolver is None
     captcha_threads: dict[str, threading.Thread] = {}
+    captcha_confirmations: dict[str, threading.Event] = {}
 
     class AccountPoolDashboardHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
@@ -73,7 +103,43 @@ def _handler_factory(
             if parsed.path == "/api/status":
                 payload = dashboard_status(store, config=config)
                 payload["runtime"] = _runtime_summary(settings)
+                if job_store is not None:
+                    from .backup import backup_health
+
+                    payload = _with_job_pool_usage(payload, job_store, config)
+                    payload["jobs"] = {
+                        "summary": job_store.summary(),
+                        "recent": _with_job_artifact_urls(job_store.list_jobs(limit=100)),
+                    }
+                    payload["backup"] = backup_health(settings)
                 self._send_json(_with_artifact_urls(payload))
+                return
+            if job_store is not None and parsed.path == "/api/jobs":
+                self._send_json(
+                    {"jobs": _with_job_artifact_urls(job_store.list_jobs(limit=_limit(parsed.query)))}
+                )
+                return
+            if job_store is not None and parsed.path.startswith("/api/jobs/"):
+                parts = [part for part in parsed.path.split("/") if part]
+                if len(parts) == 3:
+                    job = job_store.get_job(parts[2])
+                    if not job:
+                        self._send_api_error(HTTPStatus.NOT_FOUND, "job_not_found")
+                        return
+                    job["artifacts"] = _with_job_artifact_urls(
+                        [{"artifacts": job_store.artifacts(job_id=parts[2])}]
+                    )[0]["artifacts"]
+                    self._send_json(job)
+                    return
+                if len(parts) == 4 and parts[3] == "artifacts":
+                    if not job_store.get_job(parts[2]):
+                        self._send_api_error(HTTPStatus.NOT_FOUND, "job_not_found")
+                        return
+                    artifacts = job_store.artifacts(job_id=parts[2])
+                    self._send_json({"artifacts": _with_job_artifact_urls(artifacts)})
+                    return
+            if job_store is not None and parsed.path.startswith("/api/artifacts/"):
+                self._send_job_artifact(parsed.path.rsplit("/", 1)[-1])
                 return
             if parsed.path == "/api/cycles":
                 limit = _limit(parsed.query)
@@ -97,6 +163,27 @@ def _handler_factory(
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
+            if not self._origin_allowed():
+                self._send_api_error(HTTPStatus.FORBIDDEN, "cross_origin_request_rejected")
+                return
+            if job_store is not None and parsed.path == "/api/jobs":
+                self._create_job()
+                return
+            if (
+                job_store is not None
+                and parsed.path.startswith("/api/jobs/")
+                and parsed.path.endswith("/cancel")
+            ):
+                parts = [part for part in parsed.path.split("/") if part]
+                if len(parts) != 4:
+                    self._send_api_error(HTTPStatus.NOT_FOUND, "not_found")
+                    return
+                job = job_store.request_cancel(parts[2])
+                if not job:
+                    self._send_api_error(HTTPStatus.NOT_FOUND, "job_not_found")
+                    return
+                self._send_json(job)
+                return
             if parsed.path == "/api/stop":
                 store.request_stop()
                 self._send_json({"ok": True, "status": "stop_requested"})
@@ -105,7 +192,65 @@ def _handler_factory(
                 account_id = parsed.path.split("/")[3]
                 self._trigger_captcha(account_id)
                 return
+            if parsed.path.startswith("/api/captcha/") and parsed.path.endswith("/complete"):
+                account_id = parsed.path.split("/")[3]
+                confirmation = captcha_confirmations.get(account_id)
+                if not confirmation:
+                    self._send_api_error(HTTPStatus.CONFLICT, "captcha_recovery_not_running")
+                    return
+                confirmation.set()
+                self._send_json(
+                    {"ok": True, "status": "validation_requested", "account_id": account_id}
+                )
+                return
             self.send_error(HTTPStatus.NOT_FOUND, "not found")
+
+        def _create_job(self) -> None:
+            from .jobs import IdempotencyConflictError
+
+            try:
+                body = self._read_json()
+                kind = str(body.get("kind") or ("text" if body.get("text") else "fna"))
+                job, _created = job_store.create_job(
+                    kind=kind,
+                    input_data=body,
+                    idempotency_key=body.get("idempotency_key"),
+                )
+            except IdempotencyConflictError as exc:
+                self._send_api_error(HTTPStatus.CONFLICT, "idempotency_conflict", str(exc))
+                return
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._send_api_error(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+                return
+            self._send_json(
+                {
+                    "job_id": job["job_id"],
+                    "status": job["status"],
+                    "status_url": f"/api/jobs/{job['job_id']}",
+                },
+                status=HTTPStatus.ACCEPTED,
+            )
+
+        def _read_json(self) -> dict[str, Any]:
+            if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+                raise ValueError("Content-Type must be application/json")
+            raw_length = self.headers.get("Content-Length")
+            if raw_length is None:
+                raise ValueError("Content-Length is required")
+            length = int(raw_length)
+            if length <= 0 or length > 64 * 1024:
+                raise ValueError("JSON body must be between 1 byte and 64 KiB")
+            value = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("JSON body must be an object")
+            return value
+
+        def _origin_allowed(self) -> bool:
+            origin = self.headers.get("Origin")
+            if not origin:
+                return True
+            host = self.headers.get("Host")
+            return bool(host and origin in {f"http://{host}", f"https://{host}"})
 
         def _trigger_captcha(self, account_id: str) -> None:
             known_ids = {account.account_id for account in config.accounts}
@@ -119,6 +264,17 @@ def _handler_factory(
 
             def run_recovery() -> None:
                 try:
+                    if visual_confirmation_required:
+                        confirmation = threading.Event()
+                        captcha_confirmations[account_id] = confirmation
+                        if not _hold_visual_captcha_session(
+                            store,
+                            settings,
+                            config,
+                            account_id=account_id,
+                            confirmation=confirmation,
+                        ):
+                            return
                     resolver(
                         settings=settings,
                         config=config,
@@ -135,6 +291,8 @@ def _handler_factory(
                             message="pool captcha recovery failed",
                             data={"error": str(exc)},
                         )
+                finally:
+                    captcha_confirmations.pop(account_id, None)
 
             thread = threading.Thread(
                 target=run_recovery,
@@ -143,7 +301,10 @@ def _handler_factory(
             )
             captcha_threads[account_id] = thread
             thread.start()
-            self._send_json({"ok": True, "status": "started", "account_id": account_id})
+            payload = {"ok": True, "status": "started", "account_id": account_id}
+            if visual_confirmation_required:
+                payload["visual_confirmation_required"] = True
+            self._send_json(payload)
 
         def _send_artifact(self, cycle_id: str) -> None:
             match = None
@@ -168,6 +329,27 @@ def _handler_factory(
             self.end_headers()
             self.wfile.write(content)
 
+        def _send_job_artifact(self, artifact_id: str) -> None:
+            assert job_store is not None
+            artifact = job_store.artifact_record(artifact_id)
+            if not artifact:
+                self._send_api_error(HTTPStatus.NOT_FOUND, "artifact_not_found")
+                return
+            path = Path(str(artifact["path"])).resolve()
+            output_root = (settings.output_dir / "jobs").resolve()
+            if not path.exists() or not path.is_file() or not path.is_relative_to(output_root):
+                self._send_api_error(HTTPStatus.NOT_FOUND, "artifact_not_available")
+                return
+            content = path.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Content-Disposition", f'inline; filename="{path.name}"')
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "private, no-store")
+            self.end_headers()
+            self.wfile.write(content)
+
         def _send_html(self, html: str) -> None:
             encoded = html.encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -176,13 +358,31 @@ def _handler_factory(
             self.end_headers()
             self.wfile.write(encoded)
 
-        def _send_json(self, payload: dict[str, Any]) -> None:
+        def _send_json(
+            self,
+            payload: dict[str, Any],
+            *,
+            status: HTTPStatus = HTTPStatus.OK,
+        ) -> None:
             encoded = json.dumps(redact(payload), ensure_ascii=False, indent=2).encode("utf-8")
-            self.send_response(HTTPStatus.OK)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(encoded)
+
+        def _send_api_error(
+            self,
+            status: HTTPStatus,
+            code: str,
+            message: str | None = None,
+        ) -> None:
+            self._send_json(
+                {"error": code, "message": message or code},
+                status=status,
+            )
 
     return AccountPoolDashboardHandler
 
@@ -198,9 +398,107 @@ def _with_artifact_urls(payload: dict[str, Any]) -> dict[str, Any]:
     return enriched
 
 
+def _with_job_artifact_urls(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    enriched = []
+    for value in values:
+        item = dict(value)
+        if "artifact_id" in item:
+            item["artifact_url"] = f"/api/artifacts/{item['artifact_id']}"
+        if isinstance(item.get("artifacts"), list):
+            item["artifacts"] = _with_job_artifact_urls(item["artifacts"])
+        enriched.append(item)
+    return enriched
+
+
+def _with_job_pool_usage(
+    payload: dict[str, Any], job_store: "JobStore", config: PoolConfig
+) -> dict[str, Any]:
+    enriched = dict(payload)
+    usage = job_store.usage_by_account(local_today())
+    accounts = []
+    for account in enriched.get("accounts", []):
+        item = dict(account)
+        used = usage.get(str(item.get("account_id")), 0)
+        quota = int(item.get("daily_quota") or config.daily_quota_per_account)
+        item["used_today"] = used
+        item["remaining_today"] = max(0, quota - used)
+        if item.get("status") == "available" and used >= quota:
+            item["status"] = "quota_reached"
+        accounts.append(item)
+    enriched["accounts"] = accounts
+    pool = dict(enriched.get("pool") or {})
+    pool["used_today"] = sum(int(account.get("used_today") or 0) for account in accounts)
+    pool["remaining_today"] = max(
+        0, int(pool.get("daily_quota") or config.pool_daily_quota) - pool["used_today"]
+    )
+    enriched["pool"] = pool
+    stats = dict(enriched.get("stats") or {})
+    stats["downloads"] = job_store.summary()["artifacts"]
+    enriched["stats"] = stats
+    return enriched
+
+
 def _latest_run_id(store: AccountPoolStore) -> str | None:
     run = store.latest_run()
     return str(run["run_id"]) if run else None
+
+
+def _hold_visual_captcha_session(
+    store: AccountPoolStore,
+    settings: Settings,
+    config: PoolConfig,
+    *,
+    account_id: str,
+    confirmation: threading.Event,
+) -> bool:
+    from .account_pool import account_settings
+    from .browser_session import BrowserSession
+
+    run = store.latest_run(dry_run=False)
+    if not run:
+        raise ValueError("No live account run exists for CAPTCHA recovery.")
+    run_id = str(run["run_id"])
+    account = next(
+        (candidate for candidate in config.accounts if candidate.account_id == account_id),
+        None,
+    )
+    if account is None:
+        raise ValueError(f"Unknown account: {account_id}")
+    timeout_raw = os.environ.get("CBRS_CAPTCHA_RECOVERY_TIMEOUT_SECONDS", "900")
+    try:
+        timeout = max(60, min(int(timeout_raw), 3600))
+    except ValueError:
+        timeout = 900
+    store.mark_account_captcha_solving(run_id, account_id)
+    store.add_event(
+        run_id,
+        account_id=account_id,
+        level="warning",
+        message="visual captcha session opened",
+        data={"timeout_seconds": timeout},
+    )
+    try:
+        with BrowserSession(account_settings(settings, account), headless=False) as browser:
+            browser.goto_index()
+            confirmed = confirmation.wait(timeout=timeout)
+    except Exception:
+        store.mark_account_captcha_pending(run_id, account_id, reason="visual_recovery_failed")
+        raise
+    if not confirmed:
+        store.mark_account_captcha_pending(run_id, account_id, reason="visual_recovery_timed_out")
+        store.add_event(
+            run_id,
+            account_id=account_id,
+            level="warning",
+            message="visual captcha session timed out",
+        )
+        return False
+    store.add_event(
+        run_id,
+        account_id=account_id,
+        message="operator requested captcha validation",
+    )
+    return True
 
 
 def _limit(query: str) -> int:
@@ -218,6 +516,10 @@ def _runtime_summary(settings: Settings) -> dict[str, Any]:
         "browser_window_mode": settings.window_mode,
         "expected_egress_country": settings.expected_egress_country,
         "request_delay_seconds": settings.request_delay_seconds,
+        "visual_url": os.environ.get(
+            "CBRS_NOVNC_URL",
+            "http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale",
+        ),
     }
 
 
@@ -429,7 +731,7 @@ def _dashboard_html() -> str:
   <header>
     <div>
       <h1>Pool de Consultas CBRS</h1>
-      <div class="muted">3 cuentas autorizadas · 60 consultas teóricas por día</div>
+      <div id="accountSummary" class="muted">Cuentas autorizadas · capacidad controlada</div>
     </div>
     <div style="display:flex;gap:10px;align-items:center">
       <button id="stopButton">Detener</button>
@@ -477,7 +779,19 @@ def _dashboard_html() -> str:
       <div class="kpi"><div class="muted">Restantes hoy</div><div id="remainingToday" class="value">-</div></div>
       <div class="kpi"><div class="muted">PDFs generados</div><div id="downloads" class="value">-</div></div>
       <div class="kpi"><div class="muted">Captchas pendientes</div><div id="captchaPending" class="value">-</div></div>
+      <div class="kpi"><div class="muted">Jobs en cola</div><div id="queuedJobs" class="value">-</div></div>
+      <div class="kpi"><div class="muted">Respaldo</div><div id="backupState" class="value" style="font-size:18px">-</div></div>
     </div>
+
+    <section id="jobsPanel" class="panel" style="margin-bottom:16px;display:none">
+      <h2>Solicitudes recientes</h2>
+      <table>
+        <thead>
+          <tr><th>Job</th><th>Tipo</th><th>Estado</th><th>Resultados</th><th>PDFs</th><th>Finalizado</th><th>Acción</th></tr>
+        </thead>
+        <tbody id="jobs"></tbody>
+      </table>
+    </section>
 
     <section class="panel">
       <h2>Ciclos recientes</h2>
@@ -495,9 +809,16 @@ def _dashboard_html() -> str:
       blocked: "bloqueado",
       captcha_pending: "captcha pendiente",
       captcha_solving: "resolviendo captcha",
+      cancelled: "cancelado",
       completed: "completado",
       disabled: "deshabilitada",
       failed: "fallido",
+      partial: "parcial",
+      queued: "en cola",
+      healthy: "saludable",
+      low_disk: "poco espacio",
+      invalid: "inválido",
+      not_configured: "no configurado",
       not_started: "no iniciado",
       passed: "correcto",
       paused: "pausada",
@@ -506,7 +827,8 @@ def _dashboard_html() -> str:
       stale: "sin latido",
       stopped: "detenido",
       waiting: "en espera",
-      waiting_capacity: "sin capacidad"
+      waiting_capacity: "sin capacidad",
+      waiting_captcha: "esperando captcha"
     };
     const label = (value) => statusLabels[value] || value || "-";
     const localTime = (value) => value ? new Date(value).toLocaleString() : "-";
@@ -556,10 +878,18 @@ def _dashboard_html() -> str:
       document.getElementById("remainingToday").textContent = remaining;
       document.getElementById("downloads").textContent = stats.downloads ?? 0;
       document.getElementById("captchaPending").textContent = pool.captcha_pending_accounts ?? 0;
+      const routeCount = pool.egress_routes ?? (current.accounts || []).length;
+      const routeMode = pool.shared_egress ? `${routeCount} salida Chile compartida` : `${routeCount} salidas dedicadas`;
+      document.getElementById("accountSummary").textContent = `${(current.accounts || []).length} cuentas autorizadas · ${quota} consultas teóricas por día · ${routeMode}`;
+      const jobSummary = current.jobs?.summary || null;
+      document.getElementById("queuedJobs").textContent = jobSummary ? (jobSummary.queued ?? 0) : "-";
+      const backupLabels = { healthy: "saludable", stale: "atrasado", failed: "fallido", low_disk: "poco espacio", invalid: "inválido", not_configured: "no configurado" };
+      document.getElementById("backupState").textContent = current.backup ? (backupLabels[current.backup.status] || current.backup.status) : "-";
       renderAlert(current.alert);
       renderPoolFacts(pool, run, nextSeconds);
       renderAccounts(current.accounts || []);
       renderCycles(current.cycles || [], current.artifacts || []);
+      renderJobs(current.jobs?.recent || []);
     }
     function headline(data, nextSeconds) {
       const pool = data.pool || {};
@@ -594,6 +924,7 @@ def _dashboard_html() -> str:
       const rows = [
         ["Cupo diario", `${pool.daily_quota || 60}`],
         ["Disponible", `${pool.available_accounts ?? 0} cuenta(s)`],
+        ["Rutas de salida", `${pool.egress_routes ?? "-"}${pool.shared_egress ? " (compartida)" : ""}`],
         ["Siguiente cuenta", pool.next_account_label || "-"],
         ["Próximo ciclo", nextSeconds === null ? "-" : fmtSeconds(nextSeconds)],
         ["Fecha de cupo", pool.quota_date || "-"],
@@ -606,10 +937,17 @@ def _dashboard_html() -> str:
     function renderAccounts(accounts) {
       document.getElementById("accounts").innerHTML = accounts.map((account, index) => {
         const pct = account.daily_quota ? Math.min(100, (account.used_today / account.daily_quota) * 100) : 0;
-        const note = account.paused_reason ? `Motivo: ${account.paused_reason}` : `${account.remaining_today} restantes hoy`;
+        const route = account.egress_shared
+          ? `Salida compartida: ${account.egress_group || "Chile"}`
+          : "Salida dedicada";
+        const note = account.paused_reason
+          ? `Motivo: ${account.paused_reason} · ${route}`
+          : `${account.remaining_today} restantes hoy · ${route}`;
         const action = account.status === "captcha_pending"
-          ? `<button class="account-action" data-captcha-account="${escapeHtml(account.account_id)}">Resolver captcha</button>`
-          : "";
+          ? `<button class="account-action" data-captcha-account="${escapeHtml(account.account_id)}" data-captcha-action="trigger">Resolver captcha</button>`
+          : account.status === "captcha_solving"
+            ? `<button class="account-action" data-captcha-account="${escapeHtml(account.account_id)}" data-captcha-action="complete">Validar y reactivar</button>`
+            : "";
         return `<section class="account ${escapeHtml(account.status)}" style="--wave-index:${index % 9}">
           <div class="account-top">
             <div class="account-name">${escapeHtml(account.label)}</div>
@@ -622,13 +960,16 @@ def _dashboard_html() -> str:
         </section>`;
       }).join("");
     }
-    async function triggerCaptcha(accountId, button) {
+    async function triggerCaptcha(accountId, action, button) {
       if (!accountId) return;
       if (button) {
         button.disabled = true;
-        button.textContent = "Abriendo Chrome...";
+        button.textContent = action === "complete" ? "Validando..." : "Abriendo Chrome...";
       }
-      await fetch(`/api/captcha/${encodeURIComponent(accountId)}/trigger`, { method: "POST" });
+      await fetch(`/api/captcha/${encodeURIComponent(accountId)}/${action}`, { method: "POST" });
+      if (action === "trigger" && current?.runtime?.visual_url) {
+        window.open(current.runtime.visual_url, "cbrsVisualRecovery", "noopener");
+      }
       await refresh();
     }
     function maybeNotifyCaptcha(alert) {
@@ -663,6 +1004,27 @@ def _dashboard_html() -> str:
         </tr>`;
       }).join("");
     }
+    function renderJobs(jobs) {
+      const panel = document.getElementById("jobsPanel");
+      if (!jobs.length && !current.jobs) {
+        panel.style.display = "none";
+        return;
+      }
+      panel.style.display = "block";
+      document.getElementById("jobs").innerHTML = jobs.map((job) => {
+        const terminal = ["completed", "partial", "failed", "cancelled"].includes(job.status);
+        const action = terminal ? "-" : `<button data-cancel-job="${escapeHtml(job.job_id)}" style="padding:5px 8px">Cancelar</button>`;
+        return `<tr>
+          <td><a href="/api/jobs/${encodeURIComponent(job.job_id)}" target="_blank"><code>${escapeHtml(job.job_id)}</code></a></td>
+          <td>${escapeHtml(job.kind)}</td>
+          <td><span class="status ${escapeHtml(job.status)}">${escapeHtml(label(job.status))}</span></td>
+          <td>${job.result_count ?? "-"}</td>
+          <td>${job.completed_items ?? 0}</td>
+          <td>${localTime(job.finished_at)}</td>
+          <td>${action}</td>
+        </tr>`;
+      }).join("");
+    }
     document.getElementById("stopButton").addEventListener("click", async () => {
       await fetch("/api/stop", { method: "POST" });
       await refresh();
@@ -670,7 +1032,18 @@ def _dashboard_html() -> str:
     document.getElementById("accounts").addEventListener("click", (event) => {
       const button = event.target.closest("[data-captcha-account]");
       if (!button) return;
-      triggerCaptcha(button.dataset.captchaAccount, button).catch(console.error);
+      triggerCaptcha(
+        button.dataset.captchaAccount,
+        button.dataset.captchaAction || "trigger",
+        button,
+      ).catch(console.error);
+    });
+    document.getElementById("jobs").addEventListener("click", async (event) => {
+      const button = event.target.closest("[data-cancel-job]");
+      if (!button) return;
+      button.disabled = true;
+      await fetch(`/api/jobs/${encodeURIComponent(button.dataset.cancelJob)}/cancel`, { method: "POST" });
+      await refresh();
     });
     refresh().catch(console.error);
     setInterval(() => refresh().catch(console.error), 2000);

@@ -48,6 +48,7 @@ class Settings:
     proxy_url: str | None
     allow_cloak_auto_update: bool
     output_dir: Path
+    log_dir: Path
     request_delay_seconds: float
     use_curl_cffi_for_images: bool
     curl_cffi_impersonate: str
@@ -177,6 +178,7 @@ def load_settings(
         proxy_url=_empty_to_none(env.get("CBRS_PROXY_URL")),
         allow_cloak_auto_update=_bool(env.get("CBRS_ALLOW_CLOAK_AUTO_UPDATE")),
         output_dir=_path(env.get("CBRS_OUTPUT_DIR"), default="outputs", root=root),
+        log_dir=_path(env.get("CBRS_LOG_DIR"), default=".cbrs/logs", root=root),
         request_delay_seconds=request_delay,
         use_curl_cffi_for_images=_bool(env.get("CBRS_USE_CURL_CFFI_FOR_IMAGES")),
         curl_cffi_impersonate=env.get("CBRS_CURL_CFFI_IMPERSONATE", "chrome120"),
