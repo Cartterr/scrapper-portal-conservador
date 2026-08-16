@@ -1,12 +1,13 @@
 # CBRS Commerce Registry Operator Tool
 
-This branch keeps the original commerce-registry flow but runs it through a
-fixed-trust production model: normal Chrome/Edge, one clean persistent profile,
-manual login, a declared non-personal Chilean egress path, fixed pacing, and
-hard stops on risk signals.
+This branch keeps the original commerce-registry flow but runs production on
+Ubuntu through normal Google Chrome, one persistent profile and fixed Chilean
+egress per authorized account, automatic browser-origin authentication, fixed
+pacing, a durable SQLite job queue, and hard stops on global risk signals.
 
-Production does not use CAPTCHA solving, account rotation, proxy cycling,
-automated credential login, raw-cookie export, or stealth browser defaults.
+Production does not use CAPTCHA solving, proxy cycling, raw-cookie export, or
+stealth browser defaults. The scheduler may fail over between separately
+authorized accounts, but never changes an account's profile or egress identity.
 CloakBrowser/IPRoyal support is legacy opt-in only and is not the production
 trust path.
 
@@ -41,6 +42,19 @@ cbrs init
   Browser storage persists locally
   No raw cookie/session JSON is exported
 
+cbrs jobs worker
+  Claims idempotent requests from SQLite with a single-worker lease
+  Selects the least-used eligible authorized account
+  Refreshes or automatically authenticates inside that account's Chrome profile
+  Reserves quota immediately before each real search
+  Downloads every returned inscription and publishes hashed PDFs atomically
+  Recovers abandoned jobs after an expired lease without repeating completed items
+
+cbrs jobs dashboard
+  Binds the dashboard and JSON API to loopback only
+  Accepts jobs, exposes status/artifacts, cancellation, quotas and backup health
+  Starts headed CAPTCHA recovery while all normal traffic remains paused
+
 cbrs validate
   Runs preflight before any portal request
   Runs proxy health before browser work when CBRS_PROXY_URL is configured
@@ -63,6 +77,8 @@ cbrs/
   validation.py        Sanitized low-volume validation report writer
   scraper.py           Commerce search/download domain flow
   pdf.py               Pure PDF assembly utilities
+  jobs.py              Queue, leases, account scheduling, artifacts, and recovery
+  backup.py            Online SQLite snapshot, restic, and storage health
   config.py            CBRS_* environment parsing and safe defaults
   cli.py               init, doctor, preflight, search, download, validate
 ```
@@ -86,8 +102,10 @@ The client raises a safety stop instead of retrying or rotating identity for:
 - protected endpoints returning HTML where JSON/image data is expected
 - unexpected non-200 statuses
 
-The correct operator action after a stop is manual review, official access
-escalation, or trying again later from the same approved environment.
+CAPTCHA pauses only the affected account and permits another already-authorized
+account to continue. Rate limits and WAF challenges remain global hard stops.
+The operator action after a global stop is review or official escalation from
+the same approved environment.
 
 ## Environment
 
@@ -110,16 +128,13 @@ CBRS_USE_CURL_CFFI_FOR_IMAGES=0
 `CBRS_BROWSER_EXECUTABLE_PATH` is only needed when auto-detection cannot find
 Chrome or Edge. Auto-detection checks Chrome first, then Edge.
 
-`CBRS_HEADLESS=0` is the supported live portal mode. `cbrs init` is always
-headed because manual login requires a visible browser. `--headless` remains
-available for local troubleshooting, but the 2026-06-18 live proof showed the
-portal can reject headless commerce searches with a temporary 400 response while
-the same profile succeeds headed.
+`CBRS_HEADLESS=0` is the supported live portal mode. On Ubuntu, Chrome remains
+headed inside Xvfb and is visible on demand through loopback-only noVNC. On WSL2
+the same Linux Chrome is displayed by WSLg. `--headless` remains diagnostic
+because prior live evidence showed different portal behavior in true headless mode.
 
-`CBRS_WINDOW_MODE=offscreen` keeps the browser headed but moves the window away
-from the visible desktop using Chrome window position arguments. Use
-`CBRS_WINDOW_MODE=normal` if Windows pulls the window back onscreen or if manual
-inspection is needed.
+`CBRS_WINDOW_MODE=normal` is used with Xvfb/WSLg. `offscreen` remains a local
+diagnostic compatibility option.
 
 `CBRS_EGRESS_MODE` is mandatory before live operations. Allowed production
 values are:
@@ -160,10 +175,10 @@ session identity.
 
 ## Local Checks
 
-```powershell
+```bash
 python -m compileall cbrs tests
-python -m pytest
+python -m pytest -q
 python -m cbrs doctor
-python -m cbrs preflight
-python -m cbrs preflight --approve-egress-baseline
+python -m cbrs pool proxy-health --approve-egress-baseline
+python -m cbrs jobs status
 ```

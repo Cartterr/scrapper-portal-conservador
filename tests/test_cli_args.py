@@ -122,3 +122,46 @@ def test_pool_dashboard_and_stop_parsers() -> None:
     assert dashboard_args.port == 9877
     assert stop_args.command == "pool"
     assert stop_args.pool_command == "stop"
+
+
+def test_jobs_cli_parses_text_fna_worker_and_dashboard() -> None:
+    parser = build_parser()
+
+    text = parser.parse_args(
+        ["jobs", "enqueue", "--text", "Company", "--idempotency-key", "req-1"]
+    )
+    fna = parser.parse_args(
+        ["jobs", "enqueue", "--foja", "10", "--numero", "20", "--year", "2020"]
+    )
+    worker = parser.parse_args(["jobs", "worker", "--once", "--poll-seconds", "1"])
+    dashboard = parser.parse_args(["jobs", "dashboard", "--port", "9000"])
+
+    assert text.jobs_command == "enqueue"
+    assert text.text == "Company"
+    assert text.idempotency_key == "req-1"
+    assert (fna.foja, fna.numero, fna.ano) == (10, 20, 2020)
+    assert worker.once is True
+    assert worker.poll_seconds == 1
+    assert dashboard.port == 9000
+
+
+def test_readiness_cli_parses_offline_wsl_gate() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "readiness",
+            "--target",
+            "wsl",
+            "--distro",
+            "Ubuntu-24.04",
+            "--probe-wsl-runtime",
+            "--json-report",
+            ".cbrs/readiness/test.json",
+        ]
+    )
+
+    assert args.command == "readiness"
+    assert args.target == "wsl"
+    assert args.distro == "Ubuntu-24.04"
+    assert args.probe_wsl_runtime is True

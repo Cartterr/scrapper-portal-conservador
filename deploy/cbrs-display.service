@@ -1,0 +1,14 @@
+[Unit]
+Description=CBRS private virtual display
+After=network.target
+
+[Service]
+Type=simple
+User=cbrs
+Group=cbrs
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1366x900x24 -nolisten tcp -noreset
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,181 +1,85 @@
-# CBRS Fixed-Trust Validation Plan
+# Plan de validación del runtime productivo CBRS
 
-This plan proves the tool works inside the intended constraint: one legitimate
-operator, one clean persistent Chrome/Edge profile, one declared non-personal
-Chilean egress path, slow sequential requests, no retries, no solver/account
-rotation, and hard stops on portal risk signals.
+## 1. Gate offline
 
-## 1. Local Safety Gate
+Ejecutar en Ubuntu y en Ubuntu/WSL2:
 
-Run before any live portal action:
+```bash
+python -m compileall -q cbrs tests
+python -m pytest -q
+bash -n deploy/install-ubuntu.sh deploy/install-wsl.sh
+python -m cbrs jobs --help
+```
 
-```powershell
-python -m compileall cbrs tests
-python -m pytest
+La suite debe cubrir:
+
+- migración aditiva sobre la base actual del pool;
+- WAL, foreign keys, `busy_timeout`, leases y recuperación de jobs abandonados;
+- idempotencia y conflicto de claves;
+- reserva atómica de cupos y cambio de fecha `America/Santiago`;
+- descarga de todos los resultados, PDFs válidos, SHA-256 y estados parciales;
+- failover por cuenta y hard stop global para rate limit/WAF;
+- sesión persistente, login automático y redacción de secretos;
+- API loopback, cancelación y confinamiento de artefactos;
+- snapshot SQLite, restic, backup atrasado y espacio en disco.
+
+## 2. Gate de infraestructura
+
+Con el usuario y variables de los servicios:
+
+```bash
 python -m cbrs doctor
-python -m cbrs preflight
-python -m cbrs preflight --approve-egress-baseline
-python -m cbrs pool proxy-health
-rg -n "CapSolver|capsolver|2captcha|ACCOUNTS|USER_\d|PASSWORD_\d|cbrs_session|disable-blink|AutomationControlled|CBRS_CLOAK_PROXY_URL"
+python -m cbrs pool proxy-health \
+  --config /var/lib/cbrs/account-pool.json \
+  --approve-egress-baseline
+python -m cbrs jobs status
 ```
 
-Acceptance:
+Aceptación:
 
-- compile succeeds
-- tests pass
-- `doctor` is all OK only after `CBRS_EGRESS_MODE` is set to an approved
-  non-personal mode
-- plain `preflight` blocks if no approved baseline exists
-- `preflight --approve-egress-baseline` is run only after the operator confirms
-  they are on the client-owned Chilean egress path
-- after approval, plain `preflight` passes only from the same egress hash
-- search results only show docs/tests/legacy code, not active production config
-- `.env` does not contain `CBRS_CLOAK_PROXY_URL`
-- `.env` may contain `CBRS_PROXY_URL` only when
-  `CBRS_EGRESS_MODE=dedicated_static_isp`; never commit the real proxy URL
-- if `CBRS_PROXY_URL` is configured, `pool proxy-health` must pass before login:
-  Chile egress, Google reCAPTCHA Enterprise script, and CBRS home start
-- `.env` contains one of:
-  `CBRS_EGRESS_MODE=client_vpn`,
-  `CBRS_EGRESS_MODE=client_office`, or
-  `CBRS_EGRESS_MODE=dedicated_static_isp`
-- live validation runs use `CBRS_HEADLESS=0` by default because the portal has
-  rejected headless commerce searches; `--headless` is troubleshooting-only
-- use `CBRS_WINDOW_MODE=offscreen` when the headed browser should not occupy the
-  main desktop
-- last-resort personal/direct testing requires both
-  `CBRS_EGRESS_MODE=personal_direct` and `CBRS_ALLOW_PERSONAL_EGRESS=1`
-  and must not be treated as production validation
+- Google Chrome estable, Xvfb y `DISPLAY=:99` están disponibles;
+- cada cuenta tiene un perfil y referencia de proxy diferentes;
+- cada proxy resuelve a Chile, mantiene su hash aprobado y no comparte egress;
+- reCAPTCHA Enterprise y `/api/v1/home/start` son accesibles;
+- dashboard/API y noVNC escuchan exclusivamente en loopback;
+- `/var/lib/cbrs`, `/var/log/cbrs` y el repositorio restic tienen permisos del
+  usuario de servicio.
 
-## 2. Manual Login Gate
+## 3. Gate funcional vivo autorizado
 
-```powershell
-python -m cbrs init --timeout 600
-```
+1. Partir con perfiles vacíos y confirmar login automático para tres cuentas.
+2. Encolar una búsqueda textual conocida con múltiples resultados.
+3. Verificar un `job_item` y PDF por inscripción, cabecera `%PDF-`, número de
+   páginas, tamaño y hash.
+4. Repetir la clave idempotente y confirmar que no se crea otra búsqueda.
+5. Reiniciar el worker durante una descarga y confirmar recuperación sin
+   duplicar artefactos completos.
+6. Expirar una sesión y confirmar refresh o un único relogin automático.
+7. Llevar una cuenta a CAPTCHA y confirmar failover a otra.
+8. Llevar todas a CAPTCHA: no debe haber tráfico hasta **Resolver CAPTCHA** y
+   **Validar y reactivar** mediante la vista noVNC/WSLg.
+9. Cambiar el egress de una cuenta y confirmar pausa antes de una búsqueda.
+10. Completar 60 solicitudes distribuidas 20/20/20; la 61 debe quedar en
+    `waiting_capacity` hasta la siguiente fecha chilena.
+11. Confirmar que un `429` o WAF crea un safety stop global y que un segundo
+    worker no puede adquirir el lease.
+12. Ejecutar el backup, restaurar SQLite y un PDF en un directorio temporal y
+    comparar sus hashes.
 
-Acceptance:
+## 4. Soak de aceptación
 
-- preflight passes first
-- headed Chrome/Edge opens with `.cbrs/chrome-profile`
-- operator logs in manually
-- command exits after detecting the login cookie
-- no raw cookie/session JSON is created
+Ejecutar siete días con `cbrs-worker.service`, `cbrs-dashboard.service` y
+`cbrs-backup.timer` activos. Revisar diariamente sin preparar sesiones:
 
-## 3. Day 1 Search-Only Live Proof
+- heartbeat y reinicios de systemd;
+- distribución y reset de cupos;
+- refresh/login de sesiones;
+- CAPTCHA y tiempos de recuperación;
+- jobs `partial` o `failed` y motivos sanitizados;
+- edad del último backup y espacio libre;
+- ausencia de credenciales, JWT, cookies, IPs o proxy URLs en SQLite, dashboard,
+  journald y `/var/log/cbrs`.
 
-Use one known safe query or FNA provided by the operator:
-
-```powershell
-python -m cbrs validate --query "KNOWN_SAFE_NAME"
-```
-
-Acceptance:
-
-- preflight passes and the fixed-egress hash matches the saved baseline
-- exactly one search flow is attempted
-- normal fixed request delay is applied
-- result count is printed
-- sanitized report is written to `.cbrs/logs/validation-*.json`
-- report does not store query text, ticket, cookies, JWTs, captcha tokens, raw
-  IPs, credentials, or proxy URLs
-- report stores browser backend, browser family, profile hash, egress country,
-  egress hash, fixed delay, sanitized proxy metadata, and safety-stop reason if
-  any
-
-## 4. Day 2 Search-Only Live Proof
-
-Repeat one safe search from the same profile and same approved egress path:
-
-```powershell
-python -m cbrs validate --query "KNOWN_SAFE_NAME"
-```
-
-Acceptance:
-
-- preflight egress hash still matches baseline
-- profile remains logged in, or manual login can be repeated without automation
-- no `403`, `429`, `err-limite`, `intente-mas-tarde`, challenge HTML, login
-  failure, egress drift, or account lockout
-
-## 5. Day 3 Search Plus Optional First Download
-
-Only after Day 1 and Day 2 pass:
-
-```powershell
-python -m cbrs validate --query "KNOWN_SAFE_NAME"
-python -m cbrs validate --query "KNOWN_SAFE_NAME" --download-first
-```
-
-Acceptance:
-
-- one search flow is attempted per command
-- optional download uses only the first result
-- image pages are downloaded sequentially
-- PDF exists and has non-zero size
-- sanitized report includes PDF path and size only
-
-## 6. Long-Running Soak Proof
-
-Use the soak runner when the goal is to prove the normal flow over time without
-waiting on a manual multi-day checklist:
-
-```powershell
-python -m cbrs soak dashboard
-python -m cbrs soak run --dry-run --max-cycles 3 --dashboard
-python -m cbrs soak run --dashboard
-```
-
-Acceptance:
-
-- standalone dashboard starts without creating a run or touching the portal
-- dry-run writes local soak history and placeholder output without portal traffic
-- live soak starts with one immediate full-flow cycle
-- later live cycles wait a randomized test-only `2-4` minute interval,
-  averaging about 20 full-flow consults per hour
-- every live cycle uses preflight, the persistent profile, safe search, and one
-  first-result download
-- PDFs are written under `outputs/soak/<run_id>/<cycle_id>/`
-- the dashboard at `http://127.0.0.1:8765` shows status, uptime, heartbeat,
-  success rate, safety stops, validation reports, and output artifacts
-- `python -m cbrs soak stop` or the dashboard Stop button requests a graceful
-  stop after the current safe point
-- any hard safety stop leaves the dashboard alive but blocks all future portal
-  actions until operator review
-
-## 7. Safety Stop Proofs
-
-These are logic tests, not live stress tests:
-
-- `tests/test_safety.py` proves `err-limite`, `intente-mas-tarde`, `403`, `429`,
-  WAF/challenge HTML, and image HTML responses stop the flow.
-- `tests/test_preflight.py` proves legacy proxy config, non-CL egress, invalid
-  browser-proxy mode, and egress-hash drift stop before portal traffic.
-- The live tool must not continue, retry, rotate accounts, or switch identity
-  after any safety stop.
-
-## Operating Constraints
-
-- one operator session at a time
-- no bulk jobs
-- no parallel downloads
-- no retry loops
-- no IPRoyal Residential or rotating proxy in production
-- do not use a personal/home IP for approval or live validation
-- use client-owned Chilean egress, a client VPN, or a dedicated static Chile ISP
-  path approved in writing
-- if using `CBRS_PROXY_URL`, keep it fixed per account/profile and use only
-  `CBRS_EGRESS_MODE=dedicated_static_isp`
-- do not attempt login or pool cycles on a proxy that cannot tunnel Google
-  reCAPTCHA Enterprise
-- if personal/direct mode is used anyway, label it explicitly and stop after the
-  minimum login/search proof
-- no continuing after egress drift, `403`, `429`, `err-limite`,
-  `intente-mas-tarde`, or challenge HTML
-- keep default request delay at a fixed `5.0s` unless a slower setting is needed
-
-## Client-Facing Summary
-
-The proof is not based on load testing. It is based on proving the tool behaves
-like a careful operator from a stable trusted environment: persistent
-Chrome/Edge login, low volume, sequential actions, sanitized logs, fixed egress,
-and immediate stop on any portal risk signal.
+La aceptación E2E termina únicamente después de este gate vivo. La suite offline
+no puede demostrar credenciales, reputación de proxies, cuota real ni respuesta
+actual del portal.

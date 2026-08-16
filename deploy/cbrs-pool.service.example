@@ -1,0 +1,24 @@
+[Unit]
+Description=CBRS legacy account-pool diagnostic dry-run
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cbrs
+Group=cbrs
+WorkingDirectory=/opt/cbrs
+EnvironmentFile=/etc/cbrs/cbrs.env
+ExecStart=/opt/cbrs/.venv/bin/python -m cbrs pool run --dry-run
+Restart=on-failure
+RestartSec=15
+KillSignal=SIGINT
+TimeoutStopSec=90
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/cbrs
+
+[Install]
+WantedBy=multi-user.target

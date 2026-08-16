@@ -27,6 +27,10 @@ class BrowserOriginClient:
             self._image_session.close()
             self._image_session = None
 
+    def invalidate_auth(self) -> None:
+        self._jwt = None
+        self._jwt_expires_at = None
+
     def ensure_auth(self, *, force: bool = False) -> str:
         self.browser.require_login_cookie()
         if self._jwt and not force and self._jwt_is_fresh():

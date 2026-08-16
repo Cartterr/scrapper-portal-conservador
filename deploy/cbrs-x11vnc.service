@@ -1,0 +1,16 @@
+[Unit]
+Description=CBRS loopback-only VNC bridge
+Requires=cbrs-display.service
+After=cbrs-display.service
+
+[Service]
+Type=simple
+User=cbrs
+Group=cbrs
+Environment=DISPLAY=:99
+ExecStart=/usr/bin/x11vnc -display :99 -forever -shared -localhost -rfbport 5900 -nopw
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

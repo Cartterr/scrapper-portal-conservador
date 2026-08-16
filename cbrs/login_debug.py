@@ -36,7 +36,7 @@ def run_login_debug(
     timeout_seconds: int | None,
     label: str,
 ) -> Path:
-    log_dir = settings.profile_dir.parent / "logs"
+    log_dir = settings.log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"login-debug-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
     pending: dict[int, dict[str, Any]] = {}
