@@ -1,5 +1,8 @@
 # Fixed-Trust Production Runtime
 
+> **LEGACY DEPLOYMENT NOTES:** the active endurance runtime is native Windows;
+> see [`native-windows-endurance.md`](native-windows-endurance.md).
+
 ## Decision
 
 Production uses Google Chrome on Ubuntu with one clean persistent profile and a
@@ -23,7 +26,8 @@ connectivity experiments, never for production validation.
 - Egress hash: expected country `CL`, with a saved hash baseline after explicit
   approval from the intended non-personal path.
 - Login: refresh first, then browser-origin credential login from environment
-  references; manual intervention only for CAPTCHA or diagnostics.
+  references; CAPTCHA is manual by default, with an optional one-shot 2Captcha
+  fallback before operator recovery.
 - Pacing: fixed `5.0s` minimum-safe delay by default.
 - Reports: sanitized JSON under `.cbrs/logs/`.
 - Stops: one auth recovery attempt; no proxy fallback. CAPTCHA removes only the
@@ -58,8 +62,9 @@ production access path:
 We need to operate a low-volume, single-operator automation against the CBRS
 commerce portal from a stable Chilean office/client network or client VPN.
 
-The automation does not bypass login, does not solve CAPTCHA externally, does
-not rotate IPs, and stops immediately on rate-limit or WAF signals. It schedules
+The automation does not bypass login or rotate IPs, and stops immediately on
+rate-limit or WAF signals. Optional external CAPTCHA fallback requires separate
+approval and makes one attempt before stopping. It schedules
 only separately authorized named accounts, each with its own fixed Chrome
 profile and egress, using automatic normal login and fixed sequential pacing.
 

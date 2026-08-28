@@ -1,6 +1,13 @@
 from cbrs.safety import StopReason, classify_response, redact
 
 
+def test_redacts_two_captcha_client_key() -> None:
+    assert redact({"clientKey": "private-key", "status": "ok"}) == {
+        "clientKey": "[REDACTED]",
+        "status": "ok",
+    }
+
+
 def test_classifies_daily_limit() -> None:
     reason = classify_response(400, {}, {"code": "err-limite"})
 

@@ -154,6 +154,11 @@ def cmd_doctor() -> int:
             True,
             "curl_cffi compatibility" if settings.use_curl_cffi_for_images else "browser-origin",
         ),
+        (
+            "captcha solver",
+            settings.captcha_solver_mode == "browser" or bool(settings.two_captcha_api_key),
+            settings.captcha_solver_mode,
+        ),
     ]
 
     gitignore = Path(".gitignore")
@@ -266,6 +271,38 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     if result.report_path:
         print(f"Preflight report: {result.report_path}")
     return 0 if result.ok else 1
+
+
+def cmd_captcha_health() -> int:
+    from .captcha_budget import CaptchaBudgetStore
+    from .captcha_solver import TwoCaptchaClient, TwoCaptchaError
+
+    settings = config.SETTINGS
+    if not settings.two_captcha_api_key:
+        print("FAIL 2Captcha API key: CBRS_2CAPTCHA_API_KEY is not configured", file=sys.stderr)
+        return 1
+    client = TwoCaptchaClient(
+        settings.two_captcha_api_key,
+        timeout_seconds=settings.two_captcha_timeout_seconds,
+        poll_seconds=settings.two_captcha_poll_seconds,
+    )
+    try:
+        balance = client.get_balance()
+    except TwoCaptchaError as exc:
+        print(f"FAIL 2Captcha API: {exc.code}", file=sys.stderr)
+        return 1
+    if balance <= 0:
+        print("FAIL 2Captcha balance: zero balance", file=sys.stderr)
+        return 1
+    CaptchaBudgetStore(
+        settings.captcha_state_path,
+        daily_limit=settings.two_captcha_daily_limit,
+        circuit_seconds=settings.two_captcha_circuit_breaker_seconds,
+        rejection_cooldown_seconds=settings.two_captcha_rejection_cooldown_seconds,
+    ).clear_solver_disable()
+    print("OK   2Captcha API: authenticated")
+    print(f"OK   2Captcha balance: {balance:.4f}")
+    return 0
 
 
 def _require_preflight() -> dict[str, object]:
@@ -454,8 +491,10 @@ def cmd_pool(args: argparse.Namespace) -> int:
         print(json.dumps(dashboard_status(store, config=pool_config), ensure_ascii=False, indent=2))
         return 0
     if args.pool_command == "proxy-health":
+        from .jobs import default_job_store
         from .proxy_health import run_proxy_health
 
+        job_store = default_job_store(config.SETTINGS)
         accounts = (
             [_pool_account_by_id(pool_config, args.account)]
             if args.account
@@ -476,6 +515,7 @@ def cmd_pool(args: argparse.Namespace) -> int:
             if preflight.report_path:
                 print(f"Preflight report: {preflight.report_path}")
             if not preflight.ok:
+                job_store.set_account_check(account.account_id, proxy_status="failed")
                 exit_code = 1
                 continue
             result = run_proxy_health(settings, write_report=True)
@@ -483,7 +523,28 @@ def cmd_pool(args: argparse.Namespace) -> int:
             if result.report_path:
                 print(f"Proxy health report: {result.report_path}")
             if not result.ok:
+                job_store.set_account_check(account.account_id, proxy_status="failed")
                 exit_code = 1
+                continue
+            egress_hash = str(preflight.report.get("egress_hash") or "") or None
+            if egress_hash:
+                owner = job_store.egress_owner(
+                    egress_hash,
+                    exclude_account=account.account_id,
+                )
+                if owner:
+                    print(
+                        "FAIL shared egress: another enabled account uses the same fixed egress",
+                        file=sys.stderr,
+                    )
+                    job_store.set_account_check(account.account_id, proxy_status="failed")
+                    exit_code = 1
+                    continue
+            job_store.set_account_check(
+                account.account_id,
+                proxy_status="passed",
+                egress_hash=egress_hash,
+            )
         return exit_code
     if args.pool_command == "stop":
         store.request_stop()
@@ -584,13 +645,35 @@ def cmd_pool(args: argparse.Namespace) -> int:
 
 def cmd_jobs(args: argparse.Namespace) -> int:
     from .account_pool import AccountPoolStore, load_account_pool_config
+    from .endurance import EnduranceController, load_endurance_plan
     from .jobs import IdempotencyConflictError, default_job_store, run_job_worker
 
     store = default_job_store(config.SETTINGS)
+    if args.jobs_command == "backup":
+        from .backup import run_backup
+
+        result = run_backup(settings=config.SETTINGS, database_path=store.path)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else 1
+    if args.jobs_command == "backup-verify":
+        from .backup import verify_backup_restore
+
+        result = verify_backup_restore(
+            settings=config.SETTINGS,
+            require_pdf=args.require_pdf,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else 1
     pool_config = load_account_pool_config(
         config.SETTINGS,
         path=Path(args.config) if getattr(args, "config", None) else None,
     )
+    endurance_plan = load_endurance_plan(
+        Path(getattr(args, "endurance_plan", None))
+        if getattr(args, "endurance_plan", None)
+        else config.SETTINGS.profile_dir.parent / "endurance-plan.json"
+    )
+    endurance = EnduranceController(store, endurance_plan, pool_config)
 
     if args.jobs_command == "enqueue":
         kind = "text" if args.text is not None else "fna"
@@ -640,7 +723,89 @@ def cmd_jobs(args: argparse.Namespace) -> int:
         print(json.dumps(job, ensure_ascii=False, indent=2))
         return 0
     if args.jobs_command == "status":
-        print(json.dumps(store.summary(), ensure_ascii=False, indent=2))
+        from .captcha_budget import CaptchaBudgetStore
+
+        payload = store.summary()
+        payload["endurance"] = endurance.status()
+        payload["captcha"] = CaptchaBudgetStore(
+            config.SETTINGS.captcha_state_path,
+            daily_limit=config.SETTINGS.two_captcha_daily_limit,
+            circuit_seconds=config.SETTINGS.two_captcha_circuit_breaker_seconds,
+            rejection_cooldown_seconds=(
+                config.SETTINGS.two_captcha_rejection_cooldown_seconds
+            ),
+        ).status()
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if args.jobs_command == "captcha":
+        from .captcha_budget import CaptchaBudgetError, CaptchaBudgetStore
+
+        budget = CaptchaBudgetStore(
+            config.SETTINGS.captcha_state_path,
+            daily_limit=config.SETTINGS.two_captcha_daily_limit,
+            circuit_seconds=config.SETTINGS.two_captcha_circuit_breaker_seconds,
+            rejection_cooldown_seconds=(
+                config.SETTINGS.two_captcha_rejection_cooldown_seconds
+            ),
+        )
+        if args.captcha_command == "status":
+            print(json.dumps(budget.status(), ensure_ascii=False, indent=2))
+            return 0
+        if config.SETTINGS.captcha_solver_mode != "2captcha_manual":
+            print("CBRS_CAPTCHA_SOLVER_MODE must be 2captcha_manual.", file=sys.stderr)
+            return 2
+        if not config.SETTINGS.two_captcha_api_key:
+            print("CBRS_2CAPTCHA_API_KEY is not configured.", file=sys.stderr)
+            return 2
+        account = _pool_account_by_id(pool_config, args.account)
+        account_store = AccountPoolStore(store.path)
+        run = account_store.latest_run(dry_run=False)
+        state = next(
+            (
+                row
+                for row in account_store.accounts(str(run["run_id"]))
+                if row["account_id"] == account.account_id
+            ),
+            None,
+        ) if run else None
+        if not state or state["status"] != "captcha_pending":
+            print("The account must be captcha_pending before arming one solve.", file=sys.stderr)
+            return 2
+        try:
+            budget.arm_manual(account_id=account.account_id)
+        except CaptchaBudgetError as exc:
+            print(f"2Captcha manual authorization refused: {exc.code}", file=sys.stderr)
+            return 2
+        account_store.mark_account_available(str(run["run_id"]), account.account_id)
+        store.set_next_account(account.account_id, pool_config)
+        released = store.release_waiting_captcha()
+        account_store.add_event(
+            str(run["run_id"]),
+            account_id=account.account_id,
+            message="one manual 2Captcha solve authorized",
+        )
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "status": "one_solve_armed",
+                    "account_id": account.account_id,
+                    "released_jobs": released,
+                },
+                indent=2,
+            )
+        )
+        return 0
+    if args.jobs_command == "endurance":
+        if args.endurance_command == "pause":
+            endurance.set_paused(True)
+        elif args.endurance_command == "resume":
+            endurance.set_paused(False)
+        elif args.endurance_command == "run-once":
+            job = endurance.maybe_enqueue(force=True)
+            print(json.dumps({"created": bool(job), "job": job}, ensure_ascii=False, indent=2))
+            return 0 if job else 1
+        print(json.dumps(endurance.status(), ensure_ascii=False, indent=2))
         return 0
     if args.jobs_command == "safety-clear":
         store.clear_control("global_safety_stop")
@@ -675,13 +840,6 @@ def cmd_jobs(args: argparse.Namespace) -> int:
             dashboard.stop()
             print("\nDashboard stopped.")
         return 0
-    if args.jobs_command == "backup":
-        from .backup import run_backup
-
-        result = run_backup(settings=config.SETTINGS, database_path=store.path)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0 if result.get("ok") else 1
-
     result = run_job_worker(
         settings=config.SETTINGS,
         config=pool_config,
@@ -691,6 +849,7 @@ def cmd_jobs(args: argparse.Namespace) -> int:
         once=args.once,
         max_jobs=args.max_jobs,
         poll_seconds=args.poll_seconds,
+        endurance_plan=endurance_plan,
     )
     print(
         f"Job worker {result.status}: {result.processed_jobs} job(s) processed "
@@ -741,6 +900,7 @@ def cmd_readiness(args: argparse.Namespace) -> int:
         distro=args.distro,
         probe_wsl_runtime=args.probe_wsl_runtime,
         minimum_free_gib=args.minimum_free_gib,
+        require_active_runtime=args.require_active_runtime,
     )
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -791,15 +951,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("doctor", help="Run local safety/configuration checks")
+    subparsers.add_parser(
+        "captcha-health",
+        help="Validate the configured 2Captcha key and balance without creating a task",
+    )
     readiness_parser = subparsers.add_parser(
         "readiness",
-        help="Run an offline readiness gate for the indefinite Ubuntu test",
+        help="Run the readiness gate for the native Windows endurance runtime",
     )
     readiness_parser.add_argument(
         "--target",
-        choices=("current", "wsl", "ubuntu"),
-        default="wsl" if os.name == "nt" else "ubuntu",
-        help="Runtime to inspect; defaults to WSL on Windows and Ubuntu elsewhere",
+        choices=("current", "windows", "wsl", "ubuntu"),
+        default="windows" if os.name == "nt" else "ubuntu",
+        help="Runtime to inspect; defaults to native Windows on Windows",
     )
     readiness_parser.add_argument(
         "--distro",
@@ -826,6 +990,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=20.0,
         help="Warn when the current workspace volume has less free space",
+    )
+    readiness_parser.add_argument(
+        "--require-active-runtime",
+        action="store_true",
+        help="Also require enabled/running Windows tasks, worker heartbeat, and dashboard health",
     )
     readiness_parser.add_argument(
         "--json",
@@ -1112,6 +1281,25 @@ def build_parser() -> argparse.ArgumentParser:
     jobs_cancel.add_argument("--config", default=None, help=argparse.SUPPRESS)
     jobs_status = jobs_subparsers.add_parser("status", help="Show queue and worker status")
     jobs_status.add_argument("--config", default=None, help=argparse.SUPPRESS)
+    jobs_captcha = jobs_subparsers.add_parser(
+        "captcha", help="Inspect or manually authorize one paid CAPTCHA solve"
+    )
+    jobs_captcha_sub = jobs_captcha.add_subparsers(dest="captcha_command", required=True)
+    jobs_captcha_status = jobs_captcha_sub.add_parser("status")
+    jobs_captcha_status.add_argument("--config", default=None, help=argparse.SUPPRESS)
+    jobs_captcha_arm = jobs_captcha_sub.add_parser("arm")
+    jobs_captcha_arm.add_argument("--account", required=True)
+    jobs_captcha_arm.add_argument("--config", default=None, help=argparse.SUPPRESS)
+    jobs_endurance = jobs_subparsers.add_parser(
+        "endurance", help="Control the one-job endurance scheduler"
+    )
+    jobs_endurance_sub = jobs_endurance.add_subparsers(
+        dest="endurance_command", required=True
+    )
+    for command in ("status", "pause", "resume", "run-once"):
+        endurance_command = jobs_endurance_sub.add_parser(command)
+        endurance_command.add_argument("--config", default=None, help=argparse.SUPPRESS)
+        endurance_command.add_argument("--endurance-plan", default=None)
     jobs_safety_clear = jobs_subparsers.add_parser(
         "safety-clear",
         help="Clear a reviewed global safety stop before restarting the worker",
@@ -1122,8 +1310,14 @@ def build_parser() -> argparse.ArgumentParser:
     jobs_worker = jobs_subparsers.add_parser("worker", help="Run the sequential production worker")
     jobs_worker.add_argument("--once", action="store_true", help="Process at most one claim and exit")
     jobs_worker.add_argument("--max-jobs", type=int, default=None)
-    jobs_worker.add_argument("--poll-seconds", type=float, default=5.0)
+    jobs_worker.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=None,
+        help="Override the configured worker polling interval",
+    )
     jobs_worker.add_argument("--config", default=None, help="Account-pool JSON override")
+    jobs_worker.add_argument("--endurance-plan", default=None)
 
     jobs_dashboard = jobs_subparsers.add_parser(
         "dashboard", help="Serve the loopback jobs API and operational dashboard"
@@ -1138,6 +1332,16 @@ def build_parser() -> argparse.ArgumentParser:
     jobs_dashboard.add_argument("--port", type=int, default=None)
     jobs_backup = jobs_subparsers.add_parser("backup", help="Back up SQLite and permanent PDFs")
     jobs_backup.add_argument("--config", default=None, help=argparse.SUPPRESS)
+    jobs_backup_verify = jobs_subparsers.add_parser(
+        "backup-verify",
+        help="Restore the latest encrypted snapshot into a temporary directory and validate it",
+    )
+    jobs_backup_verify.add_argument(
+        "--require-pdf",
+        action="store_true",
+        help="Also require at least one valid restored PDF artifact",
+    )
+    jobs_backup_verify.add_argument("--config", default=None, help=argparse.SUPPRESS)
     return parser
 
 
@@ -1157,6 +1361,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "doctor":
             return cmd_doctor()
+        if args.command == "captcha-health":
+            return cmd_captcha_health()
         if args.command == "readiness":
             return cmd_readiness(args)
         if args.command == "preflight":

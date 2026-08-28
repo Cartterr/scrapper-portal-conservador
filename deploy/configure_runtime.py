@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import pwd
 import re
 import sys
 from pathlib import Path
@@ -202,6 +201,10 @@ def build_pool_config(validated: Mapping[str, Any]) -> dict[str, Any]:
         "interval_minutes": 0,
         "job_interval_min_seconds": 10,
         "job_interval_max_seconds": 30,
+        "human_like_behavior_enabled": True,
+        "worker_poll_seconds": 5,
+        "max_queued_production_jobs": 100,
+        "instant_jobs_enabled": True,
         "dashboard_host": "127.0.0.1",
         "dashboard_port": 8765,
         "accounts": accounts,
@@ -241,6 +244,8 @@ def apply_configuration(
 ) -> dict[str, Any]:
     if os.geteuid() != 0:
         raise PermissionError("configure_runtime.py must run as root")
+    import pwd
+
     service = pwd.getpwnam("cbrs")
     validated = validate_payload(payload)
     env_path = etc_dir / "cbrs.env"

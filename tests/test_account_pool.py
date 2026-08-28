@@ -40,6 +40,38 @@ def test_pool_config_defaults_to_three_nominal_accounts(tmp_path: Path) -> None:
     )
 
 
+def test_pool_config_loads_and_validates_production_controls(tmp_path: Path) -> None:
+    from cbrs.account_pool import load_account_pool_config
+
+    settings = load_settings({"CBRS_PROFILE_DIR": ".cbrs/chrome-profile"}, root=tmp_path)
+    path = tmp_path / "account-pool.json"
+    payload = {
+        "human_like_behavior_enabled": False,
+        "worker_poll_seconds": 2.5,
+        "max_queued_production_jobs": 35,
+        "instant_jobs_enabled": False,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    config = load_account_pool_config(settings, path=path)
+
+    assert config.human_like_behavior_enabled is False
+    assert config.worker_poll_seconds == 2.5
+    assert config.max_queued_production_jobs == 35
+    assert config.instant_jobs_enabled is False
+
+    path.write_text(json.dumps({**payload, "worker_poll_seconds": 0}), encoding="utf-8")
+    with pytest.raises(ValueError, match="worker_poll_seconds"):
+        load_account_pool_config(settings, path=path)
+
+    path.write_text(
+        json.dumps({**payload, "max_queued_production_jobs": 10_001}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="max_queued_production_jobs"):
+        load_account_pool_config(settings, path=path)
+
+
 def test_pool_config_rejects_credentials_and_emails(tmp_path: Path) -> None:
     from cbrs.account_pool import load_account_pool_config
 
@@ -842,21 +874,46 @@ def test_pool_dashboard_api_and_html_are_sanitized(
     assert "<th>N.º diario</th>" in html
     assert "documentOrdinals" in html
     assert "attempt-details" in html
-    assert "attempt-account" in html
+    assert "attempt-account-groups" in html
+    assert "attempt-account-group" in html
+    assert "attempt-history" in html
+    assert "attempt-disclosure-input" in html
+    assert "renderedJobsSignature" in html
+    assert "Último ${escapeHtml(latest.number)}" in html
     assert "No intentado" in html
     assert "shortJobId" in html
     assert "table-scroll" in html
     assert "captchaPhaseLabels" in html
+    assert "captchaSolver.daily_limit" in html
+    assert 'id="captchaAttempts"' in html
+    assert "renderCaptchaAttempts" in html
+    assert "captcha_attempts" in html
+    assert 'class="jobs-table captcha-attempts-table"' in html
+    assert ".jobs-table thead th { position: static;" in html
+    assert "restore probado" in html
     assert "recovery-spinner" in html
     assert "renderStopButton" in html
     assert "Deteniendo…" in html
     assert "Reanudar worker" in html
+    assert 'class="runtime-status-card"' in html
+    assert "Sin worker activo · listo para iniciar." in html
     assert "Configurar cuentas" in html
     assert "Agregar a cola" in html
     assert "Buscar y descargar ahora" in html
     assert "Por empresa" in html
     assert "Por documento" in html
     assert 'id="openExamples"' in html
+    assert 'id="productionSettingsModal"' in html
+    assert 'id="configureProduction"' in html
+    assert 'id="themeToggle"' in html
+    assert 'cbrs-dashboard-theme' in html
+    assert ':root[data-theme="dark"]' in html
+    assert 'aria-label="Activar modo oscuro"' in html
+    assert "grid-template-rows: auto minmax(0, 1fr) auto" in html
+    assert "scrollbar-gutter: stable" in html
+    assert "lucide@1.33.0" in html
+    assert "Comportamiento humano" in html
+    assert "Protecciones activas" in html
     assert "/api/examples" in html
     assert "data-preview-job" in html
     assert "pdfPreviewModal" in html
@@ -866,6 +923,7 @@ def test_pool_dashboard_api_and_html_are_sanitized(
     assert "email" not in serialized.lower()
     assert "password" not in serialized.lower()
     assert payload["runtime"]["visual_url"].startswith("http://localhost:6080/")
+    assert payload["runtime"]["visual_recovery_mode"] == "noVNC"
     assert "[REDACTED_IP]" not in payload["runtime"]["visual_url"]
     assert payload["pool"]["daily_quota"] == 60
     assert content.startswith(b"%PDF")
@@ -935,8 +993,7 @@ def test_pool_dashboard_can_trigger_manual_captcha_recovery(tmp_path: Path) -> N
     assert "captchaBreath" in html
     assert "--wave-index" in html
     assert ".jobs-table thead th" in html
-    assert "position: sticky" in html
-    assert "top: 64px" in html
+    assert ".jobs-table thead th { position: static;" in html
     assert payload == {"ok": True, "status": "started", "account_id": "ejecutivo_1"}
     assert calls == ["ejecutivo_1"]
 

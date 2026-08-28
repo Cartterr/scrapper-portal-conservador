@@ -3,12 +3,15 @@ from __future__ import annotations
 import logging
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 
 from .browser_runtime import detect_browser
+from .captcha_budget import CaptchaBudgetError, CaptchaBudgetStore
+from .captcha_solver import TwoCaptchaClient, TwoCaptchaError, TwoCaptchaResult
 from .cloak import apply_cloak_environment, cloak_launch_args, cloak_proxy
 from .config import SETTINGS, Settings
 from .safety import SafetyStopException, StopReason, classify_response
@@ -30,6 +33,14 @@ class BrowserFetchResponse:
     headers: dict[str, str]
     body_text: str | None = None
     body_base64: str | None = None
+
+
+@dataclass(frozen=True, repr=False)
+class RecaptchaSolution:
+    token: str
+    source: str
+    attempt_id: str | None = None
+    provider_task_id: int | None = None
 
 
 class CredentialsRejectedError(RuntimeError):
@@ -276,6 +287,14 @@ class BrowserSession:
         return "browser_form"
 
     def generate_recaptcha_token(self, action: str) -> str:
+        return self.generate_recaptcha_solution(action).token
+
+    def generate_recaptcha_solution(self, action: str) -> RecaptchaSolution:
+        if self.settings.captcha_solver_mode == "2captcha" or (
+            self.settings.captcha_solver_mode == "2captcha_manual"
+            and self.has_external_recaptcha_fallback
+        ):
+            return self.generate_external_recaptcha_solution(action)
         self._ensure_recaptcha_ready()
         token = self.page.evaluate(
             """async ({ sitekey, action }) => {
@@ -290,7 +309,135 @@ class BrowserSession:
                 context="recaptcha",
             )
         logger.debug("Generated reCAPTCHA token for action=%s", action)
-        return token
+        return RecaptchaSolution(token=token, source="browser")
+
+    @property
+    def has_external_recaptcha_fallback(self) -> bool:
+        if self.settings.captcha_solver_mode == "2captcha_fallback":
+            return True
+        if self.settings.captcha_solver_mode != "2captcha_manual":
+            return False
+        return self._captcha_budget().manual_armed(
+            account_id=self.settings.account_id or "unassigned"
+        )
+
+    def generate_external_recaptcha_token(self, action: str) -> str:
+        return self.generate_external_recaptcha_solution(action).token
+
+    def generate_external_recaptcha_solution(self, action: str) -> RecaptchaSolution:
+        api_key = self.settings.two_captcha_api_key
+        if not api_key:
+            raise SafetyStopException(
+                StopReason.CAPTCHA_SOLVER,
+                "2Captcha is enabled but its API key is not configured.",
+                context="recaptcha solver",
+            )
+        page_url = (
+            self._url("/login")
+            if action == "login"
+            else self.settings.commerce_url
+        )
+        client = TwoCaptchaClient(
+            api_key,
+            timeout_seconds=self.settings.two_captcha_timeout_seconds,
+            poll_seconds=self.settings.two_captcha_poll_seconds,
+        )
+        budget = self._captcha_budget()
+        try:
+            reservation = budget.reserve(
+                account_id=self.settings.account_id or "unassigned",
+                action=action,
+                require_manual_authorization=(
+                    self.settings.captcha_solver_mode == "2captcha_manual"
+                ),
+            )
+        except CaptchaBudgetError as exc:
+            raise SafetyStopException(
+                StopReason.CAPTCHA_SOLVER,
+                f"2Captcha solver stopped with {exc.code}.",
+                context="recaptcha solver",
+            ) from exc
+        started = time.monotonic()
+        try:
+            task = {
+                "website_url": page_url,
+                "website_key": self.settings.recaptcha_sitekey,
+                "page_action": action,
+                "min_score": self.settings.two_captcha_min_score,
+            }
+            if hasattr(client, "solve_recaptcha_v3_enterprise_result"):
+                result = client.solve_recaptcha_v3_enterprise_result(**task)
+            else:  # Compatibility for injected clients implementing the public token API.
+                result = TwoCaptchaResult(client.solve_recaptcha_v3_enterprise(**task))
+        except TwoCaptchaError as exc:
+            disable_external = exc.code in {
+                "ERROR_ZERO_BALANCE",
+                "ERROR_WRONG_USER_KEY",
+                "ERROR_KEY_DOES_NOT_EXIST",
+            }
+            budget.finish(
+                reservation,
+                status="failed",
+                error_code=exc.code,
+                latency_seconds=time.monotonic() - started,
+                open_circuit=exc.code in {
+                    "NETWORK_ERROR",
+                    "TIMEOUT",
+                    "ERROR_NO_SLOT_AVAILABLE",
+                    "ERROR_ZERO_BALANCE",
+                    "ERROR_WRONG_USER_KEY",
+                }
+                or exc.code.startswith("HTTP_"),
+                disable_external=disable_external,
+            )
+            reason = (
+                StopReason.CAPTCHA_REJECTED
+                if exc.code == "ERROR_CAPTCHA_UNSOLVABLE"
+                else StopReason.CAPTCHA_SOLVER
+            )
+            raise SafetyStopException(
+                reason,
+                f"2Captcha solver stopped with {exc.code}.",
+                context="recaptcha solver",
+            ) from exc
+        budget.finish(
+            reservation,
+            status="succeeded",
+            cost_usd=result.cost_usd,
+            latency_seconds=time.monotonic() - started,
+        )
+        logger.info("Generated reCAPTCHA token with 2Captcha for action=%s", action)
+        return RecaptchaSolution(
+            token=result.token,
+            source="2captcha",
+            attempt_id=reservation.attempt_id,
+            provider_task_id=result.task_id,
+        )
+
+    def record_external_recaptcha_outcome(
+        self,
+        solution: RecaptchaSolution,
+        *,
+        status: str,
+        error_code: str | None = None,
+    ) -> None:
+        if solution.source != "2captcha" or not solution.attempt_id:
+            return
+        self._captcha_budget().record_portal_outcome(
+            solution.attempt_id,
+            status=status,
+            error_code=error_code,
+        )
+
+    def _captcha_budget(self) -> CaptchaBudgetStore:
+        return CaptchaBudgetStore(
+            self.settings.captcha_state_path,
+            daily_limit=self.settings.two_captcha_daily_limit,
+            circuit_seconds=self.settings.two_captcha_circuit_breaker_seconds,
+            rejection_cooldown_seconds=(
+                self.settings.two_captcha_rejection_cooldown_seconds
+            ),
+        )
 
     def _login_with_fetch(self, username: str, password: str) -> None:
         self.goto_index()
@@ -301,17 +448,61 @@ class BrowserSession:
         )
         if home.status != 200:
             raise RuntimeError(f"CBRS home bootstrap returned HTTP {home.status}.")
-        token = self.generate_recaptcha_token("login")
-        response = self.fetch_json(
+        solution = self.generate_recaptcha_solution("login")
+        response = self._fetch_login(username, password, solution.token)
+        try:
+            self._check_login_response(response)
+        except SafetyStopException as exc:
+            self.record_external_recaptcha_outcome(
+                solution,
+                status=(
+                    "rejected"
+                    if exc.reason == StopReason.CAPTCHA_REJECTED
+                    else "indeterminate"
+                ),
+                error_code=exc.reason.value,
+            )
+            if (
+                exc.reason != StopReason.CAPTCHA_REJECTED
+                or solution.source == "2captcha"
+                or not self.has_external_recaptcha_fallback
+            ):
+                raise
+            logger.info("Retrying rejected login CAPTCHA once with 2Captcha")
+            solution = self.generate_external_recaptcha_solution("login")
+            response = self._fetch_login(username, password, solution.token)
+            try:
+                self._check_login_response(response)
+            except SafetyStopException as external_exc:
+                self.record_external_recaptcha_outcome(
+                    solution,
+                    status=(
+                        "rejected"
+                        if external_exc.reason == StopReason.CAPTCHA_REJECTED
+                        else "indeterminate"
+                    ),
+                    error_code=external_exc.reason.value,
+                )
+                raise
+            self.record_external_recaptcha_outcome(solution, status="accepted")
+            return
+        self.record_external_recaptcha_outcome(solution, status="accepted")
+
+    def _fetch_login(
+        self,
+        username: str,
+        password: str,
+        recaptcha_token: str,
+    ) -> BrowserFetchResponse:
+        return self.fetch_json(
             "/api/v1/auth/login",
             headers={
                 "Accept": "application/json, text/plain, */*",
                 "Content-Type": "application/json",
-                "recaptcha-token": token,
+                "recaptcha-token": recaptcha_token,
             },
             body={"email": username, "password": password},
         )
-        self._check_login_response(response)
 
     def _login_with_form(self, username: str, password: str) -> None:
         self.page.goto(

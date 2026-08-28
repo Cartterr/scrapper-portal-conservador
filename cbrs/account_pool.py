@@ -87,7 +87,12 @@ class PoolConfig:
     targets: tuple[PoolTarget, ...]
     job_interval_min_seconds: float = 0.0
     job_interval_max_seconds: float = 0.0
+    human_like_behavior_enabled: bool = True
+    worker_poll_seconds: float = 5.0
+    max_queued_production_jobs: int = 100
+    instant_jobs_enabled: bool = True
     allow_live_repetition: bool = False
+    selection_policy: str = "round_robin"
 
     @property
     def pool_daily_quota(self) -> int:
@@ -771,7 +776,16 @@ def load_account_pool_config(
         ),
         job_interval_min_seconds=float(raw.get("job_interval_min_seconds", 0)),
         job_interval_max_seconds=float(raw.get("job_interval_max_seconds", 0)),
+        human_like_behavior_enabled=bool(
+            raw.get("human_like_behavior_enabled", True)
+        ),
+        worker_poll_seconds=float(raw.get("worker_poll_seconds", 5)),
+        max_queued_production_jobs=int(
+            raw.get("max_queued_production_jobs", 100)
+        ),
+        instant_jobs_enabled=bool(raw.get("instant_jobs_enabled", True)),
         allow_live_repetition=allow_live_repetition,
+        selection_policy=str(raw.get("selection_policy", "round_robin")),
     )
     if config.daily_quota_per_account <= 0:
         raise ValueError("daily_quota_per_account must be greater than zero")
@@ -785,6 +799,12 @@ def load_account_pool_config(
         )
     if not any(account.enabled for account in config.accounts):
         raise ValueError("account pool requires at least one enabled account")
+    if config.selection_policy != "round_robin":
+        raise ValueError("selection_policy must be 'round_robin'")
+    if config.worker_poll_seconds < 0.1 or config.worker_poll_seconds > 300:
+        raise ValueError("worker_poll_seconds must be between 0.1 and 300")
+    if not 1 <= config.max_queued_production_jobs <= 10_000:
+        raise ValueError("max_queued_production_jobs must be between 1 and 10000")
     proxy_refs = [
         account.proxy_url_env
         for account in config.accounts
@@ -823,10 +843,15 @@ def account_settings(settings: Settings, account: PoolAccount) -> Settings:
                 f"Pool account {account.account_id} requires env var "
                 f"{account.proxy_url_env} with its proxy URL."
             )
+    if proxy_url and settings.use_curl_cffi_for_images:
+        raise ValueError(
+            "CBRS_USE_CURL_CFFI_FOR_IMAGES cannot be enabled for a proxied pool account."
+        )
     return replace(
         settings,
         profile_dir=profile_dir.resolve(),
         proxy_url=proxy_url,
+        account_id=account.account_id,
     )
 
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import subprocess
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -31,6 +32,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("environment file contains an invalid key")
         if value is not None:
             environment[key] = str(value)
+    if os.name == "nt":
+        return subprocess.run(command, env=environment, check=False).returncode
     os.execvpe(command[0], command, environment)
     return 127
 

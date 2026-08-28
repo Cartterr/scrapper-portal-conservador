@@ -7,9 +7,9 @@ import time
 from typing import Any
 from urllib.parse import urlparse
 
-from .browser_session import BrowserSession
+from .browser_session import BrowserSession, RecaptchaSolution
 from .config import SETTINGS, Settings
-from .safety import ensure_safe_response
+from .safety import SafetyStopException, StopReason, ensure_safe_response
 
 logger = logging.getLogger(__name__)
 
@@ -76,21 +76,145 @@ class BrowserOriginClient:
         if auth:
             headers["Authorization"] = f"Bearer {self.ensure_auth()}"
 
+        solution: RecaptchaSolution | None = None
         if captcha_action:
-            captcha_token = self.browser.generate_recaptcha_token(captcha_action)
-            headers["recaptcha-token"] = captcha_token
-            if include_recaptcha_in_body:
-                payload["recaptchaToken"] = captcha_token
+            solution = self._generate_recaptcha_solution(captcha_action)
+            self._set_captcha_token(
+                headers,
+                payload,
+                solution.token,
+                include_in_body=include_recaptcha_in_body,
+            )
 
-        self._pace(context)
-        response = self.browser.fetch_json(path, headers=headers, body=payload)
-        ensure_safe_response(
-            response.status,
-            response.headers,
-            response.body_text,
-            context=context,
-        )
+        try:
+            response = self._post_json_response(path, headers, payload, context=context)
+        except Exception:
+            self._record_external_outcome(
+                solution,
+                status="not_submitted",
+                error_code="transport_error",
+            )
+            raise
+        try:
+            ensure_safe_response(
+                response.status,
+                response.headers,
+                response.body_text,
+                context=context,
+            )
+        except SafetyStopException as exc:
+            self._record_external_outcome(
+                solution,
+                status=(
+                    "rejected"
+                    if exc.reason == StopReason.CAPTCHA_REJECTED
+                    else "indeterminate"
+                ),
+                error_code=exc.reason.value,
+            )
+            if (
+                exc.reason != StopReason.CAPTCHA_REJECTED
+                or not captcha_action
+                or (solution is not None and solution.source == "2captcha")
+                or not self.browser.has_external_recaptcha_fallback
+            ):
+                raise
+            logger.info("Retrying rejected %s CAPTCHA once with 2Captcha", context)
+            solution = self._generate_recaptcha_solution(captcha_action, external=True)
+            self._set_captcha_token(
+                headers,
+                payload,
+                solution.token,
+                include_in_body=include_recaptcha_in_body,
+            )
+            try:
+                response = self._post_json_response(path, headers, payload, context=context)
+                ensure_safe_response(
+                    response.status,
+                    response.headers,
+                    response.body_text,
+                    context=context,
+                )
+            except SafetyStopException as external_exc:
+                self._record_external_outcome(
+                    solution,
+                    status=(
+                        "rejected"
+                        if external_exc.reason == StopReason.CAPTCHA_REJECTED
+                        else "indeterminate"
+                    ),
+                    error_code=external_exc.reason.value,
+                )
+                raise
+            except Exception:
+                self._record_external_outcome(
+                    solution,
+                    status="not_submitted",
+                    error_code="transport_error",
+                )
+                raise
+        self._record_external_outcome(solution, status="accepted")
         return self._parse_json(response.body_text, context=context)
+
+    def _generate_recaptcha_solution(
+        self,
+        action: str,
+        *,
+        external: bool = False,
+    ) -> RecaptchaSolution:
+        method_name = (
+            "generate_external_recaptcha_solution"
+            if external
+            else "generate_recaptcha_solution"
+        )
+        method = getattr(self.browser, method_name, None)
+        if callable(method):
+            return method(action)
+        token_method = (
+            self.browser.generate_external_recaptcha_token
+            if external
+            else self.browser.generate_recaptcha_token
+        )
+        return RecaptchaSolution(
+            token=token_method(action),
+            source="2captcha" if external else "browser",
+        )
+
+    def _record_external_outcome(
+        self,
+        solution: RecaptchaSolution | None,
+        *,
+        status: str,
+        error_code: str | None = None,
+    ) -> None:
+        if solution is None or solution.source != "2captcha":
+            return
+        recorder = getattr(self.browser, "record_external_recaptcha_outcome", None)
+        if callable(recorder):
+            recorder(solution, status=status, error_code=error_code)
+
+    def _post_json_response(
+        self,
+        path: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        *,
+        context: str,
+    ):
+        self._pace(context)
+        return self.browser.fetch_json(path, headers=headers, body=payload)
+
+    @staticmethod
+    def _set_captcha_token(
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        token: str,
+        *,
+        include_in_body: bool,
+    ) -> None:
+        headers["recaptcha-token"] = token
+        if include_in_body:
+            payload["recaptchaToken"] = token
 
     def get_bytes(self, path: str, *, context: str) -> bytes:
         self.ensure_auth()

@@ -27,6 +27,7 @@ from .account_pool import (
     load_account_pool_config,
     local_today,
     next_quota_reset_at,
+    seconds_since,
     utc_now,
 )
 from .browser_session import CredentialsRejectedError
@@ -48,7 +49,9 @@ JOB_STATES = frozenset(
 )
 CLAIMABLE_JOB_STATES = ("queued", "waiting_capacity", "waiting_captcha")
 TERMINAL_JOB_STATES = frozenset({"completed", "partial", "failed", "cancelled"})
-GLOBAL_SAFETY_REASONS = frozenset({StopReason.RATE_LIMIT, StopReason.WAF_CHALLENGE})
+GLOBAL_SAFETY_REASONS = frozenset(
+    {StopReason.RATE_LIMIT, StopReason.WAF_CHALLENGE}
+)
 WORKER_LEASE_NAME = "portal_worker"
 WORKER_STALE_SECONDS = 120
 JOB_LEASE_SECONDS = 180
@@ -69,6 +72,7 @@ class Job:
     created_at: str
     updated_at: str
     cancel_requested: bool = False
+    source: str = "production"
 
 
 @dataclass(frozen=True)
@@ -117,6 +121,7 @@ class JobStore:
                     input_json TEXT NOT NULL,
                     idempotency_key TEXT UNIQUE,
                     status TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'production',
                     priority INTEGER NOT NULL DEFAULT 0,
                     result_count INTEGER,
                     completed_items INTEGER NOT NULL DEFAULT 0,
@@ -200,6 +205,7 @@ class JobStore:
                     account_id TEXT PRIMARY KEY,
                     session_checked_date TEXT,
                     proxy_checked_date TEXT,
+                    proxy_checked_at TEXT,
                     proxy_status TEXT,
                     egress_hash TEXT,
                     updated_at TEXT NOT NULL
@@ -229,12 +235,26 @@ class JobStore:
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS account_rotation (
+                    name TEXT PRIMARY KEY,
+                    next_index INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS endurance_state (
+                    name TEXT PRIMARY KEY,
+                    paused INTEGER NOT NULL DEFAULT 0,
+                    sequence INTEGER NOT NULL DEFAULT 0,
+                    fixture_index INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             db.execute(
                 """
                 INSERT INTO schema_versions(component, version, applied_at)
-                VALUES ('jobs', 3, ?)
+                VALUES ('jobs', 5, ?)
                 ON CONFLICT(component) DO UPDATE SET
                     version = MAX(version, excluded.version),
                     applied_at = CASE
@@ -250,12 +270,26 @@ class JobStore:
             }
             if "egress_hash" not in columns:
                 db.execute("ALTER TABLE account_checks ADD COLUMN egress_hash TEXT")
+            if "proxy_checked_at" not in columns:
+                db.execute("ALTER TABLE account_checks ADD COLUMN proxy_checked_at TEXT")
             job_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(jobs)").fetchall()
             }
             if "priority" not in job_columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+            if "source" not in job_columns:
+                db.execute(
+                    "ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'production'"
+                )
+            db.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_endurance_job
+                ON jobs(source)
+                WHERE source = 'endurance'
+                  AND status IN ('queued','running','waiting_capacity','waiting_captcha')
+                """
+            )
             db.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_jobs_claim_priority
@@ -270,10 +304,13 @@ class JobStore:
         input_data: Mapping[str, Any],
         idempotency_key: str | None = None,
         priority: int = 0,
+        source: str = "production",
     ) -> tuple[dict[str, Any], bool]:
         normalized = normalize_job_input(kind, input_data)
         key = _normalize_idempotency_key(idempotency_key)
-        priority = 1 if int(priority) > 0 else 0
+        priority = max(-100, min(int(priority), 100))
+        if source not in {"production", "endurance"}:
+            raise ValueError("job source must be production or endurance")
         now = utc_now()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -292,14 +329,16 @@ class JobStore:
             db.execute(
                 """
                 INSERT INTO jobs(
-                    job_id, kind, input_json, idempotency_key, status,
+                    job_id, kind, input_json, idempotency_key, status, source,
                     priority, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)
                 """,
-                (job_id, kind, stable_json(normalized), key, priority, now, now),
+                (job_id, kind, stable_json(normalized), key, source, priority, now, now),
             )
             row = db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
-            self._add_event_db(db, job_id, "job_enqueued", {"kind": kind, "priority": priority})
+            self._add_event_db(
+                db, job_id, "job_enqueued", {"kind": kind, "priority": priority, "source": source}
+            )
             return self._job_payload(db, row), True
 
     def get_job(self, job_id: str, *, include_input: bool = False) -> dict[str, Any] | None:
@@ -712,6 +751,9 @@ class JobStore:
         quota_date: str,
         excluded: set[str] | None = None,
         preferred_account_id: str | None = None,
+        quota_by_account: Mapping[str, int] | None = None,
+        source: str = "production",
+        source_quota_by_account: Mapping[str, int] | None = None,
     ) -> PoolAccount | None:
         excluded = excluded or set()
         with self.connect() as db:
@@ -719,7 +761,7 @@ class JobStore:
                 "SELECT account_id, status FROM accounts WHERE run_id = ?", (run_id,)
             ).fetchall()
             statuses = {str(row["account_id"]): str(row["status"]) for row in rows}
-            candidates: list[tuple[int, str, int, PoolAccount]] = []
+            candidates: dict[str, PoolAccount] = {}
             for index, account in enumerate(config.accounts):
                 if (
                     not account.enabled
@@ -728,26 +770,56 @@ class JobStore:
                 ):
                     continue
                 used = self._account_usage_db(db, account.account_id, quota_date)
-                if used >= config.quota_for(account):
+                quota = (
+                    int(quota_by_account[account.account_id])
+                    if quota_by_account and account.account_id in quota_by_account
+                    else config.quota_for(account)
+                )
+                if used >= quota:
                     continue
-                last = db.execute(
-                    """
-                    SELECT last_used_at FROM account_daily_usage
-                    WHERE account_id = ? AND quota_date = ?
-                    """,
-                    (account.account_id, quota_date),
-                ).fetchone()
-                candidates.append((used, str(last["last_used_at"] or "") if last else "", index, account))
+                if source_quota_by_account and account.account_id in source_quota_by_account:
+                    source_used = int(
+                        db.execute(
+                            """
+                            SELECT COUNT(*) FROM job_attempts a
+                            JOIN jobs j ON j.job_id = a.job_id
+                            WHERE a.account_id = ? AND a.quota_date = ?
+                              AND a.quota_consumed = 1 AND j.source = ?
+                            """,
+                            (account.account_id, quota_date, source),
+                        ).fetchone()[0]
+                    )
+                    if source_used >= int(source_quota_by_account[account.account_id]):
+                        continue
+                candidates[account.account_id] = account
             if not candidates:
                 return None
             if preferred_account_id:
-                preferred = next(
-                    (value[3] for value in candidates if value[3].account_id == preferred_account_id),
-                    None,
-                )
+                preferred = candidates.get(preferred_account_id)
                 if preferred is not None:
                     return preferred
-            return min(candidates, key=lambda value: (value[0], value[1], value[2]))[3]
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT next_index FROM account_rotation WHERE name = 'jobs'"
+            ).fetchone()
+            start = int(row["next_index"]) if row else 0
+            for offset in range(len(config.accounts)):
+                index = (start + offset) % len(config.accounts)
+                account = config.accounts[index]
+                if account.account_id not in candidates:
+                    continue
+                db.execute(
+                    """
+                    INSERT INTO account_rotation(name, next_index, updated_at)
+                    VALUES ('jobs', ?, ?)
+                    ON CONFLICT(name) DO UPDATE SET
+                        next_index = excluded.next_index,
+                        updated_at = excluded.updated_at
+                    """,
+                    ((index + 1) % len(config.accounts), utc_now()),
+                )
+                return account
+            return None
 
     def usage_by_account(self, quota_date: str) -> dict[str, int]:
         with self.connect() as db:
@@ -771,6 +843,18 @@ class JobStore:
                 )
             return result
 
+    def outstanding_job_count(self, *, source: str = "production") -> int:
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT COUNT(*) AS count FROM jobs
+                WHERE source = ?
+                  AND status IN ('queued','running','waiting_capacity','waiting_captcha')
+                """,
+                (source,),
+            ).fetchone()
+        return int(row["count"] or 0)
+
     def set_account_check(
         self,
         account_id: str,
@@ -785,12 +869,13 @@ class JobStore:
             db.execute(
                 """
                 INSERT INTO account_checks(
-                    account_id, session_checked_date, proxy_checked_date,
+                    account_id, session_checked_date, proxy_checked_date, proxy_checked_at,
                     proxy_status, egress_hash, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id) DO UPDATE SET
                     session_checked_date = COALESCE(excluded.session_checked_date, session_checked_date),
                     proxy_checked_date = COALESCE(excluded.proxy_checked_date, proxy_checked_date),
+                    proxy_checked_at = COALESCE(excluded.proxy_checked_at, proxy_checked_at),
                     proxy_status = COALESCE(excluded.proxy_status, proxy_status),
                     egress_hash = COALESCE(excluded.egress_hash, egress_hash),
                     updated_at = excluded.updated_at
@@ -799,6 +884,7 @@ class JobStore:
                     account_id,
                     today if session_checked else None,
                     today if proxy_status is not None else None,
+                    now if proxy_status is not None else None,
                     proxy_status,
                     egress_hash,
                     now,
@@ -843,6 +929,42 @@ class JobStore:
                 (status, next_run_at, reason, redact_text(reason), utc_now(), job_id),
             )
             self._add_event_db(db, job_id, f"job_{status}", {"reason": reason}, level="warning")
+
+    def release_waiting_captcha(self) -> int:
+        """Make CAPTCHA-blocked jobs immediately claimable after manual authorization."""
+        with self.connect() as db:
+            changed = db.execute(
+                """
+                UPDATE jobs SET status = 'queued', next_run_at = NULL,
+                    error_code = NULL, error_message = NULL, updated_at = ?
+                WHERE status = 'waiting_captcha'
+                """,
+                (utc_now(),),
+            ).rowcount
+        return int(changed)
+
+    def set_next_account(self, account_id: str, config: PoolConfig) -> None:
+        index = next(
+            (
+                index
+                for index, account in enumerate(config.accounts)
+                if account.account_id == account_id
+            ),
+            None,
+        )
+        if index is None:
+            raise ValueError(f"Unknown pool account: {account_id}")
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO account_rotation(name, next_index, updated_at)
+                VALUES ('jobs', ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    next_index = excluded.next_index,
+                    updated_at = excluded.updated_at
+                """,
+                (index, utc_now()),
+            )
 
     def finalize_job(self, job_id: str) -> str:
         now = utc_now()
@@ -1059,6 +1181,7 @@ class JobStore:
         payload = {
             "job_id": row["job_id"],
             "kind": row["kind"],
+            "source": row["source"],
             "status": row["status"],
             "idempotency_key": row["idempotency_key"],
             "priority": int(row["priority"] or 0),
@@ -1294,12 +1417,14 @@ def run_job_worker(
     headless: bool | None = None,
     once: bool = False,
     max_jobs: int | None = None,
-    poll_seconds: float = 5.0,
+    poll_seconds: float | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
     scraper_factory: Callable[..., Any] | None = None,
     preflight_runner: Callable[..., Any] | None = None,
     proxy_health_runner: Callable[..., Any] | None = None,
+    endurance_plan: Any | None = None,
 ) -> WorkerResult:
+    from .endurance import EnduranceController, load_endurance_plan
     from .preflight import run_preflight
     from .proxy_health import run_proxy_health
     from .scraper import CBRSScraper
@@ -1310,6 +1435,13 @@ def run_job_worker(
     scraper_factory = scraper_factory or CBRSScraper
     preflight_runner = preflight_runner or run_preflight
     proxy_health_runner = proxy_health_runner or run_proxy_health
+    endurance_plan = endurance_plan or load_endurance_plan(
+        settings.profile_dir.parent / "endurance-plan.json"
+    )
+    endurance = EnduranceController(store, endurance_plan, config)
+    runtime_poll_seconds = (
+        config.worker_poll_seconds if poll_seconds is None else float(poll_seconds)
+    )
     runtime_headless = settings.headless if headless is None else headless
     worker_id = f"{socket.gethostname()}-{os.getpid()}-{secrets.token_hex(3)}"
     if not store.acquire_lease(WORKER_LEASE_NAME, worker_id):
@@ -1365,13 +1497,14 @@ def run_job_worker(
                 final_status = "safety_stop"
                 exit_code = 2
                 break
+            endurance.maybe_enqueue()
             job = store.claim_next(worker_id)
             if job is None:
                 if once:
                     final_status = "idle"
                     break
                 pool_store.update_run(run_id, status="waiting", next_cycle_at="")
-                sleep_fn(max(0.1, poll_seconds))
+                sleep_fn(max(0.1, runtime_poll_seconds))
                 continue
             processed += 1
             pool_store.update_run(run_id, status="running", next_cycle_at="")
@@ -1386,6 +1519,7 @@ def run_job_worker(
                 scraper_factory=scraper_factory,
                 preflight_runner=preflight_runner,
                 proxy_health_runner=proxy_health_runner,
+                endurance_plan=endurance_plan,
             )
             if outcome == "safety_stop":
                 final_status = outcome
@@ -1395,8 +1529,11 @@ def run_job_worker(
                 final_status = outcome
                 break
             if outcome in {"waiting_capacity", "waiting_captcha"}:
-                sleep_fn(max(0.1, poll_seconds))
-            elif config.job_interval_max_seconds > 0:
+                sleep_fn(max(0.1, runtime_poll_seconds))
+            elif (
+                config.human_like_behavior_enabled
+                and config.job_interval_max_seconds > 0
+            ):
                 sleep_fn(
                     random.uniform(
                         config.job_interval_min_seconds,
@@ -1441,10 +1578,9 @@ def _process_claimed_job(
     scraper_factory: Callable[..., Any],
     preflight_runner: Callable[..., Any],
     proxy_health_runner: Callable[..., Any],
+    endurance_plan: Any | None = None,
 ) -> str:
     excluded: set[str] = set()
-    restarted_accounts: set[str] = set()
-    preferred_account_id: str | None = None
     quota_date = local_today()
     while True:
         if store.cancel_requested(job.job_id):
@@ -1454,9 +1590,13 @@ def _process_claimed_job(
             config=config,
             quota_date=quota_date,
             excluded=excluded,
-            preferred_account_id=preferred_account_id,
+            source=job.source,
+            source_quota_by_account=(
+                endurance_plan.source_quota(config)
+                if job.source == "endurance" and endurance_plan is not None
+                else None
+            ),
         )
-        preferred_account_id = None
         if account is None:
             status = _unavailable_job_status(pool_store, run_id, config, excluded)
             store.set_waiting(job.job_id, status, reason=status)
@@ -1468,7 +1608,20 @@ def _process_claimed_job(
             )
             return status
         excluded.add(account.account_id)
-        runtime_settings = account_settings(settings, account)
+        try:
+            runtime_settings = account_settings(settings, account)
+        except ValueError as exc:
+            pool_store.pause_account(
+                run_id, account.account_id, reason="account_configuration_invalid"
+            )
+            store.add_event(
+                "account_configuration_invalid",
+                job_id=job.job_id,
+                account_id=account.account_id,
+                level="error",
+                data={"error": str(exc)},
+            )
+            continue
         if not _ensure_account_gate(
             account,
             runtime_settings,
@@ -1656,25 +1809,15 @@ def _process_claimed_job(
                 proxy_health_runner,
                 force=True,
             )
-            transient_browser_failure = _looks_like_connection_failure(exc)
-            if (
-                gate_ok
-                and transient_browser_failure
-                and account.account_id not in restarted_accounts
-            ):
-                restarted_accounts.add(account.account_id)
-                excluded.discard(account.account_id)
-                preferred_account_id = account.account_id
-                store.add_event(
-                    "account_browser_context_restarting",
-                    job_id=job.job_id,
-                    account_id=account.account_id,
-                    level="warning",
-                )
-                continue
             if gate_ok:
                 pool_store.pause_account(
-                    run_id, account.account_id, reason="unexpected_worker_failure"
+                    run_id,
+                    account.account_id,
+                    reason=(
+                        "browser_context_failed"
+                        if _looks_like_connection_failure(exc)
+                        else "unexpected_worker_failure"
+                    ),
                 )
             store.add_event(
                 "account_paused_after_failure",
@@ -1705,7 +1848,19 @@ def _run_startup_gates(
             continue
         if states.get(account.account_id) == CAPTCHA_PENDING_STATUS:
             continue
-        runtime_settings = account_settings(settings, account)
+        try:
+            runtime_settings = account_settings(settings, account)
+        except ValueError as exc:
+            pool_store.pause_account(
+                run_id, account.account_id, reason="account_configuration_invalid"
+            )
+            store.add_event(
+                "account_configuration_invalid",
+                account_id=account.account_id,
+                level="error",
+                data={"error": str(exc)},
+            )
+            continue
         gate_ok = _ensure_account_gate(
             account,
             runtime_settings,
@@ -1772,9 +1927,13 @@ def _ensure_account_gate(
     force: bool = False,
 ) -> bool:
     check = store.account_check(account.account_id) or {}
-    if not force and check.get("proxy_checked_date") == local_today() and check.get(
-        "proxy_status"
-    ) == "passed":
+    proxy_checked_at = str(check.get("proxy_checked_at") or "")
+    if (
+        not force
+        and check.get("proxy_status") == "passed"
+        and proxy_checked_at
+        and seconds_since(proxy_checked_at) < settings.proxy_recheck_seconds
+    ):
         return True
     try:
         preflight = preflight_runner(settings, write_report=True)
@@ -1993,6 +2152,7 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
         cancel_requested=bool(row["cancel_requested"]),
+        source=str(row["source"]),
     )
 
 

@@ -1,5 +1,8 @@
 # Operación E2E autónoma en Ubuntu
 
+> **LEGACY:** la operación activa es Windows nativo. Usar
+> [`native-windows-endurance.md`](native-windows-endurance.md).
+
 ## Arquitectura soportada
 
 El entorno productivo soportado es Ubuntu. En estaciones Windows se desarrolla
@@ -17,8 +20,8 @@ Poderalia -> API 127.0.0.1 -> SQLite/WAL -> worker secuencial
 ```
 
 Se mantienen los componentes locales del proyecto: Python, Playwright, SQLite,
-Pillow y `ThreadingHTTPServer`. No existe un frontend Node, un servicio FastAPI,
-una base externa ni un solver de CAPTCHA.
+Pillow y `ThreadingHTTPServer`. No existe un frontend Node, un servicio FastAPI
+ni una base externa. El solver de CAPTCHA es opcional y se configura por entorno.
 
 ## Instalación Ubuntu
 

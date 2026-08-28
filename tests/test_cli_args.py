@@ -1,4 +1,6 @@
-from cbrs.cli import _runtime_headless, build_parser, main, missing_fna_fields
+from types import SimpleNamespace
+
+from cbrs.cli import _runtime_headless, build_parser, cmd_pool, main, missing_fna_fields
 
 
 def test_fna_requires_numero_and_ano() -> None:
@@ -124,6 +126,86 @@ def test_pool_dashboard_and_stop_parsers() -> None:
     assert stop_args.pool_command == "stop"
 
 
+def test_pool_proxy_health_records_successful_live_gate(monkeypatch) -> None:
+    accounts = [
+        SimpleNamespace(account_id="ejecutivo_1", label="Ejecutivo 1"),
+        SimpleNamespace(account_id="ejecutivo_2", label="Ejecutivo 2"),
+    ]
+    pool_config = SimpleNamespace(accounts=accounts)
+
+    class FakeJobStore:
+        def __init__(self) -> None:
+            self.checks = {}
+
+        def egress_owner(self, egress_hash, *, exclude_account):
+            return next(
+                (
+                    account_id
+                    for account_id, check in self.checks.items()
+                    if account_id != exclude_account
+                    and check["proxy_status"] == "passed"
+                    and check["egress_hash"] == egress_hash
+                ),
+                None,
+            )
+
+        def set_account_check(self, account_id, *, proxy_status, egress_hash=None):
+            self.checks[account_id] = {
+                "proxy_status": proxy_status,
+                "egress_hash": egress_hash,
+            }
+
+    job_store = FakeJobStore()
+    monkeypatch.setattr(
+        "cbrs.account_pool.load_account_pool_config", lambda *args, **kwargs: pool_config
+    )
+    monkeypatch.setattr("cbrs.account_pool.default_pool_store", lambda *args: object())
+    monkeypatch.setattr(
+        "cbrs.account_pool.account_settings", lambda settings, account: account.account_id
+    )
+    monkeypatch.setattr("cbrs.jobs.default_job_store", lambda *args: job_store)
+    monkeypatch.setattr(
+        "cbrs.cli.run_preflight",
+        lambda settings, **kwargs: SimpleNamespace(
+            ok=True,
+            report={
+                "egress_hash": f"hash-{settings}",
+                "checks": [],
+            },
+            report_path=None,
+        ),
+    )
+    monkeypatch.setattr(
+        "cbrs.proxy_health.run_proxy_health",
+        lambda settings, **kwargs: SimpleNamespace(
+            ok=True,
+            report={"checks": []},
+            report_path=None,
+        ),
+    )
+
+    result = cmd_pool(
+        SimpleNamespace(
+            pool_command="proxy-health",
+            config=None,
+            account=None,
+            approve_egress_baseline=False,
+        )
+    )
+
+    assert result == 0
+    assert job_store.checks == {
+        "ejecutivo_1": {
+            "proxy_status": "passed",
+            "egress_hash": "hash-ejecutivo_1",
+        },
+        "ejecutivo_2": {
+            "proxy_status": "passed",
+            "egress_hash": "hash-ejecutivo_2",
+        },
+    }
+
+
 def test_jobs_cli_parses_text_fna_worker_and_dashboard() -> None:
     parser = build_parser()
 
@@ -165,3 +247,12 @@ def test_readiness_cli_parses_offline_wsl_gate() -> None:
     assert args.target == "wsl"
     assert args.distro == "Ubuntu-24.04"
     assert args.probe_wsl_runtime is True
+
+
+def test_readiness_cli_can_require_active_native_runtime() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(["readiness", "--target", "windows", "--require-active-runtime"])
+
+    assert args.target == "windows"
+    assert args.require_active_runtime is True

@@ -1,4 +1,5 @@
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,8 @@ from cbrs.browser_session import (
     BrowserSession,
     CredentialsRejectedError,
 )
+from cbrs.captcha_solver import TwoCaptchaError
+from cbrs.captcha_budget import CaptchaBudgetStore
 from cbrs.safety import SafetyStopException, StopReason
 from cbrs.config import load_settings
 
@@ -363,6 +366,109 @@ def test_login_response_preserves_captcha_as_a_safety_stop(tmp_path: Path) -> No
             )
         )
     assert error.value.reason == StopReason.CAPTCHA_REJECTED
+
+
+def test_external_solver_uses_current_portal_page_and_enterprise_action(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = load_settings(
+        {
+            "CBRS_CAPTCHA_SOLVER_MODE": "2captcha",
+            "CBRS_2CAPTCHA_API_KEY": "private-key",
+        },
+        root=tmp_path,
+    )
+    session = BrowserSession(settings)
+    session._context = SimpleNamespace(
+        pages=[SimpleNamespace(url=f"{settings.base_url}/login")]
+    )
+    captured = {}
+
+    class FakeSolver:
+        def __init__(self, api_key, **kwargs):
+            captured["api_key"] = api_key
+            captured["client"] = kwargs
+
+        def solve_recaptcha_v3_enterprise(self, **kwargs):
+            captured["task"] = kwargs
+            return "external-token"
+
+    monkeypatch.setattr("cbrs.browser_session.TwoCaptchaClient", FakeSolver)
+
+    assert session.generate_recaptcha_token("login") == "external-token"
+    assert captured["api_key"] == "private-key"
+    assert captured["task"] == {
+        "website_url": f"{settings.base_url}/login",
+        "website_key": settings.recaptcha_sitekey,
+        "page_action": "login",
+        "min_score": 0.9,
+    }
+
+
+def test_external_solver_failure_is_sanitized_safety_stop(tmp_path: Path, monkeypatch) -> None:
+    settings = load_settings(
+        {
+            "CBRS_CAPTCHA_SOLVER_MODE": "2captcha",
+            "CBRS_2CAPTCHA_API_KEY": "private-key",
+        },
+        root=tmp_path,
+    )
+    session = BrowserSession(settings)
+    session._context = SimpleNamespace(pages=[SimpleNamespace(url=settings.commerce_url)])
+
+    class FakeSolver:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def solve_recaptcha_v3_enterprise(self, **_kwargs):
+            raise TwoCaptchaError("ERROR_ZERO_BALANCE", "private-key")
+
+    monkeypatch.setattr("cbrs.browser_session.TwoCaptchaClient", FakeSolver)
+
+    with pytest.raises(SafetyStopException) as error:
+        session.generate_recaptcha_token("login")
+
+    assert error.value.reason == StopReason.CAPTCHA_SOLVER
+    assert "private-key" not in str(error.value)
+
+
+def test_manual_solver_requires_and_consumes_one_account_authorization(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = replace(
+        load_settings(
+            {
+                "CBRS_CAPTCHA_SOLVER_MODE": "2captcha_manual",
+                "CBRS_2CAPTCHA_API_KEY": "private-key",
+            },
+            root=tmp_path,
+        ),
+        account_id="a1",
+    )
+    session = BrowserSession(settings)
+    session._context = SimpleNamespace(pages=[SimpleNamespace(url=settings.commerce_url)])
+
+    class FakeSolver:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def solve_recaptcha_v3_enterprise(self, **_kwargs):
+            return "external-token"
+
+    monkeypatch.setattr("cbrs.browser_session.TwoCaptchaClient", FakeSolver)
+    assert session.has_external_recaptcha_fallback is False
+    budget = CaptchaBudgetStore(
+        settings.captcha_state_path,
+        daily_limit=settings.two_captcha_daily_limit,
+        circuit_seconds=settings.two_captcha_circuit_breaker_seconds,
+    )
+    budget.arm_manual(account_id="a1")
+    assert session.has_external_recaptcha_fallback is True
+    solution = session.generate_recaptcha_solution("indice_com_texto")
+    assert solution.token == "external-token"
+    assert solution.source == "2captcha"
+    assert solution.attempt_id
+    assert session.has_external_recaptcha_fallback is False
 
 
 def test_prepare_interactive_login_prefills_without_submitting(tmp_path: Path) -> None:

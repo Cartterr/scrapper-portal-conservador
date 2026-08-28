@@ -1,8 +1,13 @@
 {
   "daily_quota_per_account": 20,
+  "selection_policy": "round_robin",
   "interval_minutes": 0,
   "job_interval_min_seconds": 10,
   "job_interval_max_seconds": 30,
+  "human_like_behavior_enabled": true,
+  "worker_poll_seconds": 5,
+  "max_queued_production_jobs": 100,
+  "instant_jobs_enabled": true,
   "dashboard_host": "127.0.0.1",
   "dashboard_port": 8765,
   "accounts": [

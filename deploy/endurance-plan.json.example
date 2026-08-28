@@ -1,0 +1,20 @@
+{
+  "enabled": false,
+  "fixtures": [
+    {
+      "label": "proven_9441_4580_1980",
+      "kind": "fna",
+      "input": {
+        "foja": 9441,
+        "numero": 4580,
+        "year": 1980
+      }
+    }
+  ],
+  "cooldown_seconds": 600,
+  "max_outstanding_jobs": 1,
+  "jobs_per_account_per_day": 15,
+  "production_reserve_per_account": 5,
+  "no_catch_up": true,
+  "quota_exhaustion_test_mode": false
+}

@@ -13,7 +13,7 @@ if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
 
 $installed = @(
     & wsl.exe --list --quiet 2>$null |
-        ForEach-Object { ([string]$_).Replace([char]0, '').Trim() } |
+        ForEach-Object { ([string]$_).Replace([string][char]0, '').Trim() } |
         Where-Object { $_ }
 )
 if ($installed -contains $DistroName) {

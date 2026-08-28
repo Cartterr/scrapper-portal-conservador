@@ -42,6 +42,9 @@ def test_validation_report_does_not_store_query_value(tmp_path: Path) -> None:
     assert report["profile_hash"]
     assert report["expected_egress_country"] == "CL"
     assert report["egress_mode"] == "client_vpn"
+    assert report["captcha_solver_mode"] == "browser"
+    assert report["captcha_solver_configured"] is False
+    assert report["proxy_recheck_seconds"] == 300
     assert report["egress_country"] == "CL"
     assert report["egress_hash"] == "abc123"
     assert report["preflight_status"] == "passed"

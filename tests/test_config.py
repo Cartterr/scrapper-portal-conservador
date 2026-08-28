@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from cbrs.config import MIN_SAFE_DELAY_SECONDS, load_settings
 
 
@@ -37,6 +39,52 @@ def test_relative_paths_resolve_under_repo_root(tmp_path: Path) -> None:
     assert settings.cloak_cache_dir == tmp_path / ".local" / "cache"
     assert settings.output_dir == tmp_path / "downloads"
     assert settings.log_dir == tmp_path / "runtime-logs"
+
+
+def test_two_captcha_fallback_requires_api_key(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="CBRS_2CAPTCHA_API_KEY"):
+        load_settings(
+            {"CBRS_CAPTCHA_SOLVER_MODE": "2captcha_fallback"},
+            root=tmp_path,
+        )
+
+
+def test_two_captcha_manual_mode_loads_with_explicit_key(tmp_path: Path) -> None:
+    settings = load_settings(
+        {
+            "CBRS_CAPTCHA_SOLVER_MODE": "2captcha_manual",
+            "CBRS_2CAPTCHA_API_KEY": "private-key",
+        },
+        root=tmp_path,
+    )
+    assert settings.captcha_solver_mode == "2captcha_manual"
+    assert "private-key" not in repr(settings)
+
+
+def test_two_captcha_manual_mode_can_be_preconfigured_without_a_key(tmp_path: Path) -> None:
+    settings = load_settings(
+        {"CBRS_CAPTCHA_SOLVER_MODE": "2captcha_manual"}, root=tmp_path
+    )
+    assert settings.captcha_solver_mode == "2captcha_manual"
+    assert settings.two_captcha_api_key is None
+
+
+def test_two_captcha_fallback_settings_are_loaded_without_exposing_key(tmp_path: Path) -> None:
+    settings = load_settings(
+        {
+            "CBRS_CAPTCHA_SOLVER_MODE": "2captcha_fallback",
+            "CBRS_2CAPTCHA_API_KEY": "private-key",
+            "CBRS_2CAPTCHA_MIN_SCORE": "0.9",
+            "CBRS_PROXY_RECHECK_SECONDS": "600",
+        },
+        root=tmp_path,
+    )
+
+    assert settings.captcha_solver_mode == "2captcha_fallback"
+    assert settings.two_captcha_api_key == "private-key"
+    assert settings.two_captcha_min_score == 0.9
+    assert settings.proxy_recheck_seconds == 600
+    assert "private-key" not in repr(settings)
 
 
 def test_settings_parse_production_defaults(tmp_path: Path) -> None:

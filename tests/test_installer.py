@@ -183,3 +183,48 @@ def test_windows_wsl_helpers_strip_cr_before_bash() -> None:
     ):
         source = (ROOT / relative_path).read_text(encoding="utf-8")
         assert '-replace "`r", \'\'' in source
+
+
+def test_native_windows_installer_is_repeatable_and_does_not_start_traffic() -> None:
+    source = (ROOT / "deploy" / "windows" / "Install-CbrsNative.ps1").read_text(
+        encoding="utf-8"
+    )
+    runtime_requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+    development_requirements = (ROOT / "requirements-dev.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert "restic.restic" in source
+    assert "C:\\ProgramData\\CBRS\\bin\\restic.exe" in source
+    assert "Merge-DotEnvTemplate" in source
+    assert "Set-CbrsSecretAcl" in source
+    assert "Disable-ScheduledTask" in source
+    assert "live_traffic_started = $false" in source
+    assert "Start-ScheduledTask" not in source
+    assert "tzdata==" in runtime_requirements
+    assert "pytest==" not in runtime_requirements
+    assert "pytest==9.0.3" in development_requirements
+
+
+def test_native_start_verifies_operational_runtime_and_rolls_back_on_failure() -> None:
+    source = (ROOT / "deploy" / "windows" / "Start-CbrsNative.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "--require-active-runtime" in source
+    assert "operational.json" in source
+    assert "startedByThisRun" in source
+    assert "Stop-ScheduledTask" in source
+    assert "Disable-ScheduledTask" in source
+
+
+def test_windows_ci_runs_native_compile_tests_and_powershell_parse() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "windows-ci.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "runs-on: windows-latest" in workflow
+    assert 'python-version: "3.14"' in workflow
+    assert "python -m pip check" in workflow
+    assert "Management.Automation.Language.Parser" in workflow
+    assert "python -m pytest -q" in workflow

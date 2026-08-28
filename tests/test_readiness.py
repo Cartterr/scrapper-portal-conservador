@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from cbrs.readiness import (
     REQUIRED_SOURCE_FILES,
     _decode_wsl_output,
+    _windows_task_statuses,
     build_readiness_report,
     write_readiness_report,
 )
@@ -218,3 +220,25 @@ def test_readiness_report_write_is_sanitized_and_atomic(tmp_path: Path) -> None:
     assert result == output.resolve()
     assert json.loads(output.read_text(encoding="utf-8")) == report
     assert not output.with_suffix(".json.tmp").exists()
+
+
+def test_windows_task_statuses_are_sanitized_and_machine_readable() -> None:
+    rows = [
+        {"name": "CBRS Worker", "state": "Running", "enabled": True, "last_result": 0},
+        {"name": "CBRS Dashboard", "state": "Running", "enabled": True, "last_result": 0},
+        {"name": "CBRS Daily Backup", "state": "Ready", "enabled": True, "last_result": 0},
+    ]
+
+    def runner(command, **kwargs):
+        assert command[:3] == ["powershell.exe", "-NoProfile", "-NonInteractive"]
+        assert kwargs["timeout"] == 15
+        return SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
+
+    statuses = _windows_task_statuses(tuple(row["name"] for row in rows), command_runner=runner)
+
+    assert statuses["CBRS Worker"] == {
+        "state": "Running",
+        "enabled": True,
+        "last_result": 0,
+    }
+    assert "user" not in json.dumps(statuses).lower()

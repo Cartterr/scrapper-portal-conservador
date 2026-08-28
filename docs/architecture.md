@@ -1,13 +1,14 @@
 # CBRS Commerce Registry Operator Tool
 
-This branch keeps the original commerce-registry flow but runs production on
-Ubuntu through normal Google Chrome, one persistent profile and fixed Chilean
+This branch keeps the original commerce-registry flow but runs endurance on
+native Windows through installed Google Chrome, one persistent profile and fixed Chilean
 egress per authorized account, automatic browser-origin authentication, fixed
 pacing, a durable SQLite job queue, and hard stops on global risk signals.
 
-Production does not use CAPTCHA solving, proxy cycling, raw-cookie export, or
-stealth browser defaults. The scheduler may fail over between separately
-authorized accounts, but never changes an account's profile or egress identity.
+Production defaults to browser-owned CAPTCHA tokens and can opt into one
+2Captcha fallback. It does not use proxy cycling, raw-cookie export, or stealth
+browser defaults. The scheduler may fail over between separately authorized
+accounts, but never changes an account's profile or egress identity.
 CloakBrowser/IPRoyal support is legacy opt-in only and is not the production
 trust path.
 
@@ -44,7 +45,7 @@ cbrs init
 
 cbrs jobs worker
   Claims idempotent requests from SQLite with a single-worker lease
-  Selects the least-used eligible authorized account
+  Selects the next eligible account with a persistent strict round-robin cursor
   Refreshes or automatically authenticates inside that account's Chrome profile
   Reserves quota immediately before each real search
   Downloads every returned inscription and publishes hashed PDFs atomically
@@ -102,8 +103,11 @@ The client raises a safety stop instead of retrying or rotating identity for:
 - protected endpoints returning HTML where JSON/image data is expected
 - unexpected non-200 statuses
 
-CAPTCHA pauses only the affected account and permits another already-authorized
-account to continue. Rate limits and WAF challenges remain global hard stops.
+CAPTCHA pauses only the affected account after the configured one-shot fallback
+is exhausted and permits another already-authorized account to continue.
+Rate limits and WAF challenges are global hard stops. Solver network/capacity
+failures open a 15-minute circuit; authentication or zero balance disables only
+the paid fallback while browser-token traffic may continue.
 The operator action after a global stop is review or official escalation from
 the same approved environment.
 
@@ -128,13 +132,10 @@ CBRS_USE_CURL_CFFI_FOR_IMAGES=0
 `CBRS_BROWSER_EXECUTABLE_PATH` is only needed when auto-detection cannot find
 Chrome or Edge. Auto-detection checks Chrome first, then Edge.
 
-`CBRS_HEADLESS=0` is the supported live portal mode. On Ubuntu, Chrome remains
-headed inside Xvfb and is visible on demand through loopback-only noVNC. On WSL2
-the same Linux Chrome is displayed by WSLg. `--headless` remains diagnostic
-because prior live evidence showed different portal behavior in true headless mode.
-
-`CBRS_WINDOW_MODE=normal` is used with Xvfb/WSLg. `offscreen` remains a local
-diagnostic compatibility option.
+The native unattended worker runs installed Chrome headless. Manual recovery
+first pauses/stops the worker and then opens only the affected persistent
+profile headed. `CBRS_WINDOW_MODE=offscreen` remains a local diagnostic option,
+not the unattended endurance path.
 
 `CBRS_EGRESS_MODE` is mandatory before live operations. Allowed production
 values are:
@@ -163,6 +164,12 @@ when `CBRS_EGRESS_MODE=dedicated_static_isp`, and should point to one stable
 Chile ISP endpoint. Reports redact the full proxy URL and store only scheme,
 port, and a host hash. Do not use it for rotating proxy pools or fallback after
 blocks.
+
+`CBRS_CAPTCHA_SOLVER_MODE=2captcha_manual` keeps browser-owned Enterprise v3
+tokens as the primary path. Rejection pauses the account without calling the
+provider; an operator must arm one `RecaptchaV3TaskProxyless` solve for that
+account. The API key is read only from
+`CBRS_2CAPTCHA_API_KEY`. See `docs/2captcha-long-run.md`.
 
 `python -m cbrs pool proxy-health` checks each configured pool account proxy
 before login attempts: Chile egress, Google reCAPTCHA Enterprise script loading,

@@ -5,10 +5,11 @@ import json
 import os
 import platform
 import shutil
+import sqlite3
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -81,6 +82,7 @@ def build_readiness_report(
     distro: str,
     probe_wsl_runtime: bool = False,
     minimum_free_gib: float = 20.0,
+    require_active_runtime: bool = False,
     system_name: str | None = None,
     wsl_distros: Sequence[str] | None = None,
 ) -> dict[str, Any]:
@@ -89,6 +91,14 @@ def build_readiness_report(
     env_file = env_file.resolve() if env_file else None
     pool_config_path = pool_config_path.resolve()
     system_name = system_name or platform.system()
+    if target == "windows":
+        return _build_windows_readiness_report(
+            repo_root=repo_root,
+            env_file=env_file,
+            pool_config_path=pool_config_path,
+            system_name=system_name,
+            require_active_runtime=require_active_runtime,
+        )
     checks: list[ReadinessCheck] = []
 
     def add(
@@ -731,7 +741,7 @@ def write_readiness_report(report: Mapping[str, Any], path: Path) -> Path:
 def format_readiness_report(report: Mapping[str, Any]) -> str:
     lines = [
         f"CBRS indefinite-test readiness ({report['target']})",
-        "Offline only: no browser, setup, or network traffic was started.",
+        "No browser, paid CAPTCHA task, or setup change was started.",
         "",
     ]
     labels = {"pass": "PASS", "fail": "FAIL", "deferred": "WAIT", "warning": "WARN"}
@@ -752,3 +762,414 @@ def format_readiness_report(report: Mapping[str, Any]) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def _build_windows_readiness_report(
+    *,
+    repo_root: Path,
+    env_file: Path | None,
+    pool_config_path: Path,
+    system_name: str,
+    require_active_runtime: bool = False,
+) -> dict[str, Any]:
+    """Validate the native Windows runtime without creating portal or CAPTCHA tasks."""
+    from urllib.parse import urlparse
+
+    from .browser_runtime import get_browser_status
+    from .captcha_solver import TwoCaptchaClient, TwoCaptchaError
+
+    checks: list[ReadinessCheck] = []
+
+    def add(check_id: str, status: str, detail: str, next_action: str | None = None) -> None:
+        checks.append(ReadinessCheck(check_id, "windows", status, True, detail, next_action))
+
+    environment = load_readiness_environment(env_file)
+    settings_environment = dict(environment)
+    configured_solver_mode = environment.get("CBRS_CAPTCHA_SOLVER_MODE", "browser")
+    configured_solver_key = environment.get("CBRS_2CAPTCHA_API_KEY", "").strip()
+    if configured_solver_mode in {
+        "2captcha",
+        "2captcha_manual",
+        "2captcha_fallback",
+    } and not configured_solver_key:
+        settings_environment["CBRS_CAPTCHA_SOLVER_MODE"] = "browser"
+    settings = load_settings(settings_environment, root=repo_root)
+    native_assets = (
+        "deploy/windows/Install-CbrsNative.ps1",
+        "deploy/windows/Start-CbrsNative.ps1",
+        "deploy/windows/Stop-CbrsNative.ps1",
+        "deploy/windows/Get-CbrsNativeStatus.ps1",
+        "deploy/windows/Invoke-CbrsNativeTask.ps1",
+        "deploy/windows/Open-CbrsNativeRecovery.ps1",
+        "deploy/cbrs-native.env.example",
+        "deploy/account-pool.native.json.example",
+        "deploy/endurance-plan.json.example",
+    )
+    assets_ok = all((repo_root / name).is_file() for name in native_assets)
+    add(
+        "native_assets",
+        "pass" if assets_ok else "fail",
+        "all native Windows deployment assets are present"
+        if assets_ok
+        else "one or more native Windows deployment assets are missing",
+    )
+    add(
+        "native_windows",
+        "pass" if system_name == "Windows" else "fail",
+        "native Windows runtime selected" if system_name == "Windows" else "runtime is not Windows",
+    )
+    browser = get_browser_status(settings)
+    add(
+        "chrome",
+        "pass" if browser.available and browser.family == "chrome" else "fail",
+        "installed Chrome browser is available"
+        if browser.available and browser.family == "chrome"
+        else "Google Chrome is unavailable",
+        "Install Google Chrome natively."
+        if not browser.available or browser.family != "chrome"
+        else None,
+    )
+    add(
+        "browser_transport",
+        "pass" if not settings.use_curl_cffi_for_images else "fail",
+        "all browser and PDF traffic uses the account browser transport"
+        if not settings.use_curl_cffi_for_images
+        else "curl_cffi image transport would bypass account proxies",
+    )
+    add(
+        "captcha_manual_only",
+        "pass" if configured_solver_mode == "2captcha_manual" else "fail",
+        "2Captcha requires a manual one-shot authorization"
+        if configured_solver_mode == "2captcha_manual"
+        else "set CBRS_CAPTCHA_SOLVER_MODE=2captcha_manual; automatic modes are forbidden",
+    )
+    state_root = settings.profile_dir.parent
+    output_drive = settings.output_dir.drive.upper()
+    repository = Path(environment.get("RESTIC_REPOSITORY", ""))
+    storage_ok = (
+        state_root.drive.upper() == "G:"
+        and output_drive == "G:"
+        and repository.drive.upper() == "E:"
+    )
+    add(
+        "storage_layout",
+        "pass" if storage_ok else "fail",
+        "primary state is on G: and encrypted backup repository is on E:"
+        if storage_ok
+        else "expected primary storage on G: and restic repository on E:",
+    )
+    configured_restic = environment.get("CBRS_RESTIC_EXECUTABLE_PATH", "").strip()
+    restic_executable = configured_restic or shutil.which("restic")
+    restic_ok = bool(restic_executable and Path(restic_executable).is_file())
+    add(
+        "restic",
+        "pass" if restic_ok else "fail",
+        "native restic is available" if restic_ok else "native restic is unavailable",
+    )
+    task_names = ("CBRS Worker", "CBRS Dashboard", "CBRS Daily Backup")
+    task_results = [
+        subprocess.run(
+            ["schtasks.exe", "/Query", "/TN", name],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).returncode
+        for name in task_names
+    ] if system_name == "Windows" else [1, 1, 1]
+    add(
+        "scheduled_tasks",
+        "pass" if all(code == 0 for code in task_results) else "fail",
+        "worker, dashboard, and daily backup tasks are registered"
+        if all(code == 0 for code in task_results)
+        else "one or more CBRS scheduled tasks are missing",
+    )
+    task_statuses: dict[str, dict[str, Any]] = {}
+    if require_active_runtime:
+        task_statuses = _windows_task_statuses(task_names) if system_name == "Windows" else {}
+        enabled = all(
+            bool(task_statuses.get(name, {}).get("enabled")) for name in task_names
+        )
+        persistent_running = all(
+            str(task_statuses.get(name, {}).get("state") or "").lower() == "running"
+            for name in ("CBRS Worker", "CBRS Dashboard")
+        )
+        backup_state = str(
+            task_statuses.get("CBRS Daily Backup", {}).get("state") or ""
+        ).lower()
+        tasks_active = enabled and persistent_running and backup_state in {"ready", "running"}
+        add(
+            "scheduled_tasks_active",
+            "pass" if tasks_active else "fail",
+            "worker and dashboard are running and daily backup is enabled"
+            if tasks_active
+            else "registered tasks are disabled or the worker/dashboard are not running",
+            "Start the native runtime through Start-CbrsNative.ps1 and rerun operational readiness."
+            if not tasks_active
+            else None,
+        )
+    env_ok = bool(env_file and env_file.is_file())
+    restic_password_file = Path(environment.get("RESTIC_PASSWORD_FILE", ""))
+    secret_files = [path for path in (env_file, restic_password_file) if path]
+    acl_ok = False
+    if env_ok and restic_password_file.is_file() and system_name == "Windows":
+        acl_ok = True
+        for secret_file in secret_files:
+            acl = subprocess.run(
+                ["icacls.exe", str(secret_file)], capture_output=True, text=True, check=False
+            )
+            acl_text = (acl.stdout or "").lower()
+            broad_acl = any(
+                marker in acl_text
+                for marker in ("everyone:", "todos:", "builtin\\users:", "builtin\\usuarios:")
+            )
+            acl_ok = acl_ok and acl.returncode == 0 and not broad_acl
+    add(
+        "secret_acl",
+        "pass" if env_ok and acl_ok else "fail",
+        "environment and restic password files exist with restricted ACLs"
+        if env_ok and acl_ok
+        else "secret files are missing or readable by broad groups",
+    )
+    raw_pool: dict[str, Any] = {}
+    proxy_refs: list[str] = []
+    pool_ok = False
+    credentials_ok = False
+    try:
+        raw_pool = json.loads(pool_config_path.read_text(encoding="utf-8"))
+        enabled_accounts = [
+            account
+            for account in raw_pool.get("accounts", [])
+            if account.get("enabled", True)
+        ]
+        proxy_refs = [
+            str(account.get("proxy_url_env") or "")
+            for account in enabled_accounts
+        ]
+        proxy_values = [environment.get(name, "") for name in proxy_refs]
+        credential_refs = [
+            (
+                str(account.get("username_env") or ""),
+                str(account.get("password_env") or ""),
+            )
+            for account in enabled_accounts
+        ]
+        credential_values = [
+            environment.get(reference, "").strip()
+            for pair in credential_refs
+            for reference in pair
+        ]
+        credentials_ok = (
+            len(credential_refs) == 3
+            and all(all(pair) for pair in credential_refs)
+            and all(
+                value and not value.upper().startswith("REPLACE_")
+                for value in credential_values
+            )
+        )
+        pool_ok = (
+            raw_pool.get("selection_policy") == "round_robin"
+            and len(proxy_values) == 3
+            and all(urlparse(value).scheme in {"http", "https"} for value in proxy_values)
+            and len(set(proxy_values)) == 3
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    add(
+        "account_credentials",
+        "pass" if credentials_ok else "fail",
+        "three account credential references resolve to configured secrets"
+        if credentials_ok
+        else "three non-placeholder account usernames and passwords are required",
+    )
+    add(
+        "proxy_configuration",
+        "pass" if pool_ok else "fail",
+        "three distinct account proxy endpoints are configured"
+        if pool_ok else "three distinct account proxy endpoints are required",
+    )
+    baseline_ok = False
+    db_path = Path(environment.get("CBRS_CAPTCHA_STATE_PATH", state_root / "pool" / "pool.sqlite3"))
+    if db_path.is_file():
+        try:
+            with sqlite3.connect(db_path) as db:
+                rows = db.execute(
+                    """
+                    SELECT account_id, egress_hash FROM account_checks
+                    WHERE proxy_status = 'passed'
+                    """
+                ).fetchall()
+            checks_by_account = {str(row[0]): str(row[1]) for row in rows if row[1]}
+            approved_hashes: list[str] = []
+            for account in raw_pool.get("accounts", []):
+                if not account.get("enabled", True):
+                    continue
+                account_id = str(account.get("id") or "")
+                profile_dir = Path(account.get("profile_dir")) if account.get("profile_dir") else (
+                    state_root / "accounts" / account_id / "chrome-profile"
+                )
+                baseline_path = profile_dir.parent / "fixed-egress-baseline.json"
+                baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+                approved_hash = str(baseline.get("egress_hash") or "")
+                if not approved_hash or checks_by_account.get(account_id) != approved_hash:
+                    approved_hashes = []
+                    break
+                approved_hashes.append(approved_hash)
+            baseline_ok = len(approved_hashes) == 3 and len(set(approved_hashes)) == 3
+        except (sqlite3.Error, OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    add(
+        "proxy_baselines",
+        "pass" if baseline_ok and settings.expected_egress_country == "CL" else "fail",
+        "three unique approved Chilean egress baselines are present"
+        if baseline_ok and settings.expected_egress_country == "CL"
+        else "prove and approve three unique stable Chilean egress baselines",
+    )
+    captcha_ok = False
+    captcha_detail = "2Captcha API key is missing"
+    usable_solver_key = configured_solver_key and not configured_solver_key.startswith("REPLACE_")
+    if usable_solver_key:
+        try:
+            balance = TwoCaptchaClient(configured_solver_key).get_balance()
+            captcha_ok = balance > 0
+            captcha_detail = "2Captcha authentication succeeded and balance is positive" if captcha_ok else "2Captcha balance is zero"
+        except TwoCaptchaError as exc:
+            captcha_detail = f"2Captcha balance check failed ({exc.code})"
+    add("captcha_balance", "pass" if captcha_ok else "fail", captcha_detail)
+    stale_lease = False
+    active_lease = False
+    if db_path.is_file():
+        try:
+            with sqlite3.connect(db_path) as db:
+                lease = db.execute(
+                    "SELECT expires_at FROM leases WHERE lease_name = 'portal_worker'"
+                ).fetchone()
+            lease_expiry = (
+                datetime.fromisoformat(str(lease[0]))
+                if lease and lease[0]
+                else None
+            )
+            stale_lease = bool(
+                lease_expiry and lease_expiry < datetime.now(timezone.utc)
+            )
+            active_lease = bool(
+                lease_expiry and lease_expiry >= datetime.now(timezone.utc)
+            )
+        except sqlite3.Error:
+            pass
+    add(
+        "worker_lease",
+        "fail" if stale_lease else "pass",
+        "no stale worker lease detected" if not stale_lease else "stale worker lease must be recovered",
+    )
+    if require_active_runtime:
+        add(
+            "worker_active_lease",
+            "pass" if active_lease else "fail",
+            "worker heartbeat lease is active"
+            if active_lease
+            else "worker task has no active heartbeat lease",
+        )
+        dashboard_port = int(raw_pool.get("dashboard_port") or 8765)
+        dashboard_healthy = _loopback_dashboard_healthy(dashboard_port)
+        add(
+            "dashboard_health",
+            "pass" if dashboard_healthy else "fail",
+            "loopback dashboard health endpoint returned successfully"
+            if dashboard_healthy
+            else "loopback dashboard health endpoint is unavailable",
+        )
+    backup_status = state_root / "backup" / "status.json"
+    backup_ok = False
+    if backup_status.is_file():
+        try:
+            stored_backup = json.loads(backup_status.read_text(encoding="utf-8"))
+            finished_at = datetime.fromisoformat(str(stored_backup.get("finished_at")))
+            backup_ok = bool(stored_backup.get("ok")) and (
+                datetime.now(timezone.utc) - finished_at
+            ) <= timedelta(hours=36)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    add(
+        "daily_backup",
+        "pass" if backup_ok else "fail",
+        "a successful backup is recorded" if backup_ok else "run and verify the first native backup",
+    )
+    blocking = [check for check in checks if check.status != "pass"]
+    return {
+        "schema": READINESS_SCHEMA,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "target": "windows",
+        "distro": None,
+        "safety": {
+            "network_requests_made": bool(usable_solver_key),
+            "browser_started": False,
+            "setup_changes_made": False,
+            "secret_values_in_report": False,
+            "captcha_tasks_created": False,
+        },
+        "summary": {
+            "offline_assets_ready": True,
+            "live_test_ready": not blocking,
+            "blocking_checks": len(blocking),
+            "failures": len(blocking),
+            "deferred": 0,
+            "warnings": 0,
+        },
+        "checks": [asdict(check) for check in checks],
+    }
+
+
+def _windows_task_statuses(
+    task_names: Sequence[str],
+    *,
+    command_runner: Any = subprocess.run,
+) -> dict[str, dict[str, Any]]:
+    quoted_names = ",".join(
+        "'" + str(name).replace("'", "''") + "'" for name in task_names
+    )
+    script = (
+        f"$names=@({quoted_names});"
+        "$rows=foreach($name in $names){"
+        "$task=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue;"
+        "if($task){$info=Get-ScheduledTaskInfo -TaskName $name;"
+        "[pscustomobject]@{name=$name;state=[string]$task.State;"
+        "enabled=[bool]$task.Settings.Enabled;last_result=[int64]$info.LastTaskResult}}};"
+        "$rows|ConvertTo-Json -Compress"
+    )
+    result = command_runner(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if int(result.returncode) != 0 or not (result.stdout or "").strip():
+        return {}
+    try:
+        raw = json.loads(result.stdout)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    rows = raw if isinstance(raw, list) else [raw]
+    statuses: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("name"):
+            continue
+        statuses[str(row["name"])] = {
+            "state": str(row.get("state") or ""),
+            "enabled": bool(row.get("enabled")),
+            "last_result": int(row.get("last_result") or 0),
+        }
+    return statuses
+
+
+def _loopback_dashboard_healthy(port: int) -> bool:
+    from urllib.request import urlopen
+
+    try:
+        with urlopen(f"http://127.0.0.1:{int(port)}/api/health", timeout=3) as response:
+            if int(response.status) != 200:
+                return False
+            payload = json.loads(response.read().decode("utf-8"))
+        return bool(isinstance(payload, dict) and payload.get("ok") is True)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False

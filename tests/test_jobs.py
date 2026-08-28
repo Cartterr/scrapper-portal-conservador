@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import HTTPError
@@ -13,7 +14,8 @@ from PIL import Image
 
 from cbrs.account_pool import AccountPoolStore, PoolAccount, PoolConfig, PoolTarget
 from cbrs.account_pool_dashboard import start_pool_dashboard
-from cbrs.backup import backup_health, run_backup
+from cbrs.backup import backup_health, run_backup, verify_backup_restore
+from cbrs.captcha_budget import CaptchaBudgetStore
 from cbrs.config import load_settings
 from cbrs.jobs import (
     IdempotencyConflictError,
@@ -400,7 +402,7 @@ def test_worker_fails_over_after_account_captcha(tmp_path, monkeypatch):
     assert sum(store.usage_by_account(_today()).values()) == 2
 
 
-def test_worker_restarts_one_failed_browser_context_with_the_same_profile(
+def test_worker_fails_over_to_next_account_after_browser_context_failure(
     tmp_path,
     monkeypatch,
 ):
@@ -441,7 +443,7 @@ def test_worker_restarts_one_failed_browser_context_with_the_same_profile(
                 (job["job_id"],),
             ).fetchall()
         ]
-    assert accounts == ["a1", "a1"]
+    assert accounts == ["a1", "a2"]
 
 
 def test_worker_waits_when_all_accounts_require_captcha(tmp_path, monkeypatch):
@@ -503,7 +505,13 @@ def test_daily_capacity_places_next_job_in_waiting_capacity(tmp_path, monkeypatc
     assert sum(store.usage_by_account(_today()).values()) == 3
 
 
-def test_global_rate_limit_stops_worker(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        (StopReason.RATE_LIMIT, "rate_limit"),
+    ],
+)
+def test_global_infrastructure_signal_stops_worker(tmp_path, monkeypatch, reason, expected):
     settings = _settings(tmp_path)
     config = _config()
     _credentials(monkeypatch, config)
@@ -511,9 +519,7 @@ def test_global_rate_limit_stops_worker(tmp_path, monkeypatch):
     pool_store = AccountPoolStore(path)
     store = JobStore(path)
     store.create_job(kind="text", input_data={"text": "Authorized"})
-    FakeScraper.behavior = {
-        "a1": SafetyStopException(StopReason.RATE_LIMIT, "rate limited")
-    }
+    FakeScraper.behavior = {"a1": SafetyStopException(reason, "global stop")}
     FakeScraper.results = []
 
     result = run_job_worker(
@@ -529,7 +535,39 @@ def test_global_rate_limit_stops_worker(tmp_path, monkeypatch):
 
     assert result.exit_code == 2
     assert result.status == "safety_stop"
-    assert store.get_control("global_safety_stop")["value"] == "rate_limit"
+    assert store.get_control("global_safety_stop")["value"] == expected
+
+
+def test_solver_failure_is_account_scoped_and_next_account_continues(
+    tmp_path, monkeypatch
+):
+    settings = _settings(tmp_path)
+    config = _config()
+    _credentials(monkeypatch, config)
+    path = tmp_path / "pool.sqlite3"
+    pool_store = AccountPoolStore(path)
+    store = JobStore(path)
+    job, _ = store.create_job(kind="text", input_data={"text": "Authorized"})
+    FakeScraper.behavior = {
+        "a1": SafetyStopException(StopReason.CAPTCHA_SOLVER, "solver unavailable")
+    }
+    FakeScraper.results = []
+
+    result = run_job_worker(
+        settings=settings,
+        config=config,
+        store=store,
+        pool_store=pool_store,
+        once=True,
+        scraper_factory=FakeScraper,
+        preflight_runner=_gate,
+        proxy_health_runner=_gate,
+    )
+
+    assert result.exit_code == 0
+    assert store.get_control("global_safety_stop") is None
+    attempts = store.get_job(job["job_id"])["attempts"]
+    assert [attempt["account_id"] for attempt in attempts] == ["a1", "a2"]
 
 
 def test_jobs_api_is_loopback_idempotent_and_cancellable(tmp_path, monkeypatch):
@@ -644,6 +682,221 @@ def test_jobs_api_is_loopback_idempotent_and_cancellable(tmp_path, monkeypatch):
         dashboard.stop()
 
 
+def test_dashboard_production_settings_are_safe_validated_and_persisted(
+    tmp_path, monkeypatch
+):
+    settings = _settings(tmp_path)
+    config = _config()
+    _credentials(monkeypatch, config)
+    state_root = settings.profile_dir.parent
+    state_root.mkdir(parents=True, exist_ok=True)
+    (state_root / "account-pool.json").write_text(
+        json.dumps(
+            {
+                "selection_policy": "round_robin",
+                "daily_quota_per_account": 20,
+                "accounts": [
+                    {
+                        "id": account.account_id,
+                        "label": account.label,
+                        "username_env": account.username_env,
+                        "password_env": account.password_env,
+                        "daily_quota": account.daily_quota,
+                    }
+                    for account in config.accounts
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_root / "endurance-plan.json").write_text(
+        json.dumps(
+            {
+                "enabled": False,
+                "cooldown_seconds": 600,
+                "jobs_per_account_per_day": 15,
+                "production_reserve_per_account": 5,
+                "max_outstanding_jobs": 1,
+                "no_catch_up": True,
+                "fixtures": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    path = tmp_path / "pool.sqlite3"
+    pool_store = AccountPoolStore(path)
+    store = JobStore(path)
+    dashboard = start_pool_dashboard(
+        pool_store,
+        settings=settings,
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        job_store=store,
+    )
+    payload = {
+        "pool": {
+            "daily_quota_per_account": 20,
+            "human_like_behavior_enabled": False,
+            "job_interval_min_seconds": 4,
+            "job_interval_max_seconds": 12,
+            "worker_poll_seconds": 2.5,
+            "max_queued_production_jobs": 40,
+            "instant_jobs_enabled": False,
+        },
+        "endurance": {
+            "enabled": False,
+            "cooldown_seconds": 900,
+            "jobs_per_account_per_day": 14,
+            "production_reserve_per_account": 6,
+        },
+    }
+    try:
+        with urlopen(f"{dashboard.url}/api/settings") as response:
+            before = json.load(response)
+        assert before["locked"]["selection_policy"] == "round_robin"
+        assert before["locked"]["dashboard_bind"] == "loopback_only"
+        assert "username" not in json.dumps(before).lower()
+        assert "password" not in json.dumps(before).lower()
+
+        request = Request(
+            f"{dashboard.url}/api/settings",
+            data=json.dumps(payload).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(request) as response:
+            saved = json.load(response)
+        assert saved["status"] == "settings_saved"
+        assert saved["settings"]["pool"]["human_like_behavior_enabled"] is False
+        assert saved["settings"]["pool"]["max_queued_production_jobs"] == 40
+        assert saved["settings"]["endurance"]["cooldown_seconds"] == 900
+
+        pool_file = json.loads((state_root / "account-pool.json").read_text())
+        endurance_file = json.loads((state_root / "endurance-plan.json").read_text())
+        assert pool_file["worker_poll_seconds"] == 2.5
+        assert pool_file["selection_policy"] == "round_robin"
+        assert endurance_file["max_outstanding_jobs"] == 1
+        assert endurance_file["no_catch_up"] is True
+
+        pool_store.create_run(
+            run_id="active",
+            dry_run=False,
+            config=config,
+            dashboard_url=None,
+        )
+        with pytest.raises(HTTPError) as error:
+            urlopen(request)
+        assert error.value.code == 409
+    finally:
+        dashboard.stop()
+
+
+def test_dashboard_enforces_queue_limit_and_instant_job_switch(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    config = replace(
+        _config(),
+        max_queued_production_jobs=1,
+        instant_jobs_enabled=False,
+    )
+    _credentials(monkeypatch, config)
+    path = tmp_path / "pool.sqlite3"
+    pool_store = AccountPoolStore(path)
+    store = JobStore(path)
+    dashboard = start_pool_dashboard(
+        pool_store,
+        settings=settings,
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        job_store=store,
+    )
+    try:
+        body = json.dumps({"kind": "text", "text": "First"}).encode()
+        with urlopen(
+            Request(
+                f"{dashboard.url}/api/jobs",
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+        ) as response:
+            assert response.status == 202
+        with pytest.raises(HTTPError) as queue_error:
+            urlopen(
+                Request(
+                    f"{dashboard.url}/api/jobs",
+                    data=json.dumps({"kind": "text", "text": "Second"}).encode(),
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+            )
+        assert queue_error.value.code == 409
+
+        with pytest.raises(HTTPError) as instant_error:
+            urlopen(
+                Request(
+                    f"{dashboard.url}/api/jobs/instant",
+                    data=body,
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+            )
+        assert instant_error.value.code == 409
+    finally:
+        dashboard.stop()
+
+
+def test_dashboard_manual_captcha_button_arms_exactly_one_solve(tmp_path, monkeypatch):
+    settings = load_settings(
+        {
+            "CBRS_PROFILE_DIR": str(tmp_path / "state" / "chrome-profile"),
+            "CBRS_OUTPUT_DIR": str(tmp_path / "outputs"),
+            "CBRS_CAPTCHA_SOLVER_MODE": "2captcha_manual",
+            "CBRS_2CAPTCHA_API_KEY": "private-key",
+        },
+        root=tmp_path,
+    )
+    config = _config()
+    _credentials(monkeypatch, config)
+    path = tmp_path / "pool.sqlite3"
+    pool_store = AccountPoolStore(path)
+    store = JobStore(path)
+    pool_store.create_run(run_id="live", dry_run=False, config=config, dashboard_url=None)
+    pool_store.mark_account_captcha_pending("live", "a1")
+    job, _ = store.create_job(kind="text", input_data={"text": "Authorized"})
+    store.set_waiting(job["job_id"], "waiting_captcha", reason="captcha_rejected")
+    dashboard = start_pool_dashboard(
+        pool_store,
+        settings=settings,
+        config=config,
+        host="127.0.0.1",
+        port=0,
+        job_store=store,
+    )
+    try:
+        request = Request(
+            f"{dashboard.url}/api/captcha/a1/solve-external", data=b"", method="POST"
+        )
+        with urlopen(request, timeout=5) as response:
+            assert response.status == 202
+            payload = json.load(response)
+    finally:
+        dashboard.stop()
+
+    budget = CaptchaBudgetStore(
+        settings.captcha_state_path,
+        daily_limit=settings.two_captcha_daily_limit,
+        circuit_seconds=settings.two_captcha_circuit_breaker_seconds,
+    )
+    assert payload["status"] == "one_solve_armed"
+    assert payload["released_jobs"] == 1
+    assert budget.manual_armed(account_id="a1") is True
+    assert store.get_job(job["job_id"])["status"] == "queued"
+    account = next(row for row in pool_store.accounts("live") if row["account_id"] == "a1")
+    assert account["status"] == "available"
+
+
 def test_jobs_api_rejects_artifact_outside_job_output_root(tmp_path):
     settings = _settings(tmp_path)
     config = _config()
@@ -707,6 +960,48 @@ def test_backup_uses_online_sqlite_snapshot_and_reports_health(tmp_path, monkeyp
     assert calls[0][0][1:3] == ["backup", "--tag"]
     assert "do-not-log" not in json.dumps(result)
     assert backup_health(settings)["status"] == "healthy"
+
+
+def test_backup_restore_verification_is_temporary_and_checks_sqlite_and_pdf(
+    tmp_path, monkeypatch
+):
+    settings = _settings(tmp_path)
+    restic = tmp_path / "restic.exe"
+    restic.write_bytes(b"test")
+
+    def runner(command, **kwargs):
+        target = Path(command[command.index("--target") + 1])
+        restored = target / "G" / "CBRS" / "backup" / "snapshot"
+        restored.mkdir(parents=True)
+        db = sqlite3.connect(restored / "cbrs.sqlite3")
+        try:
+            db.execute("CREATE TABLE evidence(value TEXT)")
+            db.execute("INSERT INTO evidence VALUES ('restored')")
+            db.commit()
+        finally:
+            db.close()
+        output = target / "G" / "CBRS" / "outputs" / "jobs" / "job-1"
+        output.mkdir(parents=True)
+        (output / "artifact.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+        return SimpleNamespace(returncode=0, stdout="restored", stderr="")
+
+    result = verify_backup_restore(
+        settings=settings,
+        require_pdf=True,
+        env={
+            "RESTIC_REPOSITORY": str(tmp_path / "repository"),
+            "CBRS_RESTIC_EXECUTABLE_PATH": str(restic),
+        },
+        command_runner=runner,
+    )
+
+    assert result["ok"] is True
+    assert result["database_quick_check"] is True
+    assert result["pdf_count"] == 1
+    assert not list((settings.profile_dir.parent / "backup").glob("restore-verify-*"))
+    health = backup_health(settings)
+    assert health["restore_status"] == "verified"
+    assert health["restored_pdf_count"] == 1
 
 
 def _today() -> str:

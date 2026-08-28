@@ -4,7 +4,9 @@ import json
 import mimetypes
 import os
 import re
+import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +19,7 @@ from .account_pool import (
     PoolConfig,
     account_credentials,
     dashboard_status,
+    load_account_pool_config,
     local_today,
     resolve_account_captcha,
 )
@@ -90,6 +93,15 @@ def _handler_factory(
     captcha_threads: dict[str, threading.Thread] = {}
     captcha_confirmations: dict[str, threading.Event] = {}
     captcha_phases: dict[str, str] = {}
+    endurance = None
+    if job_store is not None:
+        from .endurance import EnduranceController, load_endurance_plan
+
+        endurance = EnduranceController(
+            job_store,
+            load_endurance_plan(settings.profile_dir.parent / "endurance-plan.json"),
+            config,
+        )
 
     class AccountPoolDashboardHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
@@ -108,21 +120,39 @@ def _handler_factory(
                 payload["runtime"] = _runtime_summary(settings)
                 if job_store is not None:
                     from .backup import backup_health
+                    from .captcha_budget import CaptchaBudgetStore
 
                     payload = _with_job_pool_usage(payload, job_store, config)
                     payload["jobs"] = {
                         "summary": job_store.summary(),
                         "recent": _with_job_artifact_urls(job_store.list_jobs(limit=100)),
                     }
+                    payload["endurance"] = endurance.status() if endurance else None
+                    captcha_budget = CaptchaBudgetStore(
+                        settings.captcha_state_path,
+                        daily_limit=settings.two_captcha_daily_limit,
+                        circuit_seconds=settings.two_captcha_circuit_breaker_seconds,
+                        rejection_cooldown_seconds=(
+                            settings.two_captcha_rejection_cooldown_seconds
+                        ),
+                    )
+                    payload["captcha_solver"] = captcha_budget.status()
+                    payload["captcha_attempts"] = captcha_budget.recent_attempts()
                     payload["backup"] = backup_health(settings)
                 payload = _with_account_username_prefixes(payload, config)
                 payload = _with_captcha_phases(payload, captcha_phases)
                 self._send_json(_with_artifact_urls(payload))
                 return
+            if job_store is not None and parsed.path == "/api/settings":
+                self._send_json(_production_settings_payload(settings, config))
+                return
             if job_store is not None and parsed.path == "/api/jobs":
                 self._send_json(
                     {"jobs": _with_job_artifact_urls(job_store.list_jobs(limit=_limit(parsed.query)))}
                 )
+                return
+            if endurance is not None and parsed.path == "/api/endurance":
+                self._send_json(endurance.status())
                 return
             if job_store is not None and parsed.path == "/api/examples":
                 self._send_json({"examples": job_store.successful_fna_examples()})
@@ -170,6 +200,7 @@ def _handler_factory(
             self.send_error(HTTPStatus.NOT_FOUND, "not found")
 
         def do_POST(self) -> None:
+            nonlocal config, endurance
             parsed = urlparse(self.path)
             if not self._origin_allowed():
                 self._send_api_error(HTTPStatus.FORBIDDEN, "cross_origin_request_rejected")
@@ -179,6 +210,57 @@ def _handler_factory(
                 return
             if job_store is not None and parsed.path == "/api/jobs":
                 self._create_job()
+                return
+            if endurance is not None and parsed.path.startswith("/api/endurance/"):
+                action = parsed.path.rsplit("/", 1)[-1]
+                if action == "pause":
+                    endurance.set_paused(True)
+                elif action == "resume":
+                    endurance.set_paused(False)
+                elif action == "run-once":
+                    job = endurance.maybe_enqueue(force=True)
+                    self._send_json(
+                        {"created": bool(job), "job": job},
+                        status=HTTPStatus.ACCEPTED if job else HTTPStatus.CONFLICT,
+                    )
+                    return
+                else:
+                    self._send_api_error(HTTPStatus.NOT_FOUND, "not_found")
+                    return
+                self._send_json(endurance.status())
+                return
+            if job_store is not None and parsed.path == "/api/settings":
+                status = str(dashboard_status(store, config=config).get("status") or "")
+                if status in {"running", "waiting", "waiting_capacity", "waiting_captcha"}:
+                    self._send_api_error(HTTPStatus.CONFLICT, "worker_must_be_stopped")
+                    return
+                try:
+                    config = _save_production_settings(
+                        settings,
+                        config,
+                        self._read_json(),
+                    )
+                    from .endurance import EnduranceController, load_endurance_plan
+
+                    endurance = EnduranceController(
+                        job_store,
+                        load_endurance_plan(settings.profile_dir.parent / "endurance-plan.json"),
+                        config,
+                    )
+                except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    self._send_api_error(
+                        HTTPStatus.BAD_REQUEST,
+                        "invalid_production_settings",
+                        str(exc),
+                    )
+                    return
+                self._send_json(
+                    {
+                        "ok": True,
+                        "status": "settings_saved",
+                        "settings": _production_settings_payload(settings, config),
+                    }
+                )
                 return
             if (
                 job_store is not None
@@ -222,6 +304,79 @@ def _handler_factory(
                     status=HTTPStatus.ACCEPTED,
                 )
                 return
+            if (
+                job_store is not None
+                and parsed.path.startswith("/api/captcha/")
+                and parsed.path.endswith("/solve-external")
+            ):
+                account_id = parsed.path.split("/")[3]
+                known_ids = {account.account_id for account in config.accounts}
+                if account_id not in known_ids:
+                    self._send_api_error(HTTPStatus.NOT_FOUND, "unknown_account")
+                    return
+                if settings.captcha_solver_mode != "2captcha_manual":
+                    self._send_api_error(
+                        HTTPStatus.CONFLICT, "manual_2captcha_mode_not_enabled"
+                    )
+                    return
+                if not settings.two_captcha_api_key:
+                    self._send_api_error(
+                        HTTPStatus.CONFLICT, "two_captcha_api_key_not_configured"
+                    )
+                    return
+                run = store.latest_run(dry_run=False)
+                account_state = next(
+                    (
+                        row
+                        for row in store.accounts(str(run["run_id"]))
+                        if row["account_id"] == account_id
+                    ),
+                    None,
+                ) if run else None
+                if not account_state or account_state["status"] != "captcha_pending":
+                    self._send_api_error(
+                        HTTPStatus.CONFLICT, "account_not_captcha_pending"
+                    )
+                    return
+                from .captcha_budget import CaptchaBudgetError, CaptchaBudgetStore
+
+                budget = CaptchaBudgetStore(
+                    settings.captcha_state_path,
+                    daily_limit=settings.two_captcha_daily_limit,
+                    circuit_seconds=settings.two_captcha_circuit_breaker_seconds,
+                    rejection_cooldown_seconds=(
+                        settings.two_captcha_rejection_cooldown_seconds
+                    ),
+                )
+                try:
+                    budget.arm_manual(account_id=account_id)
+                except CaptchaBudgetError as exc:
+                    self._send_api_error(HTTPStatus.CONFLICT, exc.code)
+                    return
+                store.mark_account_available(str(run["run_id"]), account_id)
+                job_store.set_next_account(account_id, config)
+                released = job_store.release_waiting_captcha()
+                store.add_event(
+                    str(run["run_id"]),
+                    account_id=account_id,
+                    message="one manual 2Captcha solve authorized",
+                )
+                status = str(dashboard_status(store, config=config).get("status") or "")
+                worker_requested = False
+                if status not in {"running", "waiting", "waiting_capacity", "waiting_captcha"}:
+                    _request_worker_resume(settings)
+                    worker_requested = True
+                self._send_json(
+                    {
+                        "ok": True,
+                        "status": "one_solve_armed",
+                        "account_id": account_id,
+                        "released_jobs": released,
+                        "worker_requested": worker_requested,
+                    },
+                    status=HTTPStatus.ACCEPTED,
+                )
+                return
             if parsed.path.startswith("/api/captcha/") and parsed.path.endswith("/trigger"):
                 account_id = parsed.path.split("/")[3]
                 self._trigger_captcha(account_id)
@@ -243,6 +398,21 @@ def _handler_factory(
             from .jobs import IdempotencyConflictError
 
             try:
+                if run_now and not config.instant_jobs_enabled:
+                    self._send_api_error(
+                        HTTPStatus.CONFLICT,
+                        "instant_jobs_disabled",
+                    )
+                    return
+                if (
+                    job_store.outstanding_job_count(source="production")
+                    >= config.max_queued_production_jobs
+                ):
+                    self._send_api_error(
+                        HTTPStatus.CONFLICT,
+                        "production_queue_limit_reached",
+                    )
+                    return
                 body = self._read_json()
                 kind = str(body.get("kind") or ("text" if body.get("text") else "fna"))
                 job, _created = job_store.create_job(
@@ -304,10 +474,16 @@ def _handler_factory(
             if existing and existing.is_alive():
                 self._send_json({"ok": True, "status": "already_running", "account_id": account_id})
                 return
+            if visual_confirmation_required and job_store is not None:
+                store.request_stop()
+                if endurance is not None:
+                    endurance.set_paused(True)
 
             def run_recovery() -> None:
                 try:
                     if visual_confirmation_required:
+                        if job_store is not None:
+                            _wait_for_worker_release(store, config)
                         confirmation = threading.Event()
                         captcha_confirmations[account_id] = confirmation
                         captcha_phases[account_id] = "automatic_login"
@@ -532,11 +708,28 @@ def _with_captcha_phases(
 
 
 def _request_worker_resume(settings: Settings) -> None:
-    """Signal the fixed root-owned systemd path unit to start the worker.
+    """Start the fixed native task or signal the legacy systemd path unit.
 
-    The local dashboard can create only this one request file; the path unit
-    owns the privileged service start and accepts no command or user input.
+    Both routes accept no command or user-provided executable input.
     """
+    native_state_root = settings.profile_dir.parent
+    if os.name == "nt" and native_state_root.drive.upper() == "G:":
+        present = subprocess.run(
+            ["schtasks.exe", "/Query", "/TN", "CBRS Worker"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if present.returncode == 0:
+            result = subprocess.run(
+                ["schtasks.exe", "/Run", "/TN", "CBRS Worker"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError("The native CBRS Worker task could not be started.")
+            return
     _write_control_request(settings, "resume.request", "resume\n")
 
 
@@ -611,6 +804,234 @@ def _write_control_json_request(settings: Settings, name: str, payload: dict[str
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
+        raise
+
+
+def _production_settings_payload(
+    settings: Settings,
+    config: PoolConfig,
+) -> dict[str, Any]:
+    from .endurance import load_endurance_plan
+
+    plan = load_endurance_plan(settings.profile_dir.parent / "endurance-plan.json")
+    return {
+        "pool": {
+            "daily_quota_per_account": config.daily_quota_per_account,
+            "human_like_behavior_enabled": config.human_like_behavior_enabled,
+            "job_interval_min_seconds": config.job_interval_min_seconds,
+            "job_interval_max_seconds": config.job_interval_max_seconds,
+            "worker_poll_seconds": config.worker_poll_seconds,
+            "max_queued_production_jobs": config.max_queued_production_jobs,
+            "instant_jobs_enabled": config.instant_jobs_enabled,
+        },
+        "endurance": {
+            "enabled": plan.enabled,
+            "cooldown_seconds": plan.cooldown_seconds,
+            "jobs_per_account_per_day": plan.jobs_per_account_per_day,
+            "production_reserve_per_account": plan.production_reserve_per_account,
+        },
+        "runtime": {
+            "request_delay_seconds": settings.request_delay_seconds,
+            "proxy_recheck_seconds": settings.proxy_recheck_seconds,
+            "captcha_solver_mode": settings.captcha_solver_mode,
+            "two_captcha_daily_limit": settings.two_captcha_daily_limit,
+            "browser_headless": settings.headless,
+            "expected_egress_country": settings.expected_egress_country,
+        },
+        "locked": {
+            "selection_policy": "round_robin",
+            "production_priority": True,
+            "endurance_max_outstanding_jobs": 1,
+            "endurance_no_catch_up": True,
+            "quota_exhaustion_test_mode": plan.quota_exhaustion_test_mode,
+            "pdf_transport": "browser_origin",
+            "dashboard_bind": "loopback_only",
+        },
+    }
+
+
+def _save_production_settings(
+    settings: Settings,
+    current: PoolConfig,
+    payload: dict[str, Any],
+) -> PoolConfig:
+    from .endurance import load_endurance_plan
+
+    pool_update = payload.get("pool")
+    endurance_update = payload.get("endurance")
+    if not isinstance(pool_update, dict) or not isinstance(endurance_update, dict):
+        raise ValueError("pool and endurance settings are required")
+
+    state_root = settings.profile_dir.parent
+    pool_path = state_root / "account-pool.json"
+    endurance_path = state_root / "endurance-plan.json"
+    pool_raw = json.loads(pool_path.read_text(encoding="utf-8")) if pool_path.exists() else {}
+    endurance_raw = (
+        json.loads(endurance_path.read_text(encoding="utf-8"))
+        if endurance_path.exists()
+        else {}
+    )
+    if not isinstance(pool_raw, dict) or not isinstance(endurance_raw, dict):
+        raise ValueError("runtime configuration files must contain JSON objects")
+
+    pool_raw.update(
+        {
+            "daily_quota_per_account": _bounded_int(
+                pool_update,
+                "daily_quota_per_account",
+                minimum=1,
+                maximum=20,
+            ),
+            "human_like_behavior_enabled": _strict_bool(
+                pool_update,
+                "human_like_behavior_enabled",
+            ),
+            "job_interval_min_seconds": _bounded_float(
+                pool_update,
+                "job_interval_min_seconds",
+                minimum=0,
+                maximum=3600,
+            ),
+            "job_interval_max_seconds": _bounded_float(
+                pool_update,
+                "job_interval_max_seconds",
+                minimum=0,
+                maximum=3600,
+            ),
+            "worker_poll_seconds": _bounded_float(
+                pool_update,
+                "worker_poll_seconds",
+                minimum=0.1,
+                maximum=300,
+            ),
+            "max_queued_production_jobs": _bounded_int(
+                pool_update,
+                "max_queued_production_jobs",
+                minimum=1,
+                maximum=10_000,
+            ),
+            "instant_jobs_enabled": _strict_bool(
+                pool_update,
+                "instant_jobs_enabled",
+            ),
+            "selection_policy": "round_robin",
+        }
+    )
+    if pool_raw["job_interval_max_seconds"] < pool_raw["job_interval_min_seconds"]:
+        raise ValueError("maximum jitter must be greater than or equal to minimum jitter")
+
+    endurance_raw.update(
+        {
+            "enabled": _strict_bool(endurance_update, "enabled"),
+            "cooldown_seconds": _bounded_float(
+                endurance_update,
+                "cooldown_seconds",
+                minimum=60,
+                maximum=86_400,
+            ),
+            "jobs_per_account_per_day": _bounded_int(
+                endurance_update,
+                "jobs_per_account_per_day",
+                minimum=1,
+                maximum=20,
+            ),
+            "production_reserve_per_account": _bounded_int(
+                endurance_update,
+                "production_reserve_per_account",
+                minimum=0,
+                maximum=20,
+            ),
+            "max_outstanding_jobs": 1,
+            "no_catch_up": True,
+        }
+    )
+
+    pool_temporary = _write_json_temporary(pool_path, pool_raw)
+    endurance_temporary = _write_json_temporary(endurance_path, endurance_raw)
+    try:
+        validated_config = load_account_pool_config(settings, path=pool_temporary)
+        validated_plan = load_endurance_plan(endurance_temporary)
+        enabled_quotas = [
+            validated_config.quota_for(account)
+            for account in validated_config.accounts
+            if account.enabled
+        ]
+        minimum_quota = min(enabled_quotas) if enabled_quotas else 0
+        if (
+            not validated_plan.quota_exhaustion_test_mode
+            and validated_plan.jobs_per_account_per_day
+            + validated_plan.production_reserve_per_account
+            > minimum_quota
+        ):
+            raise ValueError(
+                "endurance allocation plus production reserve cannot exceed an enabled account quota"
+            )
+        os.replace(pool_temporary, pool_path)
+        os.replace(endurance_temporary, endurance_path)
+        return load_account_pool_config(settings, path=pool_path)
+    finally:
+        pool_temporary.unlink(missing_ok=True)
+        endurance_temporary.unlink(missing_ok=True)
+
+
+def _strict_bool(values: dict[str, Any], name: str) -> bool:
+    value = values.get(name)
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a JSON boolean")
+    return value
+
+
+def _bounded_float(
+    values: dict[str, Any],
+    name: str,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    try:
+        value = float(values.get(name))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be numeric") from exc
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum:g} and {maximum:g}")
+    return value
+
+
+def _bounded_int(
+    values: dict[str, Any],
+    name: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = values.get(name)
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if parsed != value and not (isinstance(value, str) and str(parsed) == value.strip()):
+        raise ValueError(f"{name} must be an integer")
+    if not minimum <= parsed <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return parsed
+
+
+def _write_json_temporary(path: Path, payload: dict[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        return temporary
+    except Exception:
+        temporary.unlink(missing_ok=True)
         raise
 
 
@@ -710,6 +1131,18 @@ def _hold_visual_captcha_session(
     return True
 
 
+def _wait_for_worker_release(
+    store: AccountPoolStore, config: PoolConfig, *, timeout_seconds: float = 180
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        status = str(dashboard_status(store, config=config).get("status") or "")
+        if status not in {"running", "waiting", "waiting_capacity", "waiting_captcha"}:
+            return
+        time.sleep(1)
+    raise RuntimeError("Worker did not release browser profiles for visual recovery.")
+
+
 def _limit(query: str) -> int:
     raw = parse_qs(query).get("limit", ["100"])[0]
     try:
@@ -719,20 +1152,23 @@ def _limit(query: str) -> int:
 
 
 def _runtime_summary(settings: Settings) -> dict[str, Any]:
-    visual_url = os.environ.get(
-        "CBRS_NOVNC_URL",
-        "http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale",
-    )
-    # Keep the recovery endpoint loopback-only while avoiding the general IP
-    # redactor turning 127.0.0.1 into an unusable browser URL.
-    visual_url = visual_url.replace("://127.0.0.1", "://localhost", 1)
+    # noVNC belongs exclusively to the legacy Linux display path. Native
+    # Windows recovery opens the configured Chrome executable directly, so a
+    # fabricated localhost:6080 link would always be a broken destination.
+    visual_url = os.environ.get("CBRS_NOVNC_URL", "").strip() or None
+    if visual_url:
+        # Keep the recovery endpoint loopback-only while avoiding the general
+        # IP redactor turning 127.0.0.1 into an unusable browser URL.
+        visual_url = visual_url.replace("://127.0.0.1", "://localhost", 1)
     return {
         "browser_backend": settings.browser_backend,
         "browser_headless": settings.headless,
         "browser_window_mode": settings.window_mode,
         "expected_egress_country": settings.expected_egress_country,
         "request_delay_seconds": settings.request_delay_seconds,
+        "captcha_solver_mode": settings.captcha_solver_mode,
         "visual_url": visual_url,
+        "visual_recovery_mode": "noVNC" if visual_url else "native_chrome",
     }
 
 
@@ -743,6 +1179,19 @@ def _dashboard_html() -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Pool de Consultas CBRS</title>
+  <script>
+    (() => {
+      try {
+        const savedTheme = localStorage.getItem("cbrs-dashboard-theme");
+        const preferredTheme = window.matchMedia("(prefers-color-scheme: dark)").matches
+          ? "dark"
+          : "light";
+        document.documentElement.dataset.theme = savedTheme || preferredTheme;
+      } catch (_) {
+        document.documentElement.dataset.theme = "light";
+      }
+    })();
+  </script>
   <style>
     :root {
       --bg: #edf3f8;
@@ -823,6 +1272,12 @@ def _dashboard_html() -> str:
     .onboarding-action.visual { border-color: #7c3aed; background: #7c3aed; }
     .onboarding-action.results { border-color: #475569; background: #475569; }
     .request-type-tabs { display: flex; gap: 7px; margin-top: 12px; }
+    .request-type-tab,
+    .example-trigger,
+    .instant-action,
+    [data-endurance-action],
+    .modal-close,
+    .modal-save { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
     .request-type-tab { border-color: #cbd5e1; background: #fff; color: #475569; }
     .request-type-tab.active { border-color: var(--accent); background: var(--accent); color: #fff; }
     .example-trigger { margin-left: auto; min-height: 30px; padding: 4px 8px; border-color: #bfdbfe; background: #eff6ff; color: #1d4ed8; font-size: 12px; }
@@ -1037,15 +1492,22 @@ def _dashboard_html() -> str:
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { padding: 9px 8px; border-bottom: 1px solid var(--line); text-align: left; }
     th { color: var(--muted); }
-    .table-scroll { width: 100%; max-width: 100%; overflow: visible; }
+    .table-scroll { width: 100%; max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; }
+    .jobs-table { min-width: 1080px; }
     .jobs-table th, .jobs-table td { padding: 8px 6px; }
-    .jobs-table thead th {
-      position: sticky;
-      top: 64px;
-      z-index: 4;
-      background: var(--panel);
-      box-shadow: inset 0 -1px 0 var(--line), 0 5px 10px rgba(31, 41, 55, .06);
-    }
+    /* Tables scroll horizontally inside their own container. Keeping their
+       headers in normal flow avoids overlays from the page-level header. */
+    .jobs-table thead th { position: static; background: var(--panel); }
+    .captcha-attempts-table { min-width: 1120px; table-layout: fixed; }
+    .captcha-attempts-table th:nth-child(1) { width: 13%; }
+    .captcha-attempts-table th:nth-child(2) { width: 13%; }
+    .captcha-attempts-table th:nth-child(3) { width: 12%; }
+    .captcha-attempts-table th:nth-child(4) { width: 12%; }
+    .captcha-attempts-table th:nth-child(5),
+    .captcha-attempts-table th:nth-child(6) { width: 8%; }
+    .captcha-attempts-table th:nth-child(7) { width: 13%; }
+    .captcha-attempts-table th:nth-child(8) { width: 21%; }
+    .captcha-attempts-table td:last-child { overflow-wrap: anywhere; }
     .job-id { display: inline-block; max-width: 94px; white-space: nowrap; font-size: 11px; }
     .job-account { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; font-size: 12px; font-weight: 700; }
     .job-account-icon {
@@ -1060,27 +1522,64 @@ def _dashboard_html() -> str:
       font-size: 11px;
       font-weight: 900;
     }
-    .job-reason { min-width: 210px; max-width: 360px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+    .job-reason { display: block; min-width: 280px; max-width: 420px; color: var(--muted); font-size: 11px; line-height: 1.45; }
     .attempt-count { color: var(--accent); font-size: 11px; font-weight: 850; white-space: nowrap; }
-    .attempt-details summary { cursor: pointer; color: var(--accent); font-weight: 800; user-select: none; }
-    .attempt-list { display: grid; gap: 5px; margin-top: 7px; }
-    .attempt-tuple {
-      display: grid;
-      grid-template-columns: 24px minmax(0, 1fr);
-      grid-template-areas:
-        "number account"
-        ". outcome";
-      align-items: center;
-      column-gap: 6px;
-      row-gap: 3px;
-      padding: 5px 6px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
+    .attempt-summary,
+    .attempt-account-summary { cursor: pointer; user-select: none; border: 0; box-shadow: none; }
+    .attempt-disclosure-input {
+      position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none;
+    }
+    .attempt-summary {
+      display: inline-flex; align-items: center; gap: 6px; color: var(--accent); font-weight: 850;
+      padding: 4px 6px; margin: -4px -6px; border-radius: 7px; background: transparent;
+    }
+    .attempt-summary:hover { background: var(--accent-soft); }
+    .attempt-summary::before,
+    .attempt-account-summary::before {
+      content: "›"; display: inline-block; font-size: 16px; line-height: 1; transition: transform .15s ease;
+    }
+    .attempt-disclosure-input:checked + .attempt-summary::before,
+    .attempt-disclosure-input:checked + .attempt-account-summary::before { transform: rotate(90deg); }
+    .attempt-account-groups {
+      display: none; gap: 7px; margin-top: 10px; padding-left: 12px;
+      border-left: 2px solid var(--accent-soft);
+    }
+    .attempt-details > .attempt-disclosure-input:checked ~ .attempt-account-groups { display: grid; }
+    .attempt-account-group {
+      min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 9px;
       background: #f8fafc;
     }
-    .attempt-number { grid-area: number; align-self: start; padding-top: 2px; color: var(--muted); font-weight: 850; }
-    .attempt-account { grid-area: account; min-width: 0; }
-    .attempt-outcome { grid-area: outcome; min-width: 0; color: var(--ink); overflow-wrap: anywhere; }
+    .attempt-account-summary {
+      width: 100%;
+      display: grid; grid-template-columns: 12px minmax(118px, auto) minmax(0, 1fr) auto;
+      align-items: center; gap: 7px; min-height: 42px; padding: 7px 9px; color: var(--ink); background: transparent;
+      text-align: left;
+    }
+    .attempt-account-summary:hover { background: var(--accent-soft); }
+    .attempt-account-summary::before { color: var(--accent); }
+    .attempt-latest { min-width: 0; color: var(--muted); line-height: 1.3; overflow-wrap: anywhere; }
+    .attempt-latest strong { color: var(--ink); }
+    .attempt-account-count {
+      padding: 3px 7px; border-radius: 999px; color: var(--accent); background: var(--accent-soft);
+      font-size: 10px; font-weight: 900; white-space: nowrap;
+    }
+    .attempt-history {
+      position: relative; display: none; gap: 5px; margin: 0 9px 9px 27px; padding: 8px 0 0 15px;
+      border-top: 1px solid var(--line); border-left: 1px solid var(--line);
+    }
+    .attempt-account-group > .attempt-disclosure-input:checked ~ .attempt-history { display: grid; }
+    .attempt-history::before {
+      content: "Historial"; position: absolute; top: 8px; left: 14px; color: var(--muted);
+      font-size: 9px; font-weight: 900; letter-spacing: .07em; text-transform: uppercase;
+    }
+    .attempt-history-row {
+      display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 8px; align-items: start;
+      min-width: 0; padding: 5px 7px; margin-top: 14px; border-radius: 7px; color: var(--ink); background: var(--panel);
+    }
+    .attempt-history-row + .attempt-history-row { margin-top: 0; }
+    .attempt-history-row.latest { box-shadow: inset 3px 0 0 var(--accent); }
+    .attempt-number { color: var(--accent); font-weight: 900; }
+    .attempt-outcome { min-width: 0; color: var(--ink); overflow-wrap: anywhere; }
     .attempt-outcome strong { font-weight: 850; }
     .document-ordinal {
       display: inline-flex;
@@ -1102,19 +1601,253 @@ def _dashboard_html() -> str:
       .request-document-fields { grid-template-columns: 1fr; }
       .headline h2 { font-size: 34px; }
       .table-scroll { overflow-x: auto; }
-      .jobs-table thead th { position: static; }
+    }
+    /* Operator console refresh */
+    :root {
+      --bg: #f4f7fb;
+      --ink: #162033;
+      --muted: #68748a;
+      --panel: #ffffff;
+      --line: #dce3ee;
+      --accent: #4f46e5;
+      --accent-soft: #eef2ff;
+      --ok: #078766;
+      --ok-soft: #e9f8f3;
+      --shadow: 0 12px 32px rgba(21, 32, 51, .07);
+      color-scheme: light;
+    }
+    :root[data-theme="dark"] {
+      --bg: #0b1220;
+      --ink: #e7edf7;
+      --muted: #9aa9bd;
+      --panel: #111b2d;
+      --line: #29384f;
+      --accent: #818cf8;
+      --accent-soft: #222952;
+      --ok: #34d399;
+      --ok-soft: #10352d;
+      --warn: #fbbf24;
+      --warn-soft: #3b2b0d;
+      --bad: #fb7185;
+      --bad-soft: #3a1822;
+      --captcha: #f59e0b;
+      --captcha-soft: #352611;
+      --captcha-wave: #22d3ee;
+      --shadow: 0 14px 38px rgba(0, 0, 0, .28);
+      color-scheme: dark;
+    }
+    body { min-height: 100vh; }
+    [hidden] { display: none !important; }
+    header {
+      min-height: 76px;
+      padding: 14px max(24px, calc((100vw - 1440px) / 2));
+      color: #f8fafc;
+      background: #111827;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+      box-shadow: 0 10px 30px rgba(15, 23, 42, .16);
+      z-index: 20;
+    }
+    header .muted { color: #aab5c5; }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark {
+      width: 42px; height: 42px; display: grid; place-items: center;
+      color: #c7d2fe; background: rgba(99,102,241,.18);
+      border: 1px solid rgba(165,180,252,.26); border-radius: 13px;
+    }
+    .brand-mark svg { width: 22px; height: 22px; }
+    .header-actions { display: flex; gap: 8px; align-items: stretch; }
+    .header-button {
+      min-height: 44px; display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+      border-color: rgba(255,255,255,.18); color: #f8fafc; background: rgba(255,255,255,.08);
+      border-radius: 10px; padding: 8px 12px;
+    }
+    .header-button:hover { background: rgba(255,255,255,.14); }
+    .theme-toggle { min-width: 132px; }
+    .theme-toggle svg { transition: transform .2s ease; }
+    .theme-toggle:hover svg { transform: rotate(-10deg); }
+    .header-button svg, button svg, .section-title svg { width: 17px; height: 17px; stroke-width: 2; }
+    .icon-label { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+    main { max-width: 1440px; padding-top: 24px; }
+    button { border-radius: 10px; transition: transform .12s ease, box-shadow .12s ease, background .12s ease; }
+    button:not([disabled]):hover { transform: translateY(-1px); box-shadow: 0 7px 18px rgba(15,23,42,.12); }
+    button:focus-visible, input:focus-visible { outline: 3px solid rgba(79,70,229,.24); outline-offset: 2px; }
+    .panel, .account, .kpi { border-radius: 14px; box-shadow: var(--shadow); }
+    .panel { padding: 20px; }
+    .onboarding { border-color: #d9defd; background: linear-gradient(135deg, #fff 0%, #f5f7ff 100%); }
+    .onboarding-action { border-color: var(--accent); background: var(--accent); }
+    .headline { background: radial-gradient(circle at 100% 0, #e7edff 0, transparent 42%), #fff; }
+    .headline h2 { letter-spacing: -.035em; }
+    .status { border-radius: 999px; letter-spacing: .04em; }
+    .worker-action { min-height: 44px; border-radius: 10px; }
+    .runtime-status-card {
+      min-height: 44px;
+      display: grid;
+      grid-template-columns: auto minmax(150px, 210px);
+      align-items: center;
+      gap: 9px;
+      padding: 6px 10px;
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 11px;
+      background: rgba(255,255,255,.055);
+    }
+    .runtime-status-card .status { padding: 5px 8px; font-size: 10px; line-height: 1; }
+    .runtime-status-card .worker-control-hint {
+      max-width: 210px;
+      margin: 0;
+      color: #c1cad8;
+      font-size: 10.5px;
+      line-height: 1.25;
+      text-align: left;
+    }
+    .section-title { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; }
+    .section-title h2 { margin: 0; }
+    .section-title-icon {
+      width: 32px; height: 32px; display: grid; place-items: center;
+      border-radius: 9px; color: var(--accent); background: var(--accent-soft);
+    }
+    .kpi { min-height: 112px; display: flex; flex-direction: column; justify-content: space-between; }
+    .kpi-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .kpi-icon {
+      width: 34px; height: 34px; display: grid; place-items: center;
+      color: var(--accent); background: var(--accent-soft); border-radius: 10px;
+    }
+    .kpi-icon.ok { color: var(--ok); background: var(--ok-soft); }
+    .kpi-icon.warn { color: var(--warn); background: var(--warn-soft); }
+    dialog.config-modal { border-radius: 20px; }
+    .settings-modal {
+      width: min(1040px, calc(100vw - 28px)) !important;
+      height: min(880px, calc(100vh - 28px));
+      max-height: min(880px, calc(100vh - 28px)) !important;
+      overflow: hidden;
+    }
+    .settings-modal .config-modal-content {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      height: 100%;
+      min-height: 0;
+      padding: 0;
+    }
+    .settings-modal .config-modal-header { margin: 0; padding: 22px 24px; border-bottom: 1px solid var(--line); }
+    .settings-body {
+      min-height: 0;
+      padding: 20px 24px 24px;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      scrollbar-gutter: stable;
+      background: #f8fafc;
+    }
+    .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 16px; }
+    .settings-section { padding: 18px; border: 1px solid var(--line); border-radius: 14px; background: #fff; }
+    .settings-section.wide { grid-column: 1 / -1; }
+    .settings-section p { margin: -4px 0 16px; font-size: 12px; line-height: 1.5; }
+    .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
+    .setting-field { display: grid; gap: 6px; min-width: 0; }
+    .setting-field > span { color: #43506a; font-size: 12px; font-weight: 800; }
+    .setting-field input[type="number"] {
+      width: 100%; min-height: 42px; border: 1px solid #cbd5e1; border-radius: 10px;
+      padding: 9px 11px; color: var(--ink); background: #fff; font: inherit;
+    }
+    .setting-field small { color: var(--muted); line-height: 1.35; }
+    .switch-row {
+      display: flex; justify-content: space-between; align-items: center; gap: 16px;
+      padding: 12px 0; border-bottom: 1px solid #edf1f6;
+    }
+    .switch-row:last-child { border-bottom: 0; padding-bottom: 0; }
+    .switch-copy strong { display: block; font-size: 13px; }
+    .switch-copy small { display: block; margin-top: 3px; color: var(--muted); line-height: 1.35; }
+    .switch { position: relative; width: 44px; height: 24px; flex: 0 0 auto; }
+    .switch input { position: absolute; opacity: 0; pointer-events: none; }
+    .switch span { position: absolute; inset: 0; border-radius: 999px; background: #cbd5e1; cursor: pointer; transition: .18s ease; }
+    .switch span::after { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; border-radius: 50%; background: #fff; box-shadow: 0 2px 6px rgba(15,23,42,.24); transition: .18s ease; }
+    .switch input:checked + span { background: var(--accent); }
+    .switch input:checked + span::after { transform: translateX(20px); }
+    .locked-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; }
+    .locked-item { display: flex; gap: 9px; align-items: flex-start; padding: 11px; border: 1px solid #e2e8f0; border-radius: 11px; background: #f8fafc; }
+    .locked-item svg { width: 17px; height: 17px; flex: 0 0 auto; margin-top: 1px; color: var(--ok); }
+    .locked-item strong { display: block; font-size: 12px; }
+    .locked-item small { display: block; color: var(--muted); margin-top: 3px; line-height: 1.3; }
+    .settings-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 24px; border-top: 1px solid var(--line); background: #fff; }
+    .settings-save { display: inline-flex; align-items: center; gap: 8px; border-color: var(--accent); background: var(--accent); }
+    .settings-save[disabled] { opacity: .55; cursor: not-allowed; }
+    .danger-note { margin-top: 12px; padding: 10px 12px; border-radius: 10px; color: #92400e; background: #fffbeb; border: 1px solid #fde68a; font-size: 12px; line-height: 1.45; }
+    :root[data-theme="dark"] header { background: #080f1c; }
+    :root[data-theme="dark"] header .muted { color: #9eacc0; }
+    :root[data-theme="dark"] .onboarding {
+      border-color: #343f72;
+      background: linear-gradient(135deg, #111b2d 0%, #171d3a 100%);
+    }
+    :root[data-theme="dark"] .headline {
+      background: radial-gradient(circle at 100% 0, #202950 0, transparent 44%), var(--panel);
+    }
+    :root[data-theme="dark"] .capacity { background: rgba(7, 13, 24, .48); }
+    :root[data-theme="dark"] .bar,
+    :root[data-theme="dark"] .mini-bar { background: #26354a; }
+    :root[data-theme="dark"] .bar .remaining { background: #34445b; }
+    :root[data-theme="dark"] .account.captcha_pending {
+      background: linear-gradient(135deg, var(--captcha-soft), var(--panel));
+    }
+    :root[data-theme="dark"] .account.captcha_solving {
+      background: linear-gradient(110deg, var(--warn-soft) 20%, var(--panel) 42%, var(--warn-soft) 64%);
+      background-size: 240% 100%;
+    }
+    :root[data-theme="dark"] .config-modal-content,
+    :root[data-theme="dark"] .pdf-preview-content,
+    :root[data-theme="dark"] .settings-footer { background: var(--panel); }
+    :root[data-theme="dark"] .settings-body { background: #0d1626; }
+    :root[data-theme="dark"] .settings-section,
+    :root[data-theme="dark"] .account-editor,
+    :root[data-theme="dark"] .attempt-account-group,
+    :root[data-theme="dark"] .locked-item { background: #142034; }
+    :root[data-theme="dark"] .request-composer input,
+    :root[data-theme="dark"] .account-editor input,
+    :root[data-theme="dark"] .setting-field input[type="number"] {
+      border-color: #35465f;
+      color: var(--ink);
+      background: #0d1728;
+    }
+    :root[data-theme="dark"] .modal-close,
+    :root[data-theme="dark"] .password-toggle,
+    :root[data-theme="dark"] .request-type-tab,
+    :root[data-theme="dark"] .example-choice,
+    :root[data-theme="dark"] .pdf-preview-file {
+      border-color: #3a4a63;
+      color: var(--ink);
+      background: #162237;
+    }
+    :root[data-theme="dark"] .example-choice:hover { border-color: var(--accent); background: #222952; }
+    :root[data-theme="dark"] .remove-account { border-color: #713243; color: #fda4af; background: #341822; }
+    :root[data-theme="dark"] .switch-row { border-bottom-color: #26354a; }
+    :root[data-theme="dark"] .locked-item { border-color: #2c3b52; }
+    :root[data-theme="dark"] .danger-note { color: #fcd34d; background: #34270e; border-color: #6d5114; }
+    :root[data-theme="dark"] .pdf-preview-frame { background: #060b13; }
+    :root[data-theme="dark"] .job-account-icon {
+      background: hsl(var(--avatar-hue) 40% 24%);
+      color: hsl(var(--avatar-hue) 80% 82%);
+      border-color: hsl(var(--avatar-hue) 38% 38%);
+    }
+    @media (max-width: 900px) {
+      header { align-items: flex-start; gap: 12px; }
+      .header-actions { flex-wrap: wrap; justify-content: flex-end; }
+      .runtime-status-card { grid-template-columns: auto minmax(130px, 190px); }
+      .settings-grid, .field-grid, .locked-grid { grid-template-columns: 1fr; }
+      .settings-section.wide { grid-column: auto; }
     }
   </style>
 </head>
 <body>
   <header>
-    <div>
-      <h1>Pool de Consultas CBRS</h1>
-      <div id="accountSummary" class="muted">Cuentas autorizadas · capacidad controlada</div>
-    </div>
-    <div style="display:flex;gap:10px;align-items:center">
-      <button id="stopButton" class="worker-action" disabled>Comprobando…</button>
+    <div class="brand">
+      <div class="brand-mark"><i data-lucide="landmark" aria-hidden="true"></i></div>
       <div>
+        <h1>Pool de Consultas CBRS</h1>
+        <div id="accountSummary" class="muted">Cuentas autorizadas · capacidad controlada</div>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button id="themeToggle" class="header-button theme-toggle" type="button" aria-label="Activar modo oscuro" aria-pressed="false"><i data-lucide="moon" aria-hidden="true"></i> <span>Modo oscuro</span></button>
+      <button id="configureProduction" class="header-button" type="button"><i data-lucide="sliders-horizontal" aria-hidden="true"></i> Configuración</button>
+      <button id="stopButton" class="worker-action" disabled><i data-lucide="loader-circle" aria-hidden="true"></i> Comprobando…</button>
+      <div class="runtime-status-card" aria-label="Estado operativo del worker">
         <div id="status" class="status">cargando</div>
         <div id="workerControlHint" class="muted worker-control-hint"></div>
       </div>
@@ -1131,7 +1864,7 @@ def _dashboard_html() -> str:
         <h2>Centro de control</h2>
         <p class="muted">Administra la configuración local, la recuperación visual y las solicitudes. El panel nunca muestra ni transmite contraseñas.</p>
         <div class="onboarding-actions" style="margin-top:12px">
-          <button id="configureAccounts" class="onboarding-action" type="button">⚙ Configurar cuentas</button>
+          <button id="configureAccounts" class="onboarding-action" type="button"><i data-lucide="users-round" aria-hidden="true"></i> Configurar cuentas</button>
         </div>
         <div id="controlFeedback" class="control-feedback" role="status"></div>
       </div>
@@ -1139,9 +1872,9 @@ def _dashboard_html() -> str:
         <h2>Crear solicitud</h2>
         <p class="muted">Elige cómo localizar la inscripción y qué hacer con ella.</p>
         <div class="request-type-tabs" role="tablist" aria-label="Tipo de búsqueda">
-          <button class="request-type-tab active" data-request-type="text" type="button">Por empresa</button>
-          <button class="request-type-tab" data-request-type="fna" type="button">Por documento</button>
-          <button id="openExamples" class="example-trigger" type="button" title="Ejemplos ya descargados correctamente">Ej.</button>
+          <button class="request-type-tab active" data-request-type="text" type="button"><i data-lucide="building-2" aria-hidden="true"></i> Por empresa</button>
+          <button class="request-type-tab" data-request-type="fna" type="button"><i data-lucide="file-search" aria-hidden="true"></i> Por documento</button>
+          <button id="openExamples" class="example-trigger" type="button" title="Ejemplos ya descargados correctamente"><i data-lucide="history" aria-hidden="true"></i></button>
         </div>
         <form id="requestComposer" class="request-composer">
           <div id="textRequestFields"><input id="jobText" type="text" maxlength="500" autocomplete="off" placeholder="Razón social autorizada" aria-label="Razón social autorizada" /></div>
@@ -1151,8 +1884,8 @@ def _dashboard_html() -> str:
             <input id="documentYear" type="number" min="1800" max="2200" placeholder="Año" aria-label="Año" />
           </div>
           <div class="request-actions">
-            <button class="onboarding-action" data-request-action="queue" type="submit">＋ Agregar a cola</button>
-            <button class="instant-action" data-request-action="instant" type="submit">⇩ Buscar y descargar ahora</button>
+            <button class="onboarding-action" data-request-action="queue" type="submit"><i data-lucide="list-plus" aria-hidden="true"></i> Agregar a cola</button>
+            <button class="instant-action" data-request-action="instant" type="submit"><i data-lucide="download" aria-hidden="true"></i> Buscar y descargar ahora</button>
           </div>
         </form>
       </div>
@@ -1162,7 +1895,7 @@ def _dashboard_html() -> str:
       <div class="config-modal-content">
         <div class="config-modal-header">
           <div><h2 id="examplesModalTitle">Ejemplos comprobados</h2><p class="muted">Estas coordenadas ya generaron al menos un PDF correctamente en este equipo.</p></div>
-          <button id="closeExamplesModal" class="modal-close" type="button" aria-label="Cerrar">×</button>
+          <button id="closeExamplesModal" class="modal-close" type="button" aria-label="Cerrar"><i data-lucide="x" aria-hidden="true"></i></button>
         </div>
         <div id="exampleList" class="example-list"><span class="muted">Cargando ejemplos…</span></div>
       </div>
@@ -1170,7 +1903,7 @@ def _dashboard_html() -> str:
 
     <dialog id="pdfPreviewModal" class="pdf-preview-modal" aria-labelledby="pdfPreviewTitle">
       <div class="pdf-preview-content">
-        <div class="pdf-preview-header"><h2 id="pdfPreviewTitle">Vista previa del PDF</h2><button id="closePdfPreview" class="modal-close" type="button" aria-label="Cerrar">×</button></div>
+        <div class="pdf-preview-header"><h2 id="pdfPreviewTitle">Vista previa del PDF</h2><button id="closePdfPreview" class="modal-close" type="button" aria-label="Cerrar"><i data-lucide="x" aria-hidden="true"></i></button></div>
         <div id="pdfPreviewFiles" class="pdf-preview-files"></div>
         <iframe id="pdfPreviewFrame" class="pdf-preview-frame" title="Vista previa del PDF" referrerpolicy="no-referrer"></iframe>
       </div>
@@ -1180,16 +1913,90 @@ def _dashboard_html() -> str:
       <div class="config-modal-content">
         <div class="config-modal-header">
           <div><h2 id="configModalTitle">Cuentas autorizadas</h2><p class="muted">Agrega, actualiza o elimina cuentas locales. El worker debe estar detenido.</p></div>
-          <button id="closeConfigModal" class="modal-close" type="button" aria-label="Cerrar">×</button>
+          <button id="closeConfigModal" class="modal-close" type="button" aria-label="Cerrar"><i data-lucide="x" aria-hidden="true"></i></button>
         </div>
         <div id="accountEditorList" class="account-editor-list"></div>
         <div class="modal-actions">
-          <button id="addAccount" class="onboarding-action results" type="button">＋ Agregar cuenta</button>
-          <button id="saveAccounts" class="modal-save" type="button">Guardar configuración</button>
+          <button id="addAccount" class="onboarding-action results" type="button"><i data-lucide="user-plus" aria-hidden="true"></i> Agregar cuenta</button>
+          <button id="saveAccounts" class="modal-save" type="button"><i data-lucide="save" aria-hidden="true"></i> Guardar configuración</button>
         </div>
         <div id="configModalFeedback" class="control-feedback" role="status"></div>
         <p class="modal-note">Las contraseñas existentes nunca se cargan aquí. Déjalas vacías para conservarlas; usa <strong>Ver</strong> solo para revisar una contraseña que hayas escrito durante esta sesión.</p>
       </div>
+    </dialog>
+
+    <dialog id="productionSettingsModal" class="config-modal settings-modal" aria-labelledby="productionSettingsTitle">
+      <form id="productionSettingsForm" class="config-modal-content">
+        <div class="config-modal-header">
+          <div>
+            <h2 id="productionSettingsTitle">Configuración de producción</h2>
+            <p class="muted">Ajusta tiempos y límites operativos. El worker debe estar detenido para guardar.</p>
+          </div>
+          <button id="closeProductionSettings" class="modal-close" type="button" aria-label="Cerrar"><i data-lucide="x" aria-hidden="true"></i></button>
+        </div>
+        <div class="settings-body">
+          <div class="settings-grid">
+            <section class="settings-section">
+              <div class="section-title"><span class="section-title-icon"><i data-lucide="activity" aria-hidden="true"></i></span><h2>Comportamiento humano</h2></div>
+              <p class="muted">Añade variación entre trabajos; la demora mínima segura por petición siempre permanece activa.</p>
+              <div class="switch-row">
+                <div class="switch-copy"><strong>Jitter entre trabajos</strong><small>Activa una pausa aleatoria dentro del rango configurado.</small></div>
+                <label class="switch"><input id="settingHumanLike" type="checkbox"><span></span></label>
+              </div>
+              <div class="field-grid" style="margin-top:14px">
+                <label class="setting-field"><span>Mínimo</span><input id="settingJitterMin" type="number" min="0" max="3600" step="1"><small>segundos</small></label>
+                <label class="setting-field"><span>Máximo</span><input id="settingJitterMax" type="number" min="0" max="3600" step="1"><small>segundos</small></label>
+              </div>
+            </section>
+
+            <section class="settings-section">
+              <div class="section-title"><span class="section-title-icon"><i data-lucide="list-ordered" aria-hidden="true"></i></span><h2>Cola de producción</h2></div>
+              <p class="muted">Controla cuánto trabajo aceptar y con qué frecuencia revisar la cola.</p>
+              <div class="field-grid">
+                <label class="setting-field"><span>Máximo pendiente</span><input id="settingQueueMax" type="number" min="1" max="10000" step="1"><small>jobs de producción</small></label>
+                <label class="setting-field"><span>Polling del worker</span><input id="settingWorkerPoll" type="number" min="0.1" max="300" step="0.1"><small>segundos</small></label>
+              </div>
+              <div class="switch-row" style="margin-top:8px">
+                <div class="switch-copy"><strong>Descarga inmediata</strong><small>Permite que “Buscar y descargar ahora” solicite el arranque del worker.</small></div>
+                <label class="switch"><input id="settingInstantJobs" type="checkbox"><span></span></label>
+              </div>
+            </section>
+
+            <section class="settings-section">
+              <div class="section-title"><span class="section-title-icon"><i data-lucide="repeat-2" aria-hidden="true"></i></span><h2>Endurance</h2></div>
+              <p class="muted">Mantiene como máximo un trabajo de endurance pendiente o ejecutándose.</p>
+              <div class="switch-row">
+                <div class="switch-copy"><strong>Generación automática</strong><small>El run-once manual sigue disponible cuando está apagada.</small></div>
+                <label class="switch"><input id="settingEnduranceEnabled" type="checkbox"><span></span></label>
+              </div>
+              <div class="field-grid" style="margin-top:14px">
+                <label class="setting-field"><span>Cooldown</span><input id="settingCooldown" type="number" min="60" max="86400" step="60"><small>segundos tras finalizar</small></label>
+                <label class="setting-field"><span>Asignación diaria</span><input id="settingEnduranceQuota" type="number" min="1" max="20" step="1"><small>jobs por cuenta</small></label>
+                <label class="setting-field"><span>Reserva producción</span><input id="settingProductionReserve" type="number" min="0" max="20" step="1"><small>cupos por cuenta</small></label>
+                <label class="setting-field"><span>Cupo base</span><input id="settingDailyQuota" type="number" min="1" max="20" step="1"><small>máximo diario por cuenta</small></label>
+              </div>
+            </section>
+
+            <section class="settings-section wide">
+              <div class="section-title"><span class="section-title-icon"><i data-lucide="shield-check" aria-hidden="true"></i></span><h2>Protecciones activas</h2></div>
+              <p class="muted">Estos controles no se pueden relajar desde el dashboard.</p>
+              <div class="locked-grid">
+                <div class="locked-item"><i data-lucide="rotate-cw" aria-hidden="true"></i><div><strong>Round-robin estricto</strong><small>Producción tiene prioridad.</small></div></div>
+                <div class="locked-item"><i data-lucide="badge-check" aria-hidden="true"></i><div><strong>Una IP por cuenta</strong><small>Egreso chileno verificado.</small></div></div>
+                <div class="locked-item"><i data-lucide="bot-off" aria-hidden="true"></i><div><strong>2Captcha manual</strong><small>Un solve pagado por autorización.</small></div></div>
+                <div class="locked-item"><i data-lucide="file-lock-2" aria-hidden="true"></i><div><strong>Transporte browser-only</strong><small>PDFs por el perfil asignado.</small></div></div>
+                <div class="locked-item"><i data-lucide="gauge" aria-hidden="true"></i><div><strong>Sin catch-up</strong><small>No crea ráfagas tras downtime.</small></div></div>
+                <div class="locked-item"><i data-lucide="server" aria-hidden="true"></i><div><strong>Loopback-only</strong><small>Dashboard sólo en este equipo.</small></div></div>
+              </div>
+              <div id="runtimeSettingsSummary" class="danger-note">Cargando protecciones del runtime…</div>
+            </section>
+          </div>
+        </div>
+        <div class="settings-footer">
+          <div><div id="productionSettingsFeedback" class="control-feedback" role="status"></div><small class="muted">Los cambios se aplican al siguiente arranque del worker.</small></div>
+          <button id="saveProductionSettings" class="settings-save" type="submit"><i data-lucide="save" aria-hidden="true"></i> Guardar cambios</button>
+        </div>
+      </form>
     </dialog>
 
     <div class="hero">
@@ -1222,16 +2029,27 @@ def _dashboard_html() -> str:
     <div id="accounts" class="accounts"></div>
 
     <div class="kpis">
-      <div class="kpi"><div class="muted">Usadas hoy</div><div id="usedToday" class="value">-</div></div>
-      <div class="kpi"><div class="muted">Restantes hoy</div><div id="remainingToday" class="value">-</div></div>
-      <div class="kpi"><div class="muted">PDFs generados</div><div id="downloads" class="value">-</div></div>
-      <div class="kpi"><div class="muted">Captchas pendientes</div><div id="captchaPending" class="value">-</div></div>
-      <div class="kpi"><div class="muted">Jobs en cola</div><div id="queuedJobs" class="value">-</div></div>
-      <div class="kpi"><div class="muted">Respaldo</div><div id="backupState" class="value" style="font-size:18px">-</div></div>
+      <div class="kpi"><div class="kpi-top"><div class="muted">Usadas hoy</div><span class="kpi-icon"><i data-lucide="circle-check-big"></i></span></div><div id="usedToday" class="value">-</div></div>
+      <div class="kpi"><div class="kpi-top"><div class="muted">Restantes hoy</div><span class="kpi-icon ok"><i data-lucide="battery-charging"></i></span></div><div id="remainingToday" class="value">-</div></div>
+      <div class="kpi"><div class="kpi-top"><div class="muted">PDFs generados</div><span class="kpi-icon"><i data-lucide="file-text"></i></span></div><div id="downloads" class="value">-</div></div>
+      <div class="kpi"><div class="kpi-top"><div class="muted">Captchas pendientes</div><span class="kpi-icon warn"><i data-lucide="shield-question"></i></span></div><div id="captchaPending" class="value">-</div></div>
+      <div class="kpi"><div class="kpi-top"><div class="muted">2Captcha hoy</div><span class="kpi-icon"><i data-lucide="key-round"></i></span></div><div id="paidCaptcha" class="value">-</div></div>
+      <div class="kpi"><div class="kpi-top"><div class="muted">Jobs en cola</div><span class="kpi-icon"><i data-lucide="list-todo"></i></span></div><div id="queuedJobs" class="value">-</div></div>
+      <div class="kpi"><div class="kpi-top"><div class="muted">Respaldo</div><span class="kpi-icon ok"><i data-lucide="database-backup"></i></span></div><div id="backupState" class="value" style="font-size:18px">-</div></div>
     </div>
 
+    <section class="panel" style="margin-bottom:16px">
+      <div class="section-title"><span class="section-title-icon"><i data-lucide="repeat-2"></i></span><h2>Endurance</h2></div>
+      <p id="enduranceStatus" class="muted">Cargando estado…</p>
+      <div class="request-actions">
+        <button data-endurance-action="pause" type="button"><i data-lucide="pause"></i> Pausar</button>
+        <button class="onboarding-action" data-endurance-action="resume" type="button"><i data-lucide="play"></i> Reanudar</button>
+        <button class="instant-action" data-endurance-action="run-once" type="button"><i data-lucide="play-circle"></i> Ejecutar una vez</button>
+      </div>
+    </section>
+
     <section id="jobsPanel" class="panel" style="margin-bottom:16px;display:none">
-      <h2>Solicitudes recientes</h2>
+      <div class="section-title"><span class="section-title-icon"><i data-lucide="inbox"></i></span><h2>Solicitudes recientes</h2></div>
       <div class="table-scroll">
         <table class="jobs-table">
           <thead>
@@ -1243,7 +2061,7 @@ def _dashboard_html() -> str:
     </section>
 
     <section class="panel">
-      <h2>Ciclos recientes</h2>
+      <div class="section-title"><span class="section-title-icon"><i data-lucide="history"></i></span><h2>Ciclos recientes</h2></div>
       <table>
         <thead>
           <tr><th>#</th><th>Cuenta</th><th>Estado</th><th>Resultados</th><th>PDF</th><th>Parada</th><th>Finalizado</th></tr>
@@ -1251,7 +2069,21 @@ def _dashboard_html() -> str:
         <tbody id="cycles"></tbody>
       </table>
     </section>
+
+    <section class="panel" style="margin-top:16px">
+      <div class="section-title"><span class="section-title-icon"><i data-lucide="key-round"></i></span><h2>Intentos 2Captcha</h2></div>
+      <p class="muted">Distingue si 2Captcha produjo un token y si CBRS realmente lo aceptó. Nunca incluye tokens, claves ni datos del worker.</p>
+      <div class="table-scroll">
+        <table class="jobs-table captcha-attempts-table">
+          <thead>
+            <tr><th>Inicio</th><th>Cuenta</th><th>Acción</th><th>2Captcha</th><th>Costo</th><th>Demora</th><th>Resultado CBRS</th><th>Detalle</th></tr>
+          </thead>
+          <tbody id="captchaAttempts"></tbody>
+        </table>
+      </div>
+    </section>
   </main>
+  <script src="https://unpkg.com/lucide@1.33.0/dist/umd/lucide.min.js" crossorigin="anonymous"></script>
   <script>
     const statusLabels = {
       available: "disponible",
@@ -1329,10 +2161,33 @@ def _dashboard_html() -> str:
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
     }[char]));
+    const refreshIcons = () => {
+      if (window.lucide) window.lucide.createIcons();
+    };
+    const applyTheme = (theme, { persist = false } = {}) => {
+      const selected = theme === "dark" ? "dark" : "light";
+      document.documentElement.dataset.theme = selected;
+      const toggle = document.getElementById("themeToggle");
+      const dark = selected === "dark";
+      toggle.setAttribute("aria-pressed", String(dark));
+      toggle.setAttribute("aria-label", dark ? "Activar modo claro" : "Activar modo oscuro");
+      toggle.innerHTML = dark
+        ? '<i data-lucide="sun" aria-hidden="true"></i> <span>Modo claro</span>'
+        : '<i data-lucide="moon" aria-hidden="true"></i> <span>Modo oscuro</span>';
+      if (persist) {
+        try { localStorage.setItem("cbrs-dashboard-theme", selected); } catch (_) {}
+      }
+      refreshIcons();
+    };
+    applyTheme(document.documentElement.dataset.theme);
+    document.getElementById("themeToggle").addEventListener("click", () => {
+      applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", { persist: true });
+    });
     let current = null;
     let lastCaptchaNoticeKey = "";
     let stopRequested = false;
     let resumeRequested = false;
+    let renderedJobsSignature = "";
     async function refresh() {
       const response = await fetch("/api/status");
       current = await response.json();
@@ -1346,21 +2201,25 @@ def _dashboard_html() -> str:
         resumeRequested = false;
         button.className = "worker-action stop";
         button.disabled = stopRequested;
-        button.innerHTML = stopRequested ? "⌛ Deteniendo…" : "■ Detener";
+        button.innerHTML = stopRequested
+          ? '<i data-lucide="loader-circle" aria-hidden="true"></i> Deteniendo…'
+          : '<i data-lucide="square" aria-hidden="true"></i> Detener';
         hint.textContent = stopRequested
-          ? "No se tomarán más trabajos; se espera el punto seguro actual."
-          : "Detiene el worker de forma segura al terminar el trabajo actual.";
+          ? "Esperando el punto seguro actual."
+          : "Se detiene al terminar el trabajo actual.";
         return;
       }
       stopRequested = false;
       button.className = "worker-action resume";
       button.disabled = resumeRequested;
-      button.innerHTML = resumeRequested ? "⌛ Reanudando…" : "▶ Reanudar worker";
+      button.innerHTML = resumeRequested
+        ? '<i data-lucide="loader-circle" aria-hidden="true"></i> Reanudando…'
+        : '<i data-lucide="play" aria-hidden="true"></i> Reanudar worker';
       hint.textContent = resumeRequested
-        ? "Solicitando el arranque seguro del servicio CBRS."
+        ? "Solicitando arranque seguro."
         : status === "stopped"
-          ? "El test está detenido. PDFs, SQLite y trabajos en cola se conservan."
-          : "No hay un worker activo. Puedes iniciar el servicio CBRS.";
+          ? "Detenido · cola y PDFs conservados."
+          : "Sin worker activo · listo para iniciar.";
     }
     function render() {
       if (!current) return;
@@ -1386,18 +2245,29 @@ def _dashboard_html() -> str:
       document.getElementById("remainingToday").textContent = remaining;
       document.getElementById("downloads").textContent = stats.downloads ?? 0;
       document.getElementById("captchaPending").textContent = pool.captcha_pending_accounts ?? 0;
+      const captchaSolver = current.captcha_solver || {};
+      document.getElementById("paidCaptcha").textContent = `${captchaSolver.attempts ?? 0}/${captchaSolver.daily_limit ?? 0}`;
       const routeCount = pool.egress_routes ?? (current.accounts || []).length;
       const routeMode = pool.shared_egress ? `${routeCount} salida Chile compartida` : `${routeCount} salidas dedicadas`;
       document.getElementById("accountSummary").textContent = `${(current.accounts || []).length} cuentas autorizadas · ${quota} consultas teóricas por día · ${routeMode}`;
       const jobSummary = current.jobs?.summary || null;
       document.getElementById("queuedJobs").textContent = jobSummary ? (jobSummary.queued ?? 0) : "-";
       const backupLabels = { healthy: "saludable", stale: "atrasado", failed: "fallido", low_disk: "poco espacio", invalid: "inválido", not_configured: "no configurado" };
-      document.getElementById("backupState").textContent = current.backup ? (backupLabels[current.backup.status] || current.backup.status) : "-";
+      const restoreLabels = { verified: "restore probado", stale: "restore vencido", failed: "restore fallido", invalid: "restore inválido", not_verified: "restore pendiente" };
+      document.getElementById("backupState").textContent = current.backup
+        ? `${backupLabels[current.backup.status] || current.backup.status} · ${restoreLabels[current.backup.restore_status] || "restore pendiente"}`
+        : "-";
+      const endurance = current.endurance || {};
+      document.getElementById("enduranceStatus").textContent = endurance.active_job
+        ? `Activo: ${endurance.active_job.status} · ${endurance.active_job.job_id}`
+        : endurance.paused ? "Pausado" : endurance.enabled ? "Habilitado, esperando cooldown" : "Deshabilitado; run-once sigue disponible";
       renderAlert(current.alert);
       renderPoolFacts(pool, run, nextSeconds);
       renderAccounts(current.accounts || []);
       renderCycles(current.cycles || [], current.artifacts || []);
       renderJobs(current.jobs?.recent || []);
+      renderCaptchaAttempts(current.captcha_attempts || []);
+      refreshIcons();
     }
     function headline(data, nextSeconds) {
       const pool = data.pool || {};
@@ -1453,8 +2323,20 @@ def _dashboard_html() -> str:
           : `${account.remaining_today} restantes hoy · ${route}`;
         const phase = account.captcha_phase || "";
         const phaseLabel = captchaPhaseLabels[phase] || "";
+        const latestPaidAttempt = (current.captcha_attempts || []).find(
+          (attempt) => attempt.account_id === account.account_id
+        );
+        const paidRetryBlocked = Boolean(
+          latestPaidAttempt?.paid_retry_blocked_until
+          && new Date(latestPaidAttempt.paid_retry_blocked_until).getTime() > Date.now()
+        );
+        const paidSolveButton = current.runtime?.captcha_solver_mode === "2captcha_manual"
+          ? paidRetryBlocked
+            ? `<button class="account-action" disabled title="CBRS rechazó el solve anterior; usa recuperación visual.">2Captcha en cooldown</button>`
+            : `<button class="account-action" data-captcha-account="${escapeHtml(account.account_id)}" data-captcha-action="solve-external">Autorizar 1 solve 2Captcha</button>`
+          : "";
         const action = account.status === "captcha_pending"
-          ? `<button class="account-action" data-captcha-account="${escapeHtml(account.account_id)}" data-captcha-action="trigger">Resolver captcha</button>`
+          ? `${paidSolveButton}<button class="account-action" data-captcha-account="${escapeHtml(account.account_id)}" data-captcha-action="trigger">Resolver captcha visualmente</button>`
           : account.status === "captcha_solving" && phase === "waiting_operator"
             ? `<button class="account-action" data-captcha-account="${escapeHtml(account.account_id)}" data-captcha-action="complete">Validar y reactivar</button>`
             : account.status === "captcha_solving"
@@ -1480,11 +2362,28 @@ def _dashboard_html() -> str:
       if (!accountId) return;
       if (button) {
         button.disabled = true;
-        button.textContent = action === "complete" ? "Validando..." : "Abriendo Chrome...";
+        button.textContent = action === "complete"
+          ? "Validando..."
+          : action === "solve-external" ? "Autorizando 1 solve..." : "Abriendo Chrome...";
       }
-      await fetch(`/api/captcha/${encodeURIComponent(accountId)}/${action}`, { method: "POST" });
-      if (action === "trigger" && current?.runtime?.visual_url) {
-        window.open(current.runtime.visual_url, "cbrsVisualRecovery", "noopener");
+      const response = await fetch(`/api/captcha/${encodeURIComponent(accountId)}/${action}`, { method: "POST" });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const errors = {
+          RECENT_PORTAL_REJECTION: "CBRS rechazó el solve anterior. 2Captcha queda temporalmente bloqueado para evitar gasto repetido; usa la recuperación visual.",
+          DAILY_LIMIT: "Se alcanzó el límite diario de solves pagados.",
+          CIRCUIT_OPEN: "2Captcha está en cooldown por un fallo temporal.",
+        };
+        setControlFeedback(errors[result.error] || "No se pudo autorizar el solve pagado.", true);
+        await refresh();
+        return;
+      }
+      if (action === "trigger") {
+        if (current?.runtime?.visual_url) {
+          window.open(current.runtime.visual_url, "cbrsVisualRecovery", "noopener");
+        } else {
+          setControlFeedback("Chrome se está abriendo localmente para la recuperación visual.");
+        }
       }
       await refresh();
     }
@@ -1522,6 +2421,18 @@ def _dashboard_html() -> str:
     }
     function renderJobs(jobs) {
       const panel = document.getElementById("jobsPanel");
+      const jobsBody = document.getElementById("jobs");
+      const jobsSignature = JSON.stringify({
+        jobs,
+        accounts: (current.accounts || []).map((account) => ({
+          account_id: account.account_id,
+          label: account.username_prefix || account.label,
+          status: account.status,
+          paused_reason: account.paused_reason,
+        })),
+      });
+      if (jobsSignature === renderedJobsSignature) return;
+      renderedJobsSignature = jobsSignature;
       if (!jobs.length && !current.jobs) {
         panel.style.display = "none";
         return;
@@ -1556,7 +2467,7 @@ def _dashboard_html() -> str:
           documentTotals.set(key, end);
           documentOrdinals.set(job.job_id, { start, end, day });
         });
-      document.getElementById("jobs").innerHTML = jobs.map((job) => {
+      jobsBody.innerHTML = jobs.map((job) => {
         const terminal = ["completed", "partial", "failed", "cancelled"].includes(job.status);
         const preview = (job.completed_items || 0) > 0
           ? `<button class="preview-pdf" data-preview-job="${escapeHtml(job.job_id)}">Ver PDF</button>`
@@ -1601,13 +2512,32 @@ def _dashboard_html() -> str:
           const unavailableCount = failedEntries.filter((entry) => !entry.attempted).length;
           const summaryParts = [`${attempts.length} intento${attempts.length === 1 ? "" : "s"}`];
           if (unavailableCount) summaryParts.push(`${unavailableCount} no elegible${unavailableCount === 1 ? "" : "s"}`);
-          const open = attempts.length && ["waiting_capacity", "waiting_captcha"].includes(job.status) ? " open" : "";
-          reason = `<span class="job-reason"><details class="attempt-details"${open}><summary>${escapeHtml(summaryParts.join(" · "))}</summary><span class="attempt-list">${failedEntries.map((entry) => {
-            const rawReason = entry.reason || "failed";
-            const reasonText = stopReasonLabels[rawReason] || label(rawReason);
-            const actionText = entry.attempted ? "Intentado" : "No intentado";
-            return `<span class="attempt-tuple"><span class="attempt-number">${escapeHtml(entry.number)}</span><span class="attempt-account">${accountBadge(entry.accountId)}</span><span class="attempt-outcome"><strong>${actionText}:</strong> ${escapeHtml(reasonText)}</span></span>`;
-          }).join("")}</span></details></span>`;
+          const entriesByAccount = new Map();
+          failedEntries.forEach((entry) => {
+            if (!entriesByAccount.has(entry.accountId)) entriesByAccount.set(entry.accountId, []);
+            entriesByAccount.get(entry.accountId).push(entry);
+          });
+          summaryParts.push(`${entriesByAccount.size} cuenta${entriesByAccount.size === 1 ? "" : "s"}`);
+          const accountGroups = Array.from(entriesByAccount.entries()).map(([entryAccountId, entries]) => {
+            const latest = entries.at(-1);
+            const latestRawReason = latest.reason || "failed";
+            const latestReason = stopReasonLabels[latestRawReason] || label(latestRawReason);
+            const attemptedEntries = entries.filter((entry) => entry.attempted);
+            const countLabel = attemptedEntries.length
+              ? `${attemptedEntries.length} intento${attemptedEntries.length === 1 ? "" : "s"}`
+              : "No elegible";
+            const groupKey = `${job.job_id}:${entryAccountId}`;
+            const groupControlId = `attempt-account-${groupKey.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+            const historyRows = [...entries].reverse().map((entry, index) => {
+              const rawReason = entry.reason || "failed";
+              const reasonText = stopReasonLabels[rawReason] || label(rawReason);
+              const actionText = entry.attempted ? "Intentado" : "No intentado";
+              return `<span class="attempt-history-row${index === 0 ? " latest" : ""}"><span class="attempt-number">${escapeHtml(entry.number)}</span><span class="attempt-outcome"><strong>${actionText}:</strong> ${escapeHtml(reasonText)}</span></span>`;
+            }).join("");
+            return `<span class="attempt-account-group" data-attempt-account="${escapeHtml(groupKey)}"><input class="attempt-disclosure-input" id="${escapeHtml(groupControlId)}" type="checkbox"><label class="attempt-account-summary" for="${escapeHtml(groupControlId)}">${accountBadge(entryAccountId)}<span class="attempt-latest"><strong>Último ${escapeHtml(latest.number)}:</strong> ${escapeHtml(latestReason)}</span><span class="attempt-account-count">${escapeHtml(countLabel)}</span></label><span class="attempt-history">${historyRows}</span></span>`;
+          }).join("");
+          const jobControlId = `attempt-job-${String(job.job_id).replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+          reason = `<span class="job-reason"><span class="attempt-details" data-attempt-job="${escapeHtml(job.job_id)}"><input class="attempt-disclosure-input" id="${escapeHtml(jobControlId)}" type="checkbox"><label class="attempt-summary" for="${escapeHtml(jobControlId)}">${escapeHtml(summaryParts.join(" · "))}</label><span class="attempt-account-groups">${accountGroups}</span></span></span>`;
         } else if (job.status === "waiting_capacity") {
           reason = `<span class="job-reason">No se envió: no había cuentas elegibles.</span>`;
         } else if (job.status === "waiting_captcha") {
@@ -1617,7 +2547,7 @@ def _dashboard_html() -> str:
         }
         return `<tr>
           <td><a class="job-id" href="/api/jobs/${encodeURIComponent(job.job_id)}" target="_blank" title="${escapeHtml(job.job_id)}" aria-label="Abrir ${escapeHtml(job.job_id)}"><code>${escapeHtml(shortJobId(job.job_id))}</code></a></td>
-          <td>${escapeHtml(job.kind)}</td>
+          <td>${escapeHtml(job.kind)}${job.source === "endurance" ? " · endurance" : ""}</td>
           <td>${account}</td>
           <td>${documentNumber}</td>
           <td><span class="status ${escapeHtml(job.status)}">${escapeHtml(label(job.status))}</span></td>
@@ -1628,6 +2558,29 @@ def _dashboard_html() -> str:
           <td>${action}</td>
         </tr>`;
       }).join("");
+    }
+    function renderCaptchaAttempts(attempts) {
+      const body = document.getElementById("captchaAttempts");
+      const accountLabels = new Map((current.accounts || []).map((account) => [
+        account.account_id,
+        account.username_prefix || account.label || account.account_id,
+      ]));
+      const solverLabels = { reserved: "en espera", succeeded: "token resuelto", failed: "falló" };
+      const portalLabels = { accepted: "aceptado", rejected: "rechazado", indeterminate: "sin decisión", not_submitted: "no enviado" };
+      if (!attempts.length) {
+        body.innerHTML = '<tr><td colspan="8" class="muted">Aún no hay intentos pagados de 2Captcha.</td></tr>';
+        return;
+      }
+      body.innerHTML = attempts.map((attempt) => `<tr>
+        <td>${localTime(attempt.started_at)}</td>
+        <td>${escapeHtml(accountLabels.get(attempt.account_id) || attempt.account_id || "-")}</td>
+        <td>${escapeHtml(attempt.action || "-")}</td>
+        <td><span class="status ${escapeHtml(attempt.status || "")}">${escapeHtml(solverLabels[attempt.status] || attempt.status || "-")}</span></td>
+        <td>${attempt.cost_usd == null ? "-" : `$${Number(attempt.cost_usd).toFixed(5)}`}</td>
+        <td>${attempt.latency_seconds == null ? "-" : `${Number(attempt.latency_seconds).toFixed(1)} s`}</td>
+        <td><span class="status ${attempt.portal_status === "accepted" ? "completed" : attempt.portal_status === "rejected" ? "failed" : ""}">${escapeHtml(portalLabels[attempt.portal_status] || "pendiente de confirmación")}</span></td>
+        <td><code>${escapeHtml(attempt.portal_error_code || attempt.error_code || "sin error")}</code>${attempt.paid_retry_blocked_until ? `<br><small class="muted">Nuevo solve bloqueado hasta ${escapeHtml(localTime(attempt.paid_retry_blocked_until))}</small>` : ""}</td>
+      </tr>`).join("");
     }
     document.getElementById("stopButton").addEventListener("click", async () => {
       const button = document.getElementById("stopButton");
@@ -1747,6 +2700,108 @@ def _dashboard_html() -> str:
         button.disabled = false;
       }
     });
+    const productionSettingsModal = document.getElementById("productionSettingsModal");
+    const productionSettingsForm = document.getElementById("productionSettingsForm");
+    const saveProductionSettings = document.getElementById("saveProductionSettings");
+    const settingHumanLike = document.getElementById("settingHumanLike");
+    function setProductionSettingsFeedback(message, isError = false) {
+      const feedback = document.getElementById("productionSettingsFeedback");
+      feedback.textContent = message;
+      feedback.style.color = isError ? "var(--bad)" : "var(--muted)";
+    }
+    function setJitterFieldsEnabled() {
+      document.getElementById("settingJitterMin").disabled = !settingHumanLike.checked;
+      document.getElementById("settingJitterMax").disabled = !settingHumanLike.checked;
+    }
+    function fillProductionSettings(settings) {
+      const pool = settings.pool || {};
+      const endurance = settings.endurance || {};
+      const runtime = settings.runtime || {};
+      settingHumanLike.checked = Boolean(pool.human_like_behavior_enabled);
+      document.getElementById("settingJitterMin").value = pool.job_interval_min_seconds ?? 0;
+      document.getElementById("settingJitterMax").value = pool.job_interval_max_seconds ?? 0;
+      document.getElementById("settingQueueMax").value = pool.max_queued_production_jobs ?? 100;
+      document.getElementById("settingWorkerPoll").value = pool.worker_poll_seconds ?? 5;
+      document.getElementById("settingInstantJobs").checked = Boolean(pool.instant_jobs_enabled);
+      document.getElementById("settingEnduranceEnabled").checked = Boolean(endurance.enabled);
+      document.getElementById("settingCooldown").value = endurance.cooldown_seconds ?? 600;
+      document.getElementById("settingEnduranceQuota").value = endurance.jobs_per_account_per_day ?? 15;
+      document.getElementById("settingProductionReserve").value = endurance.production_reserve_per_account ?? 5;
+      document.getElementById("settingDailyQuota").value = pool.daily_quota_per_account ?? 20;
+      document.getElementById("runtimeSettingsSummary").textContent =
+        `Demora segura por petición: ${runtime.request_delay_seconds ?? "-"}s · ` +
+        `revalidación proxy: ${runtime.proxy_recheck_seconds ?? "-"}s · ` +
+        `2Captcha: ${runtime.captcha_solver_mode || "-"}, límite ${runtime.two_captcha_daily_limit ?? "-"}/día · ` +
+        `egreso esperado: ${runtime.expected_egress_country || "-"}.`;
+      setJitterFieldsEnabled();
+    }
+    settingHumanLike.addEventListener("change", setJitterFieldsEnabled);
+    document.getElementById("configureProduction").addEventListener("click", async () => {
+      setProductionSettingsFeedback("Cargando configuración…");
+      saveProductionSettings.disabled = true;
+      productionSettingsModal.showModal();
+      refreshIcons();
+      try {
+        const response = await fetch("/api/settings", { cache: "no-store" });
+        if (!response.ok) throw new Error(`settings request failed: ${response.status}`);
+        fillProductionSettings(await response.json());
+        const workerActive = ["running", "waiting", "waiting_capacity", "waiting_captcha"].includes(current?.status);
+        saveProductionSettings.disabled = workerActive;
+        setProductionSettingsFeedback(
+          workerActive ? "Detén el worker para editar y guardar estos valores." : "Listo para editar."
+        );
+      } catch (error) {
+        setProductionSettingsFeedback("No se pudo cargar la configuración de producción.", true);
+      }
+    });
+    document.getElementById("closeProductionSettings").addEventListener("click", () => productionSettingsModal.close());
+    productionSettingsForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const number = (id) => Number(document.getElementById(id).value);
+      const payload = {
+        pool: {
+          daily_quota_per_account: number("settingDailyQuota"),
+          human_like_behavior_enabled: settingHumanLike.checked,
+          job_interval_min_seconds: number("settingJitterMin"),
+          job_interval_max_seconds: number("settingJitterMax"),
+          worker_poll_seconds: number("settingWorkerPoll"),
+          max_queued_production_jobs: number("settingQueueMax"),
+          instant_jobs_enabled: document.getElementById("settingInstantJobs").checked,
+        },
+        endurance: {
+          enabled: document.getElementById("settingEnduranceEnabled").checked,
+          cooldown_seconds: number("settingCooldown"),
+          jobs_per_account_per_day: number("settingEnduranceQuota"),
+          production_reserve_per_account: number("settingProductionReserve"),
+        },
+      };
+      if (payload.pool.job_interval_max_seconds < payload.pool.job_interval_min_seconds) {
+        setProductionSettingsFeedback("El jitter máximo no puede ser menor que el mínimo.", true);
+        return;
+      }
+      if (payload.endurance.jobs_per_account_per_day + payload.endurance.production_reserve_per_account > payload.pool.daily_quota_per_account) {
+        setProductionSettingsFeedback("La asignación endurance más la reserva de producción supera el cupo diario.", true);
+        return;
+      }
+      saveProductionSettings.disabled = true;
+      setProductionSettingsFeedback("Validando y guardando…");
+      try {
+        const response = await fetch("/api/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.message || result.error || `HTTP ${response.status}`);
+        fillProductionSettings(result.settings);
+        setProductionSettingsFeedback("Configuración guardada. Se aplicará en el siguiente arranque del worker.");
+        await refresh();
+      } catch (error) {
+        setProductionSettingsFeedback(`No se pudo guardar: ${error.message}`, true);
+      } finally {
+        saveProductionSettings.disabled = false;
+      }
+    });
     let requestType = "text";
     document.querySelectorAll("[data-request-type]").forEach((button) => {
       button.addEventListener("click", () => {
@@ -1769,7 +2824,8 @@ def _dashboard_html() -> str:
           exampleList.innerHTML = '<span class="muted">Todavía no hay búsquedas por documento completadas para usar como ejemplo.</span>';
           return;
         }
-        exampleList.innerHTML = examples.map((example) => `<button class="example-choice" type="button" data-example-foja="${example.foja}" data-example-numero="${example.numero}" data-example-year="${example.year}"><span>Foja ${example.foja} · Número ${example.numero} · Año ${example.year}<br><small>${example.success_count} descarga${example.success_count === 1 ? "" : "s"} correcta${example.success_count === 1 ? "" : "s"}</small></span><small>Usar ejemplo →</small></button>`).join("");
+        exampleList.innerHTML = examples.map((example) => `<button class="example-choice" type="button" data-example-foja="${example.foja}" data-example-numero="${example.numero}" data-example-year="${example.year}"><span>Foja ${example.foja} · Número ${example.numero} · Año ${example.year}<br><small>${example.success_count} descarga${example.success_count === 1 ? "" : "s"} correcta${example.success_count === 1 ? "" : "s"}</small></span><small class="icon-label">Usar ejemplo <i data-lucide="arrow-right" aria-hidden="true"></i></small></button>`).join("");
+        refreshIcons();
       } catch (error) {
         exampleList.innerHTML = '<span class="muted">No se pudieron cargar los ejemplos comprobados.</span>';
       }
@@ -1890,6 +2946,18 @@ def _dashboard_html() -> str:
       await fetch(`/api/jobs/${encodeURIComponent(button.dataset.cancelJob)}/cancel`, { method: "POST" });
       await refresh();
     });
+    document.querySelectorAll("[data-endurance-action]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          await fetch(`/api/endurance/${button.dataset.enduranceAction}`, { method: "POST" });
+          await refresh();
+        } finally {
+          button.disabled = false;
+        }
+      });
+    });
+    refreshIcons();
     refresh().catch(console.error);
     setInterval(() => refresh().catch(console.error), 2000);
   </script>

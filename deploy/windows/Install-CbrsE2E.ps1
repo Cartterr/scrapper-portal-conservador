@@ -136,7 +136,7 @@ function Get-WslDistributions {
     $raw = & wsl.exe --list --quiet 2>$null
     return @(
         $raw |
-            ForEach-Object { ([string]$_).Replace([char]0, '').Trim() } |
+            ForEach-Object { ([string]$_).Replace([string][char]0, '').Trim() } |
             Where-Object { $_ }
     )
 }

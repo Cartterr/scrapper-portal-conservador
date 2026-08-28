@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 class StopReason(str, Enum):
     CAPTCHA_REJECTED = "captcha_rejected"
+    CAPTCHA_SOLVER = "captcha_solver_failed"
     DAILY_LIMIT = "daily_limit"
     RATE_LIMIT = "rate_limit"
     WAF_CHALLENGE = "waf_challenge"
@@ -37,6 +38,9 @@ class SafetyStopException(RuntimeError):
 SENSITIVE_KEY_PARTS = (
     "authorization",
     "auth_key",
+    "api_key",
+    "clientkey",
+    "client_key",
     "cookie",
     "csrf",
     "g-recaptcha-response",

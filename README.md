@@ -11,26 +11,32 @@
 
 ## Resumen ejecutivo
 
-Antes de instalar, revisar [PREREQUISITES.txt](PREREQUISITES.txt). Ese archivo
+Antes de instalar, revisar [los prerrequisitos nativos](docs/native-windows-prerequisites.md). Ese archivo
 define los requisitos del equipo, autorizaciones, cuentas, proxies, respaldo y
 gates que tambien debera aplicar el instalador E2E de Windows.
 
 ### Instalación E2E en Windows
 
-Después de clonar una release aprobada, el cliente solo debe hacer clic derecho
-sobre [`INSTALL-CBRS.bat`](INSTALL-CBRS.bat) y elegir **Ejecutar como
-administrador**. El instalador:
+La ruta activa es Windows nativo; WSL queda únicamente como referencia legacy.
+Consultar [el runbook nativo](docs/native-windows-endurance.md). Desde PowerShell
+elevado:
 
-1. valida el checkout y habilita/reutiliza WSL2 con Ubuntu 24.04;
-2. puede continuar automáticamente después de un reinicio requerido;
-3. instala el runtime Linux y conserva cualquier estado existente;
-4. solicita cuentas, contraseñas y proxies mediante campos ocultos;
-5. configura restic, servicios y el dashboard nativo;
-6. ejecuta readiness y muestra un resultado `PASS/FAIL` sanitizado.
+```powershell
+.\deploy\windows\Install-CbrsNative.ps1
+```
+
+El instalador nativo:
+
+1. instala/reutiliza Python, Chrome y restic nativos;
+2. conserva el estado durable bajo `G:\CBRS`;
+3. prepara el repositorio restic bajo `E:\CBRS-backup\restic`;
+4. restringe `C:\ProgramData\CBRS\cbrs.env` al usuario y `SYSTEM`;
+5. registra tareas reiniciables para worker, dashboard y backup diario;
+6. deja las tareas deshabilitadas hasta superar readiness y el gate de tráfico.
 
 La instalación no aprueba egresos ni inicia el worker sin confirmaciones
-separadas. Para revisar el plan sin cambios se puede ejecutar
-`INSTALL-CBRS.bat --plan` desde una consola.
+separadas. El arranque requiere explícitamente
+`-AcknowledgeAuthorizedLiveTraffic`.
 
 Esta plataforma facilita consultas documentales autorizadas en el portal CBRS y
 convierte las imágenes obtenidas en archivos PDF ordenados para revisión local.
@@ -40,8 +46,9 @@ ritmo controlado, monitoreo local y paradas automáticas ante señales de riesgo
 El sistema está diseñado para operar cuentas expresamente autorizadas sin
 sustituir los controles del portal. Las sesiones se renuevan o autentican dentro
 del navegador persistente usando secretos referenciados por variables de
-entorno. CAPTCHA sigue siendo una intervención visual: no se almacenan secretos
-en Git, no se rotan identidades y no se realizan reintentos agresivos.
+entorno. Por defecto CAPTCHA sigue siendo una intervención visual; opcionalmente
+se puede habilitar un solve 2Captcha manual de un solo uso. No se almacenan secretos en
+Git, no se rotan identidades y no se realizan reintentos agresivos.
 
 | Valor para la operación | Cómo se materializa |
 |---|---|
@@ -205,7 +212,7 @@ Las detenciones cubren, entre otras señales:
 El pool permite distribuir ciclos entre tres cuentas nominales autorizadas. Cada
 cuenta conserva su propio perfil de Chrome, sesión y ruta de egreso fija o sticky.
 El scheduler respeta el cupo configurado y excluye temporalmente una cuenta si
-requiere revisión o resolución manual de CAPTCHA.
+requiere revisión o agotó el único intento automático de CAPTCHA configurado.
 
 ```mermaid
 flowchart LR
@@ -273,79 +280,40 @@ alinearse con la autorización o contrato aplicable.
 | Componente | Uso |
 |---|---|
 | **Python 3.14** | Aplicación, orquestación y comandos. |
-| **Playwright + Google Chrome** | Perfiles persistentes y aislados sobre Ubuntu/Xvfb o WSLg. |
+| **Playwright + Google Chrome** | Perfiles persistentes y aislados en Windows nativo. |
 | **Pillow** | Ensamblaje de imágenes en documentos PDF. |
 | **SQLite** | Estado local del monitoreo y del pool. |
-| **`http.server`** | Dashboard y API JSON en loopback; en WSL2 puede habilitarse explícitamente la interfaz privada del VM. |
+| **`http.server`** | Dashboard y API JSON exclusivamente en loopback. |
 | **pytest** | Pruebas automatizadas de regresión y seguridad. |
 
 ## Límite del entorno soportado
 
-CBRS tiene **un solo runtime soportado: Ubuntu Linux**.
+La prueba endurance usa exclusivamente **Windows nativo**: Python 3.14, Chrome,
+Playwright, SQLite, restic y Windows Scheduled Tasks. No se debe instalar ni
+ejecutar esta ruta mediante WSL, Docker, Xvfb o una máquina virtual. Los assets
+Ubuntu/WSL permanecen en el repositorio solo como material legacy y no forman
+parte del runbook activo.
 
-- En producción, Python, Playwright, Google Chrome, Xvfb, SQLite, restic,
-  dashboards y servicios `systemd` se ejecutan directamente en Ubuntu.
-- En un PC Windows, esos mismos componentes se ejecutan dentro de Ubuntu sobre
-  WSL2. La operación desatendida usa Xvfb igual que producción. WSLg se reserva
-  únicamente para depuración visual o intervención manual solicitada.
-- Windows y PowerShell no forman parte del runtime de CBRS. No se debe ejecutar
-  `python -m cbrs` con Python de Windows ni conectar Playwright Linux a Chrome de
-  Windows.
-- El único paso del host Windows es instalar o abrir WSL2. Por ejemplo,
-  `wsl --install --distribution Ubuntu-24.04` se ejecuta una sola vez desde una
-  terminal elevada de Windows. Después de abrir Ubuntu, todos los comandos de
-  este README se ejecutan con Bash dentro de Ubuntu.
+### Operación sin ventana
 
-El repositorio puede permanecer en una unidad montada como `/mnt/v`, pero el
-proceso, virtualenv, navegador, perfiles operativos y servicios siguen siendo
-Linux. Los scripts PowerShell de `deploy/windows/` son ayudantes opcionales del
-host y no son la ruta normal de instalación, prueba ni operación.
-
-### Operación sin ventana y sin interferencia de foco
-
-La ruta productiva cumple el requisito operativo de ejecución *headless* sin
-activar el modo `--headless` de Chrome:
-
-```text
-systemd -> Python/Playwright -> Google Chrome headed -> DISPLAY=:99 -> Xvfb
-```
-
-Xvfb es un servidor gráfico virtual en memoria, independiente de WSLg, del
-escritorio de Windows y de cualquier sesión física de Ubuntu. Chrome no crea una
-ventana en el escritorio del operador, no aparece en la barra de tareas y no
-puede tomar el foco ni interrumpir escritura en otras aplicaciones. Esto no es
-una ventana movida fuera de pantalla: el navegador pertenece a otro servidor de
-display que normalmente no tiene visor conectado.
-
-La distinción debe conservarse en diagnósticos y reportes:
-
-- **modo del motor:** Chrome headed convencional, requerido por el comportamiento
-  observado de CBRS;
-- **modo operativo:** display virtual aislado, sin ventana física ni impacto en
-  el foco del operador;
-- **modo `--headless` de Chrome:** diagnóstico solamente mientras CBRS lo rechace
-  de forma inconsistente.
-
-El servicio `cbrs-display.service` crea `DISPLAY=:99` y
-`cbrs-worker.service` depende de él. noVNC/x11vnc permanecen detenidos durante la
-operación normal y se levantan solo para una recuperación visual explícita. En
-WSL2 no se debe exportar `DISPLAY=:0` al worker, porque ese valor corresponde a
-WSLg y sí puede crear una ventana visible en Windows.
+El worker programado ejecuta Chrome en modo headless. Para recuperación manual,
+primero se pausa endurance y se detiene el worker; solo entonces se abre headed
+el perfil de la cuenta afectada. El worker y la recuperación nunca comparten un
+perfil simultáneamente.
 
 ## Inicio rápido
 
 ### 1. Instalar dependencias
 
-Abre una terminal Ubuntu —directa en producción o mediante WSL2 en desarrollo—
-y ejecuta:
+Abre PowerShell nativo como administrador y ejecuta:
 
-```bash
-bash deploy/install-wsl.sh
-.venv/bin/python -m pytest -q
+```powershell
+.\deploy\windows\Install-CbrsNative.ps1 -InstallDevelopmentRequirements
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-La guía de Ubuntu, el ejemplo de `systemd` y el gate de aceptación están en
-[Preparación E2E y despliegue en Ubuntu](docs/e2e-production-readiness.md).
+El procedimiento completo y el gate de aceptación están en
+[Endurance E2E nativo en Windows](docs/native-windows-endurance.md).
 
 ### 2. Configurar el egreso autorizado
 
@@ -414,46 +382,16 @@ worker, cupos, pacing, preflight y safety stops; no salta los gates de CBRS.
 Si CBRS devuelve más de una inscripción válida, se descarga un PDF
 permanente por cada resultado.
 
-El dashboard/API escucha normalmente en `127.0.0.1:8765`. En WSL2, el drop-in
-`deploy/cbrs-dashboard-wsl.conf` habilita de forma explícita la interfaz privada
-de la VM para que pueda abrirse desde cualquier navegador del mismo PC. Usa:
+El dashboard/API escucha exclusivamente en `127.0.0.1:8765`; no admite un bind
+privado durante la operación nativa. Las búsquedas publican PDFs permanentes en
+`G:\CBRS\outputs\jobs\<job_id>`. Las tareas `CBRS Worker`, `CBRS Dashboard` y
+`CBRS Daily Backup` recuperan la operación después del siguiente inicio de
+sesión del mismo usuario.
 
-```bash
-hostname -I
-```
-
-Si el resultado comienza, por ejemplo, con `172.20.42.4`, las dos rutas desde
-Chrome, Edge, Brave o Firefox de Windows son:
-
-```text
-http://127.0.0.1:8765/
-http://172.20.42.4:8765/
-```
-
-La segunda dirección puede cambiar después de apagar completamente WSL. Esta
-excepción es solo para la red privada de desarrollo WSL2; la unidad productiva
-permanece ligada a loopback y los puertos nunca se exponen a Internet. Las
-búsquedas procesan todas las coincidencias y publican PDFs permanentes bajo
-`outputs/jobs/<job_id>/`.
-
-En WSL2 el dashboard se abre en el navegador **nativo de Windows**, mientras que
-el worker, SQLite, Playwright y todos los procesos CBRS permanecen en Ubuntu. Es
-una excepción exclusiva de visualización: WSLg expone actualmente el escritorio
-a 60 Hz, mientras que el navegador nativo puede usar la frecuencia real del
-monitor. El puente utiliza `http://127.0.0.1:8765/`, espera hasta que responda y
-no envía tráfico CBRS ni mueve lógica de aplicación a Windows.
-
-En la estación WSL de desarrollo, el inicio de sesión de Windows puede registrar
-`deploy/windows/Start-CbrsWslHidden.vbs` como puente de arranque sin privilegios.
-Ese puente mantiene Ubuntu iniciado y abre el dashboard en el navegador nativo
-cuando el endpoint esté listo; no ejecuta lógica CBRS en Windows. El botón
-**Configurar cuentas** abre un formulario local para agregar, actualizar o
-eliminar cuentas. Las contraseñas existentes nunca se cargan ni se muestran: los
-campos vacíos las conservan y el botón de revelar solo muestra valores escritos
-en la sesión actual. Al guardar, una unidad local de `systemd` aplica la
-configuración protegida y mantiene el worker detenido hasta que el operador use
-**Reanudar worker**. Una vez iniciado Ubuntu, `systemd` recupera el worker, el
-dashboard y el temporizador de respaldo habilitados.
+`Start-CbrsNative.ps1` ejecuta además un gate operacional post-arranque. No
+declara éxito hasta comprobar tareas habilitadas, worker y dashboard corriendo,
+heartbeat vivo y `/api/health`; ante un fallo detiene sólo los procesos que el
+arranque actual creó y restaura el estado habilitado/deshabilitado previo.
 
 ### Controles de operación en el dashboard
 
@@ -490,6 +428,9 @@ egreso fijo declarado, no rotación automática.
 
 ## Validación y monitoreo de largo plazo
 
+Los comandos `soak` siguientes son diagnósticos legacy. La prueba indefinida
+activa usa `jobs worker` más el controlador `jobs endurance`.
+
 Ejecuta una validación real de bajo volumen:
 
 ```bash
@@ -519,20 +460,19 @@ El dashboard de soak utiliza por defecto
 [`http://127.0.0.1:8765`](http://127.0.0.1:8765). El runner real ejecuta ciclos
 contra CBRS; el dashboard por sí solo es de solo lectura.
 
-Para comprobar la preparación E2E desde el propio Ubuntu sin iniciar Chrome ni
-tráfico, ejecutar dentro de `/opt/cbrs`:
+Para comprobar la preparación E2E nativa sin iniciar Chrome ni crear un CAPTCHA:
 
-```bash
-.venv/bin/python -m cbrs readiness \
-  --target ubuntu \
-  --env-file /etc/cbrs/cbrs.env \
-  --config /var/lib/cbrs/account-pool.json \
-  --json-report /var/lib/cbrs/readiness/indefinite-test.json
+```powershell
+.\.venv\Scripts\python.exe -m cbrs readiness `
+  --target windows `
+  --env-file C:\ProgramData\CBRS\cbrs.env `
+  --config G:\CBRS\account-pool.json `
+  --json-report G:\CBRS\readiness\indefinite-test.json
 ```
 
 El procedimiento escalonado, los controles de arranque/parada y los criterios
 de observación están en
-[`docs/indefinite-test-runbook.md`](docs/indefinite-test-runbook.md).
+[`docs/native-windows-endurance.md`](docs/native-windows-endurance.md).
 
 ## Pool de cuentas autorizadas
 
@@ -547,6 +487,11 @@ Este gate verifica país `CL`, carga de Google reCAPTCHA Enterprise y respuesta
 inicial del portal CBRS. Si falla, `pool init`, `pool login-debug` y los ciclos
 reales no deben abrir el flujo del portal.
 
+La integración opcional de 2Captcha y el procedimiento de prueba larga están en
+[`docs/2captcha-long-run.md`](docs/2captcha-long-run.md). El proxy del navegador
+y el solver v3 son rutas separadas: 2Captcha documenta reCAPTCHA Enterprise v3
+únicamente como tarea `proxyless`.
+
 ### Diagnosticar perfiles separados manualmente
 
 ```bash
@@ -560,6 +505,9 @@ para diagnóstico visual; la operación normal usa los nombres de variables de
 secreto declarados en la configuración del pool.
 
 ### Dashboard y ejecución
+
+`pool run` es legacy. Para endurance usar los comandos `jobs endurance` y las
+tareas nativas del runbook.
 
 ```bash
 python -m cbrs pool dashboard
@@ -611,10 +559,12 @@ de rutas de salida y marca cada cuenta como **salida compartida**, mientras los
 perfiles, sesiones y cupos siguen siendo independientes. Compartir una salida
 no modifica el límite de 20 consultas por cuenta ni permite tráfico paralelo.
 
-Si CBRS responde `captcha_rejected`, la cuenta queda marcada como
-`captcha pendiente` y sale temporalmente del scheduler. El botón **Resolver
-captcha** abre el perfil correspondiente en modo visible; después ejecuta una
-verificación segura y reincorpora la cuenta únicamente si la sesión es válida.
+En modo `2captcha_manual`, un rechazo del token del navegador deja la cuenta como
+`captcha pendiente` sin contactar a 2Captcha. El operador puede pulsar
+**Autorizar 1 solve 2Captcha**; esa autorización no se acumula y se consume solo
+en el siguiente intento real de esa cuenta. Si no se usa, vence después de 15
+minutos. Un segundo rechazo vuelve a pausar la cuenta. **Resolver visualmente**
+conserva el camino headed alternativo.
 
 ## Resultados y trazabilidad
 
@@ -638,7 +588,7 @@ cbrs/
   cli.py                     Comandos y experiencia del operador
   config.py                  Configuración CBRS_* y valores seguros
   preflight.py               Validación de egreso y reportes sanitizados
-  browser_runtime.py         Detección de Google Chrome en Ubuntu y fallbacks diagnósticos
+  browser_runtime.py         Detección de Google Chrome nativo y fallbacks diagnósticos
   browser_session.py         Perfiles persistentes y acceso same-origin
   client.py                  Ritmo, sesión y validación de respuestas
   safety.py                  Clasificación de detenciones y redacción
@@ -669,8 +619,8 @@ docs/                        Arquitectura y guías operacionales
   encolar una solicitud prioritaria y solicitar el arranque seguro del worker.
   Los runners `soak` y `pool` siguen siendo los únicos procesos que ejecutan
   tráfico real contra CBRS.
-- No existe resolución externa de CAPTCHA, rotación automática de IP, cambio de
-  identidad ni reintentos agresivos.
+- La resolución externa es opt-in y hace como máximo un fallback por operación;
+  no existe rotación automática de IP, cambio de identidad ni reintento agresivo.
 - Una cuenta pausada requiere revisión y no se fuerza automáticamente.
 - Las pausas de seguridad sobreviven al reinicio del runner; un heartbeat vivo
   impide ejecutar dos runners sobre los mismos perfiles.
@@ -682,9 +632,9 @@ docs/                        Arquitectura y guías operacionales
 ## Validación de infraestructura pendiente
 
 La suite offline valida la cola, idempotencia, failover, cupos, PDFs, API,
-redacción y respaldo. La aceptación final todavía debe ejecutar en Ubuntu del
-cliente el gate vivo de cuentas nuevas, 60 consultas autorizadas, CAPTCHA visual,
-reinicio durante descarga y soak de siete días.
+redacción y respaldo. La aceptación final todavía debe ejecutar en el host
+Windows del cliente el gate vivo de las tres cuentas, el probe pagado único,
+reinicio durante descarga, 24 horas y luego siete días de endurance.
 
 ## Documentación adicional
 
@@ -692,4 +642,6 @@ reinicio durante descarga y soak de siete días.
 - [Runtime de confianza fija](docs/fixed-trust-runtime.md)
 - [Pruebas de largo plazo](docs/soak-testing.md)
 - [Plan de validación](docs/validation-plan.md)
-- [Preparación E2E y despliegue en Ubuntu](docs/e2e-production-readiness.md)
+- [Prerrequisitos Windows nativo](docs/native-windows-prerequisites.md)
+- [Endurance E2E nativo](docs/native-windows-endurance.md)
+- [Preparación Ubuntu legacy](docs/e2e-production-readiness.md)

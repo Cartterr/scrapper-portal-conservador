@@ -1,5 +1,9 @@
 # Runbook de prueba E2E indefinida
 
+> **LEGACY:** este documento conserva la ruta histórica WSL para recuperación.
+> La operación activa no usa WSL, Docker ni virtualización. Usar
+> [`native-windows-endurance.md`](native-windows-endurance.md).
+
 Este runbook separa deliberadamente la preparación sin tráfico de la puesta en
 marcha real. La ruta de prueba es la cola durable (`jobs worker`), no el runner
 legacy de `soak` ni el pool legacy. El worker puede quedar activo

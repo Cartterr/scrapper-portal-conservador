@@ -1,6 +1,10 @@
 CBRS - PRERREQUISITOS PARA INSTALACION E2E
 ==========================================
 
+DOCUMENTO LEGACY: la ruta WSL/Ubuntu descrita abajo ya no es activa. Para la
+instalacion vigente usar docs/native-windows-prerequisites.md y
+docs/native-windows-endurance.md. No instalar WSL, Docker ni virtualizacion.
+
 Version del documento: 1.1
 Entorno soportado: Ubuntu 24.04 LTS; en Windows, Ubuntu 24.04 dentro de WSL2
 
@@ -38,8 +42,9 @@ No soportado como runtime:
   - Python nativo de Windows ejecutando CBRS.
   - Chrome de Windows como navegador de las cuentas CBRS.
   - Docker, React, Node.js, FastAPI, Postgres o un servidor web publico.
-  - Solucionadores externos de CAPTCHA, rotacion automatica de identidad o
-    exportacion de cookies/tokens.
+  - Rotacion automatica de identidad o exportacion de cookies/tokens.
+  - Solucionadores externos de CAPTCHA sin autorizacion explicita y sin el
+    modo acotado documentado en docs/2captcha-long-run.md.
 
 
 2. AUTORIZACIONES OBLIGATORIAS DEL CLIENTE
@@ -228,8 +233,8 @@ INSTALL-CBRS.bat debe instalar o comprobar, de forma idempotente:
   - Xvfb, x11vnc, noVNC y websockify.
   - restic, curl, ca-certificates, gnupg, rsync y utilidades requeridas.
   - Virtualenv `/opt/cbrs/.venv`.
-  - Versiones fijadas en `requirements.txt`, incluidas Playwright, Pillow,
-    python-dotenv, curl_cffi y pytest.
+  - Versiones runtime fijadas en `requirements.txt`: Playwright, Pillow,
+    python-dotenv, curl_cffi y tzdata. pytest vive en `requirements-dev.txt`.
   - Dependencias Linux requeridas por Playwright/Chromium.
   - Usuario/grupo de servicio `cbrs`, directorios y permisos.
   - Unidades systemd del display, worker, dashboard, VNC/noVNC, backup y
@@ -394,7 +399,8 @@ Una instalacion esta lista solo cuando:
   - Cada cuenta tiene perfil, proxy, baseline, cuota y sesion verificables.
   - El dashboard abre localmente y muestra cuentas, jobs, PDFs, alertas y los
     controles `Crear solicitud`, ejemplos comprobados y configuracion de cuentas.
-  - CAPTCHA pausa trafico y permite recuperacion manual.
+  - CAPTCHA agota como maximo un fallback autorizado, pausa trafico y permite
+    recuperacion manual.
   - SQLite, perfiles y PDFs sobreviven reinicios.
   - Existe un backup cifrado reciente en almacenamiento secundario.
   - No se ha expuesto ningun secreto ni puerto publico.
