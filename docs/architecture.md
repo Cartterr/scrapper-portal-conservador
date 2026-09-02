@@ -119,7 +119,7 @@ Production settings are optional and prefixed with `CBRS_`:
 CBRS_BROWSER_BACKEND=chrome
 CBRS_BROWSER_EXECUTABLE_PATH=
 CBRS_PROFILE_DIR=.cbrs/chrome-profile
-CBRS_HEADLESS=0
+CBRS_HEADLESS=1
 CBRS_WINDOW_MODE=offscreen
 CBRS_EGRESS_MODE=client_vpn
 CBRS_EXPECTED_EGRESS_COUNTRY=CL

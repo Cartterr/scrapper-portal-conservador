@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +41,7 @@ def run_preflight(
     fetch_egress: Callable[[], dict[str, Any]] | None = None,
     write_report: bool = True,
     approve_baseline: bool = False,
+    allow_baseline_replacement: bool = False,
 ) -> PreflightResult:
     fetch_egress = fetch_egress or (lambda: fetch_public_egress(settings))
     checks: list[dict[str, Any]] = []
@@ -119,7 +121,10 @@ def run_preflight(
             approve=approve_baseline,
         )
         if baseline_status == "mismatch":
-            errors.append("fixed egress hash differs from saved baseline")
+            if allow_baseline_replacement:
+                baseline_status = "replacement_pending"
+            else:
+                errors.append("fixed egress hash differs from saved baseline")
         elif baseline_status == "approval_required":
             errors.append(
                 "fixed egress baseline approval required; rerun preflight with "
@@ -129,7 +134,7 @@ def run_preflight(
     checks.append(
         {
             "name": "egress baseline",
-            "ok": baseline_status in {"created", "matched"},
+            "ok": baseline_status in {"created", "matched", "replacement_pending"},
             "detail": baseline_status,
         }
     )
@@ -210,6 +215,63 @@ def baseline_file(settings: Settings = SETTINGS) -> Path:
     return settings.profile_dir.parent / "fixed-egress-baseline.json"
 
 
+def replace_egress_baseline(
+    settings: Settings,
+    *,
+    egress_hash: str,
+    egress_country: str,
+) -> Path:
+    """Atomically replace one sanitized fixed-egress baseline.
+
+    All live provider, country, portal, and uniqueness gates must run before
+    this function. It refuses malformed or missing prior baselines and archives
+    only the known sanitized fields.
+    """
+    if not egress_hash:
+        raise ValueError("a validated egress hash is required")
+    if egress_country != settings.expected_egress_country:
+        raise ValueError("replacement egress country does not match the configured country")
+
+    path = baseline_file(settings)
+    if not path.is_file():
+        raise ValueError("an existing egress baseline is required for replacement")
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("the existing egress baseline is invalid") from exc
+    if current.get("schema") != "cbrs-fixed-egress-baseline-v1" or not current.get(
+        "egress_hash"
+    ):
+        raise ValueError("the existing egress baseline is invalid")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive = _unique_baseline_archive(path.parent, timestamp)
+    archived_payload = {
+        "schema": current.get("schema"),
+        "created_at": current.get("created_at"),
+        "egress_hash": current.get("egress_hash"),
+        "egress_country": current.get("egress_country"),
+        "profile_hash": current.get("profile_hash"),
+        "archived_at": _now(),
+    }
+    _atomic_json_write(archive, archived_payload)
+    try:
+        _atomic_json_write(
+            path,
+            {
+                "schema": "cbrs-fixed-egress-baseline-v1",
+                "created_at": _now(),
+                "egress_hash": egress_hash,
+                "egress_country": egress_country,
+                "profile_hash": profile_hash(settings),
+            },
+        )
+    except Exception:
+        archive.unlink(missing_ok=True)
+        raise
+    return archive
+
+
 def _check_or_create_baseline(
     settings: Settings,
     *,
@@ -269,7 +331,7 @@ def _proxy_route_allowed(settings: Settings) -> bool:
         return False
     if not settings.proxy_url:
         return True
-    return settings.egress_mode == "dedicated_static_isp"
+    return settings.egress_mode in {"dedicated_static_isp", "residential_sticky"}
 
 
 def _proxy_route_detail(settings: Settings) -> str:
@@ -277,8 +339,11 @@ def _proxy_route_detail(settings: Settings) -> str:
         return "CBRS_CLOAK_PROXY_URL configured"
     if not settings.proxy_url:
         return "not configured"
-    if settings.egress_mode != "dedicated_static_isp":
-        return "CBRS_PROXY_URL requires CBRS_EGRESS_MODE=dedicated_static_isp"
+    if settings.egress_mode not in {"dedicated_static_isp", "residential_sticky"}:
+        return (
+            "CBRS_PROXY_URL requires CBRS_EGRESS_MODE="
+            "dedicated_static_isp or residential_sticky"
+        )
     parsed = urlparse(settings.proxy_url)
     return f"{parsed.scheme.lower()} proxy configured"
 
@@ -320,3 +385,30 @@ def _unique_report_path(log_dir: Path, prefix: str, timestamp: str) -> Path:
         if not candidate.exists():
             return candidate
     raise RuntimeError("Could not allocate unique preflight report path")
+
+
+def _atomic_json_write(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(redact(payload), handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _unique_baseline_archive(directory: Path, timestamp: str) -> Path:
+    path = directory / f"fixed-egress-baseline-{timestamp}.bak.json"
+    if not path.exists():
+        return path
+    for counter in range(2, 1000):
+        candidate = directory / f"fixed-egress-baseline-{timestamp}-{counter}.bak.json"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("Could not allocate unique egress baseline archive path")

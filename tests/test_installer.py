@@ -33,6 +33,8 @@ def _payload(*, proxy_url: str = "http://user:password@proxy.example.test:8080")
                 "username": "operator@example.test",
                 "password": "pa'ss$word`tick\\slash\"quote",
                 "proxy_url": proxy_url,
+                "proxy_provider": "2captcha_dedicated_isp",
+                "proxy_brand": "2Captcha",
                 "daily_quota": 20,
             }
         ],
@@ -58,6 +60,13 @@ def test_installer_assets_are_required_by_readiness() -> None:
     assert all((ROOT / path).is_file() for path in expected)
 
 
+def test_native_readiness_checks_the_selected_captcha_provider() -> None:
+    source = (ROOT / "cbrs" / "readiness.py").read_text(encoding="utf-8")
+
+    assert "CapSolverClient" in source
+    assert 'captcha_provider = "CapSolver" if using_capsolver else "2Captcha"' in source
+
+
 def test_protected_configuration_preserves_special_characters(tmp_path: Path) -> None:
     module = _load_configure_module()
     validated = module.validate_payload(_payload())
@@ -72,7 +81,9 @@ def test_protected_configuration_preserves_special_characters(tmp_path: Path) ->
 
     assert parsed["CBRS_ACCOUNT_1_PASSWORD"] == _payload()["accounts"][0]["password"]
     assert parsed["RESTIC_REPOSITORY"] == "/srv/secondary/restic"
-    assert parsed["CBRS_HEADLESS"] == "0"
+    assert parsed["CBRS_HEADLESS"] == "1"
+    assert validated["accounts"][0]["proxy_provider"] == "2captcha_dedicated_isp"
+    assert validated["accounts"][0]["proxy_brand"] == "2Captcha"
 
 
 def test_protected_configuration_rejects_unsupported_proxy() -> None:
@@ -130,6 +141,7 @@ def test_account_update_preserves_blank_existing_secrets(
     assert account["password"] == "existing-password"
     assert account["proxy_url"] == "http://user:pass@proxy.example.test:8080"
     assert account["daily_quota"] == 25
+    assert account["proxy_provider"] == "generic_static"
 
 
 def test_run_with_env_does_not_evaluate_shell_syntax(tmp_path: Path) -> None:
@@ -201,6 +213,14 @@ def test_native_windows_installer_is_repeatable_and_does_not_start_traffic() -> 
     assert "Disable-ScheduledTask" in source
     assert "live_traffic_started = $false" in source
     assert "Start-ScheduledTask" not in source
+    assert "-RestartCount 999" in source
+    assert "-ExecutionTimeLimit ([TimeSpan]::Zero)" in source
+    assert "-AllowStartIfOnBatteries" in source
+    assert "-DontStopIfGoingOnBatteries" in source
+    assert "NativeTaskLauncher\\SilentRun.exe" in source
+    assert "New-CbrsHiddenTaskAction" in source
+    assert '"--wait powershell.exe $powershellArguments"' in source
+    assert '$escapedCommand' not in source
     assert "tzdata==" in runtime_requirements
     assert "pytest==" not in runtime_requirements
     assert "pytest==9.0.3" in development_requirements
@@ -212,10 +232,59 @@ def test_native_start_verifies_operational_runtime_and_rolls_back_on_failure() -
     )
 
     assert "--require-active-runtime" in source
+    assert "browser_authenticated_count" in source
+    assert "authenticated_form" in source
+    assert "jobs recover" in source
     assert "operational.json" in source
     assert "startedByThisRun" in source
     assert "Stop-ScheduledTask" in source
     assert "Disable-ScheduledTask" in source
+    assert "Set-ScheduledTask" in source
+    assert "-RestartCount 999" in source
+    assert "-ExecutionTimeLimit ([TimeSpan]::Zero)" in source
+    assert "CBRS User Worker" in source
+    assert "CBRS User Runtime Watchdog" in source
+    assert "Invoke-CbrsRuntimeWatchdog.ps1" in source
+    assert "$watchdogArguments = '-TaskScope User'" in source
+    assert "Register-ScheduledTask" in source
+    assert "NativeTaskLauncher\\SilentRun.exe" in source
+    assert "New-CbrsHiddenTaskAction" in source
+    assert '"--wait powershell.exe $powershellArguments"' in source
+    assert '$escapedCommand' not in source
+
+
+def test_native_worker_and_periodic_watchdog_cover_reboot_and_child_crashes() -> None:
+    task_source = (ROOT / "deploy" / "windows" / "Invoke-CbrsNativeTask.ps1").read_text(
+        encoding="utf-8"
+    )
+    watchdog_source = (
+        ROOT / "deploy" / "windows" / "Invoke-CbrsRuntimeWatchdog.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "jobs recover" in task_source
+    assert "Ensure-TaskRunning" in watchdog_source
+    assert "[ValidateSet('User', 'System')]" in watchdog_source
+    assert "CBRS User Worker" in watchdog_source
+    assert "CBRS Worker" in watchdog_source
+    assert "Start-ScheduledTask" in watchdog_source
+    assert "Stop-ScheduledTask" in watchdog_source
+    assert "Stop-VerifiedWorkerChild" in watchdog_source
+    assert "Stop-Process" in watchdog_source
+    assert "prior worker child survives" in watchdog_source
+    assert "expires_at" in watchdog_source
+    assert "pastStartupGrace" in watchdog_source
+
+
+def test_residential_proxy_installer_accepts_provider_http_detail_without_logging_secrets() -> None:
+    source = (
+        ROOT / "deploy" / "windows" / "Set-CbrsResidentialProxySessions.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "(?<host>[^:/\\s]+):(?<port>\\d+)" in source
+    assert "[Uri]::EscapeDataString" in source
+    assert "sessTime-120" in source
+    assert "Set-Clipboard -Value ''" in source
+    assert "secrets_printed = $false" in source
 
 
 def test_windows_ci_runs_native_compile_tests_and_powershell_parse() -> None:

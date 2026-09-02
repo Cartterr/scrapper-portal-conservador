@@ -8,6 +8,14 @@ from urllib.parse import urlparse
 
 from dotenv import dotenv_values
 
+from .dataimpulse import (
+    DEFAULT_DATAIMPULSE_COUNTRY,
+    DEFAULT_DATAIMPULSE_HOST,
+    DEFAULT_DATAIMPULSE_PORT_MAX,
+    DEFAULT_DATAIMPULSE_PORT_MIN,
+    DEFAULT_DATAIMPULSE_STICKY_TTL_MINUTES,
+)
+
 DEFAULT_BASE_URL = "https://nuevo-portal.conservador.cl"
 COMMERCE_ROUTE = "/consultas-en-linea/indices/indice-del-registro-de-comercio"
 DEFAULT_RECAPTCHA_SITEKEY = "6Le-eiksAAAAANU-0ITcjxvGfFoHsz40juvUVI_-"
@@ -15,25 +23,41 @@ DEFAULT_RECAPTCHA_SITEKEY = "6Le-eiksAAAAANU-0ITcjxvGfFoHsz40juvUVI_-"
 MIN_SAFE_DELAY_SECONDS = 3.5
 DEFAULT_REQUEST_DELAY_SECONDS = 5.0
 DEFAULT_BROWSER_BACKEND = "chrome"
-DEFAULT_HEADLESS = False
+DEFAULT_HEADLESS = True
 DEFAULT_WINDOW_MODE = "normal"
 DEFAULT_EXPECTED_EGRESS_COUNTRY = "CL"
 DEFAULT_CAPTCHA_SOLVER_MODE = "browser"
 CAPTCHA_SOLVER_MODES = frozenset(
-    {"browser", "2captcha_manual", "2captcha_fallback", "2captcha"}
+    {
+        "browser",
+        "2captcha_manual",
+        "2captcha_fallback",
+        "2captcha",
+        "capsolver_manual",
+        "capsolver_fallback",
+        "capsolver",
+    }
 )
 DEFAULT_2CAPTCHA_MIN_SCORE = 0.9
 DEFAULT_2CAPTCHA_TIMEOUT_SECONDS = 120.0
 DEFAULT_2CAPTCHA_POLL_SECONDS = 5.0
-DEFAULT_2CAPTCHA_DAILY_LIMIT = 10
-DEFAULT_2CAPTCHA_CIRCUIT_BREAKER_SECONDS = 900.0
-DEFAULT_2CAPTCHA_REJECTION_COOLDOWN_SECONDS = 21_600.0
+DEFAULT_2CAPTCHA_DAILY_LIMIT = 60
+DEFAULT_2CAPTCHA_CIRCUIT_BREAKER_SECONDS = 300.0
+DEFAULT_2CAPTCHA_REJECTION_COOLDOWN_SECONDS = 300.0
+DEFAULT_CAPSOLVER_TIMEOUT_SECONDS = 120.0
+DEFAULT_CAPSOLVER_POLL_SECONDS = 3.0
 DEFAULT_PROXY_RECHECK_SECONDS = 300.0
+DEFAULT_BROWSER_HEALTHCHECK_SECONDS = 30.0
+DEFAULT_BROWSER_REAUTH_BACKOFF_SECONDS = 60.0
+DEFAULT_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS = 300.0
+DEFAULT_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR = 3
+DEFAULT_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD = 2
 ALLOWED_EGRESS_MODES = frozenset(
     {
         "client_vpn",
         "client_office",
         "dedicated_static_isp",
+        "residential_sticky",
     }
 )
 PERSONAL_DIRECT_EGRESS_MODE = "personal_direct"
@@ -57,6 +81,18 @@ class Settings:
     cloak_fingerprint_seed: str | None
     cloak_proxy_url: str | None
     proxy_url: str | None
+    dataimpulse_proxy_login: str | None = field(repr=False)
+    dataimpulse_proxy_password: str | None = field(repr=False)
+    dataimpulse_host: str
+    dataimpulse_country: str
+    dataimpulse_sticky_ttl_minutes: int
+    dataimpulse_port_min: int
+    dataimpulse_port_max: int
+    dataimpulse_rotation_cooldown_seconds: float
+    dataimpulse_max_rotations_per_hour: int
+    dataimpulse_temp_unavailable_threshold: int
+    browser_healthcheck_seconds: float
+    browser_reauth_backoff_seconds: float
     captcha_solver_mode: str
     two_captcha_api_key: str | None = field(repr=False)
     two_captcha_min_score: float
@@ -65,6 +101,9 @@ class Settings:
     two_captcha_daily_limit: int
     two_captcha_circuit_breaker_seconds: float
     two_captcha_rejection_cooldown_seconds: float
+    capsolver_api_key: str | None = field(repr=False)
+    capsolver_timeout_seconds: float
+    capsolver_poll_seconds: float
     captcha_state_path: Path
     account_id: str | None
     proxy_recheck_seconds: float
@@ -81,6 +120,14 @@ class Settings:
 
     def delay_seconds(self) -> float:
         return self.request_delay_seconds
+
+    @property
+    def external_captcha_provider(self) -> str | None:
+        if self.captcha_solver_mode.startswith("capsolver"):
+            return "capsolver"
+        if self.captcha_solver_mode.startswith("2captcha"):
+            return "2captcha"
+        return None
 
 
 def _merged_env(dotenv_path: str | Path = ".env") -> dict[str, str]:
@@ -177,13 +224,18 @@ def load_settings(
     ).strip().lower()
     if captcha_solver_mode not in CAPTCHA_SOLVER_MODES:
         raise ValueError(
-            "CBRS_CAPTCHA_SOLVER_MODE must be browser, 2captcha_manual, "
-            "2captcha_fallback, or 2captcha"
+            "CBRS_CAPTCHA_SOLVER_MODE must be browser or a supported "
+            "2captcha/capsolver manual, fallback, or direct mode"
         )
     two_captcha_api_key = _empty_to_none(env.get("CBRS_2CAPTCHA_API_KEY"))
     if captcha_solver_mode in {"2captcha", "2captcha_fallback"} and not two_captcha_api_key:
         raise ValueError(
             "CBRS_2CAPTCHA_API_KEY is required when CBRS_CAPTCHA_SOLVER_MODE uses 2Captcha"
+        )
+    capsolver_api_key = _empty_to_none(env.get("CBRS_CAPSOLVER_API_KEY"))
+    if captcha_solver_mode in {"capsolver", "capsolver_fallback"} and not capsolver_api_key:
+        raise ValueError(
+            "CBRS_CAPSOLVER_API_KEY is required when CBRS_CAPTCHA_SOLVER_MODE uses CapSolver"
         )
     two_captcha_min_score = _float(
         env.get("CBRS_2CAPTCHA_MIN_SCORE"), default=DEFAULT_2CAPTCHA_MIN_SCORE
@@ -211,21 +263,83 @@ def load_settings(
         env.get("CBRS_2CAPTCHA_CIRCUIT_BREAKER_SECONDS"),
         default=DEFAULT_2CAPTCHA_CIRCUIT_BREAKER_SECONDS,
     )
-    if two_captcha_circuit_breaker_seconds < 60:
-        raise ValueError("CBRS_2CAPTCHA_CIRCUIT_BREAKER_SECONDS must be at least 60 seconds")
+    if not 60 <= two_captcha_circuit_breaker_seconds <= 300:
+        raise ValueError(
+            "CBRS_2CAPTCHA_CIRCUIT_BREAKER_SECONDS must be between 60 and 300 seconds"
+        )
     two_captcha_rejection_cooldown_seconds = _float(
         env.get("CBRS_2CAPTCHA_REJECTION_COOLDOWN_SECONDS"),
         default=DEFAULT_2CAPTCHA_REJECTION_COOLDOWN_SECONDS,
     )
-    if two_captcha_rejection_cooldown_seconds < 3600:
+    if not 60 <= two_captcha_rejection_cooldown_seconds <= 300:
         raise ValueError(
-            "CBRS_2CAPTCHA_REJECTION_COOLDOWN_SECONDS must be at least 3600 seconds"
+            "CBRS_2CAPTCHA_REJECTION_COOLDOWN_SECONDS must be between 60 and 300 seconds"
         )
+    capsolver_timeout_seconds = _float(
+        env.get("CBRS_CAPSOLVER_TIMEOUT_SECONDS"),
+        default=DEFAULT_CAPSOLVER_TIMEOUT_SECONDS,
+    )
+    if capsolver_timeout_seconds <= 0:
+        raise ValueError("CBRS_CAPSOLVER_TIMEOUT_SECONDS must be greater than zero")
+    capsolver_poll_seconds = _float(
+        env.get("CBRS_CAPSOLVER_POLL_SECONDS"),
+        default=DEFAULT_CAPSOLVER_POLL_SECONDS,
+    )
+    if capsolver_poll_seconds < 1:
+        raise ValueError("CBRS_CAPSOLVER_POLL_SECONDS must be at least 1 second")
     proxy_recheck_seconds = _float(
         env.get("CBRS_PROXY_RECHECK_SECONDS"), default=DEFAULT_PROXY_RECHECK_SECONDS
     )
     if proxy_recheck_seconds < 60:
         raise ValueError("CBRS_PROXY_RECHECK_SECONDS must be at least 60 seconds")
+    dataimpulse_ttl = _int(
+        env.get("DATAIMPULSE_STICKY_TTL_MINUTES"),
+        default=DEFAULT_DATAIMPULSE_STICKY_TTL_MINUTES,
+    )
+    if not 1 <= dataimpulse_ttl <= 120:
+        raise ValueError("DATAIMPULSE_STICKY_TTL_MINUTES must be between 1 and 120")
+    dataimpulse_port_min = _int(
+        env.get("DATAIMPULSE_STICKY_PORT_MIN"), default=DEFAULT_DATAIMPULSE_PORT_MIN
+    )
+    dataimpulse_port_max = _int(
+        env.get("DATAIMPULSE_STICKY_PORT_MAX"), default=DEFAULT_DATAIMPULSE_PORT_MAX
+    )
+    if (
+        dataimpulse_port_min < 1
+        or dataimpulse_port_max > 65535
+        or dataimpulse_port_min > dataimpulse_port_max
+    ):
+        raise ValueError("DataImpulse sticky port range is invalid")
+    dataimpulse_rotation_cooldown = _float(
+        env.get("CBRS_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS"),
+        default=DEFAULT_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS,
+    )
+    if dataimpulse_rotation_cooldown < 60:
+        raise ValueError("CBRS_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS must be at least 60")
+    dataimpulse_max_rotations = _int(
+        env.get("CBRS_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR"),
+        default=DEFAULT_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR,
+    )
+    if dataimpulse_max_rotations < 1:
+        raise ValueError("CBRS_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR must be positive")
+    dataimpulse_temporary_threshold = _int(
+        env.get("CBRS_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD"),
+        default=DEFAULT_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD,
+    )
+    if dataimpulse_temporary_threshold < 2:
+        raise ValueError("CBRS_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD must be at least 2")
+    browser_healthcheck_seconds = _float(
+        env.get("CBRS_BROWSER_HEALTHCHECK_SECONDS"),
+        default=DEFAULT_BROWSER_HEALTHCHECK_SECONDS,
+    )
+    if browser_healthcheck_seconds < 5:
+        raise ValueError("CBRS_BROWSER_HEALTHCHECK_SECONDS must be at least 5")
+    browser_reauth_backoff_seconds = _float(
+        env.get("CBRS_BROWSER_REAUTH_BACKOFF_SECONDS"),
+        default=DEFAULT_BROWSER_REAUTH_BACKOFF_SECONDS,
+    )
+    if browser_reauth_backoff_seconds < 30:
+        raise ValueError("CBRS_BROWSER_REAUTH_BACKOFF_SECONDS must be at least 30")
 
     return Settings(
         base_url=env.get("CBRS_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
@@ -262,6 +376,24 @@ def load_settings(
         cloak_fingerprint_seed=_empty_to_none(env.get("CBRS_CLOAK_FINGERPRINT_SEED")),
         cloak_proxy_url=_empty_to_none(env.get("CBRS_CLOAK_PROXY_URL")),
         proxy_url=_empty_to_none(env.get("CBRS_PROXY_URL")),
+        dataimpulse_proxy_login=_empty_to_none(env.get("DATAIMPULSE_PROXY_LOGIN")),
+        dataimpulse_proxy_password=_empty_to_none(
+            env.get("DATAIMPULSE_PROXY_PASSWORD")
+        ),
+        dataimpulse_host=env.get(
+            "DATAIMPULSE_PROXY_HOST", DEFAULT_DATAIMPULSE_HOST
+        ).strip().lower(),
+        dataimpulse_country=env.get(
+            "DATAIMPULSE_COUNTRY", DEFAULT_DATAIMPULSE_COUNTRY
+        ).strip().lower(),
+        dataimpulse_sticky_ttl_minutes=dataimpulse_ttl,
+        dataimpulse_port_min=dataimpulse_port_min,
+        dataimpulse_port_max=dataimpulse_port_max,
+        dataimpulse_rotation_cooldown_seconds=dataimpulse_rotation_cooldown,
+        dataimpulse_max_rotations_per_hour=dataimpulse_max_rotations,
+        dataimpulse_temp_unavailable_threshold=dataimpulse_temporary_threshold,
+        browser_healthcheck_seconds=browser_healthcheck_seconds,
+        browser_reauth_backoff_seconds=browser_reauth_backoff_seconds,
         captcha_solver_mode=captcha_solver_mode,
         two_captcha_api_key=two_captcha_api_key,
         two_captcha_min_score=two_captcha_min_score,
@@ -270,6 +402,9 @@ def load_settings(
         two_captcha_daily_limit=two_captcha_daily_limit,
         two_captcha_circuit_breaker_seconds=two_captcha_circuit_breaker_seconds,
         two_captcha_rejection_cooldown_seconds=two_captcha_rejection_cooldown_seconds,
+        capsolver_api_key=capsolver_api_key,
+        capsolver_timeout_seconds=capsolver_timeout_seconds,
+        capsolver_poll_seconds=capsolver_poll_seconds,
         captcha_state_path=_path(
             env.get("CBRS_CAPTCHA_STATE_PATH"),
             default=".cbrs/pool/pool.sqlite3",

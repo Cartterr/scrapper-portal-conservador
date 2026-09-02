@@ -14,7 +14,12 @@ logger = logging.getLogger(__name__)
 
 
 class CBRSScraper:
-    def __init__(self, *, headless: bool = False, settings: Settings = SETTINGS) -> None:
+    def __init__(
+        self,
+        *,
+        headless: bool | None = None,
+        settings: Settings = SETTINGS,
+    ) -> None:
         self.settings = settings
         self.browser = BrowserSession(settings, headless=headless)
         self.client = BrowserOriginClient(self.browser, settings)

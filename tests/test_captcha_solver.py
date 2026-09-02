@@ -9,6 +9,8 @@ from cbrs.captcha_solver import (
     CREATE_TASK_URL,
     GET_BALANCE_URL,
     GET_TASK_RESULT_URL,
+    REPORT_CORRECT_URL,
+    REPORT_INCORRECT_URL,
     TwoCaptchaClient,
     TwoCaptchaError,
     TwoCaptchaResult,
@@ -94,6 +96,23 @@ def test_two_captcha_balance_check_does_not_create_a_task() -> None:
 
     assert client.get_balance() == 12.3456
     assert calls == [(GET_BALANCE_URL, {"clientKey": "private-key"})]
+
+
+def test_two_captcha_reports_sanitized_provider_feedback() -> None:
+    calls: list[tuple[str, Mapping[str, Any]]] = []
+
+    def request_json(url: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        calls.append((url, payload))
+        return {"errorId": 0, "status": "success"}
+
+    client = TwoCaptchaClient("private-key", request_json=request_json)
+    client.report_correct(123)
+    client.report_incorrect(456)
+
+    assert calls == [
+        (REPORT_CORRECT_URL, {"clientKey": "private-key", "taskId": 123}),
+        (REPORT_INCORRECT_URL, {"clientKey": "private-key", "taskId": 456}),
+    ]
 
 
 def test_solver_result_repr_does_not_expose_solution_token() -> None:

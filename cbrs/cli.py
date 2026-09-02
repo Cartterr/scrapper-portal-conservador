@@ -6,12 +6,17 @@ import logging
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import config
 from .browser_runtime import get_browser_status
-from .preflight import preflight_validation_metadata, run_preflight
+from .preflight import (
+    preflight_validation_metadata,
+    replace_egress_baseline,
+    run_preflight,
+)
 from .safety import SafetyStopException, StopReason, redact_text
 from .validation import (
     run_controlled_validation,
@@ -156,7 +161,12 @@ def cmd_doctor() -> int:
         ),
         (
             "captcha solver",
-            settings.captcha_solver_mode == "browser" or bool(settings.two_captcha_api_key),
+            settings.captcha_solver_mode == "browser"
+            or bool(
+                settings.capsolver_api_key
+                if settings.external_captcha_provider == "capsolver"
+                else settings.two_captcha_api_key
+            ),
             settings.captcha_solver_mode,
         ),
     ]
@@ -238,7 +248,7 @@ def _proxy_route_allowed(settings: config.Settings) -> bool:
         return False
     if not settings.proxy_url:
         return True
-    return settings.egress_mode == "dedicated_static_isp"
+    return settings.egress_mode in {"dedicated_static_isp", "residential_sticky"}
 
 
 def _proxy_route_detail(settings: config.Settings) -> str:
@@ -246,9 +256,12 @@ def _proxy_route_detail(settings: config.Settings) -> str:
         return "CBRS_CLOAK_PROXY_URL configured"
     if not settings.proxy_url:
         return "not configured"
-    if settings.egress_mode != "dedicated_static_isp":
-        return "CBRS_PROXY_URL requires CBRS_EGRESS_MODE=dedicated_static_isp"
-    return "configured for dedicated_static_isp"
+    if settings.egress_mode not in {"dedicated_static_isp", "residential_sticky"}:
+        return (
+            "CBRS_PROXY_URL requires CBRS_EGRESS_MODE="
+            "dedicated_static_isp or residential_sticky"
+        )
+    return f"configured for {settings.egress_mode}"
 
 
 def _runtime_headless(args: argparse.Namespace) -> bool:
@@ -274,25 +287,43 @@ def cmd_preflight(args: argparse.Namespace) -> int:
 
 
 def cmd_captcha_health() -> int:
+    from .capsolver import CapSolverClient, CapSolverError
     from .captcha_budget import CaptchaBudgetStore
     from .captcha_solver import TwoCaptchaClient, TwoCaptchaError
 
     settings = config.SETTINGS
-    if not settings.two_captcha_api_key:
-        print("FAIL 2Captcha API key: CBRS_2CAPTCHA_API_KEY is not configured", file=sys.stderr)
-        return 1
-    client = TwoCaptchaClient(
-        settings.two_captcha_api_key,
-        timeout_seconds=settings.two_captcha_timeout_seconds,
-        poll_seconds=settings.two_captcha_poll_seconds,
-    )
+    provider = settings.external_captcha_provider
+    if provider == "capsolver":
+        api_key = settings.capsolver_api_key
+        if not api_key:
+            print("FAIL CapSolver API key: CBRS_CAPSOLVER_API_KEY is not configured", file=sys.stderr)
+            return 1
+        client = CapSolverClient(
+            api_key,
+            timeout_seconds=settings.capsolver_timeout_seconds,
+            poll_seconds=settings.capsolver_poll_seconds,
+        )
+        error_type = CapSolverError
+        label = "CapSolver"
+    else:
+        api_key = settings.two_captcha_api_key
+        if not api_key:
+            print("FAIL 2Captcha API key: CBRS_2CAPTCHA_API_KEY is not configured", file=sys.stderr)
+            return 1
+        client = TwoCaptchaClient(
+            api_key,
+            timeout_seconds=settings.two_captcha_timeout_seconds,
+            poll_seconds=settings.two_captcha_poll_seconds,
+        )
+        error_type = TwoCaptchaError
+        label = "2Captcha"
     try:
         balance = client.get_balance()
-    except TwoCaptchaError as exc:
-        print(f"FAIL 2Captcha API: {exc.code}", file=sys.stderr)
+    except error_type as exc:
+        print(f"FAIL {label} API: {exc.code}", file=sys.stderr)
         return 1
     if balance <= 0:
-        print("FAIL 2Captcha balance: zero balance", file=sys.stderr)
+        print(f"FAIL {label} balance: zero balance", file=sys.stderr)
         return 1
     CaptchaBudgetStore(
         settings.captcha_state_path,
@@ -300,8 +331,8 @@ def cmd_captcha_health() -> int:
         circuit_seconds=settings.two_captcha_circuit_breaker_seconds,
         rejection_cooldown_seconds=settings.two_captcha_rejection_cooldown_seconds,
     ).clear_solver_disable()
-    print("OK   2Captcha API: authenticated")
-    print(f"OK   2Captcha balance: {balance:.4f}")
+    print(f"OK   {label} API: authenticated")
+    print(f"OK   {label} balance: {balance:.4f}")
     return 0
 
 
@@ -415,6 +446,60 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return result.exit_code
 
 
+def cmd_captcha_test(args: argparse.Namespace) -> int:
+    """Run one headed, search-only CAPTCHA acceptance/control test."""
+    from .account_pool import account_settings, load_account_pool_config
+
+    provider = args.provider
+    if provider == "capsolver" and not config.SETTINGS.capsolver_api_key:
+        print("CBRS_CAPSOLVER_API_KEY is not configured.", file=sys.stderr)
+        return 2
+    pool_config = load_account_pool_config(
+        config.SETTINGS,
+        path=Path(args.config) if args.config else None,
+    )
+    account = _pool_account_by_id(pool_config, args.account)
+    runtime_settings = replace(
+        account_settings(config.SETTINGS, account),
+        captcha_solver_mode=provider,
+    )
+    output_dir = (
+        runtime_settings.output_dir
+        / "captcha-tests"
+        / provider
+        / time.strftime("%Y%m%d-%H%M%S")
+    )
+    print(
+        f"Running one headed {provider} CAPTCHA test with the account's "
+        "existing proxy; no PDF will be downloaded."
+    )
+    result = run_controlled_validation(
+        settings=runtime_settings,
+        search_kind="fna",
+        foja=args.foja,
+        numero=args.numero,
+        ano=args.ano,
+        download_first=False,
+        output_dir=output_dir,
+        keep_images=False,
+        headless=False,
+    )
+    payload = {
+        "provider": provider,
+        "account_id": account.account_id,
+        "status": result.status,
+        "result_count": result.result_count,
+        "safety_stop": result.safety_stop,
+        "error": result.error,
+        "validation_report": str(result.report_path) if result.report_path else None,
+        "preflight_report": (
+            str(result.preflight_report_path) if result.preflight_report_path else None
+        ),
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return result.exit_code
+
+
 def cmd_soak(args: argparse.Namespace) -> int:
     from .soak import default_soak_store, dashboard_status, load_soak_config, run_soak
 
@@ -491,10 +576,43 @@ def cmd_pool(args: argparse.Namespace) -> int:
         print(json.dumps(dashboard_status(store, config=pool_config), ensure_ascii=False, indent=2))
         return 0
     if args.pool_command == "proxy-health":
+        from .endurance import EnduranceController, load_endurance_plan
         from .jobs import default_job_store
         from .proxy_health import run_proxy_health
+        from .proxy_provider import (
+            TWO_CAPTCHA_DEDICATED_ISP_PROVIDER,
+            TWO_CAPTCHA_RESIDENTIAL_STICKY_PROVIDER,
+            two_captcha_proxy_health,
+        )
 
         job_store = default_job_store(config.SETTINGS)
+        replace_baseline = bool(getattr(args, "replace_egress_baseline", False))
+        if replace_baseline:
+            if not args.account:
+                print(
+                    "FAIL --replace-egress-baseline requires exactly one --account.",
+                    file=sys.stderr,
+                )
+                return 1
+            if job_store.summary().get("worker"):
+                print(
+                    "FAIL egress baseline replacement requires no worker lease.",
+                    file=sys.stderr,
+                )
+                return 1
+            endurance = EnduranceController(
+                job_store,
+                load_endurance_plan(
+                    config.SETTINGS.profile_dir.parent / "endurance-plan.json"
+                ),
+                pool_config,
+            ).status()
+            if not endurance.get("paused"):
+                print(
+                    "FAIL egress baseline replacement requires paused endurance.",
+                    file=sys.stderr,
+                )
+                return 1
         accounts = (
             [_pool_account_by_id(pool_config, args.account)]
             if args.account
@@ -504,10 +622,30 @@ def cmd_pool(args: argparse.Namespace) -> int:
         for account in accounts:
             settings = account_settings(config.SETTINGS, account)
             print(f"{account.label} ({account.account_id})")
+            account_provider = getattr(account, "proxy_provider", "generic_static")
+            if account_provider in {
+                TWO_CAPTCHA_DEDICATED_ISP_PROVIDER,
+                TWO_CAPTCHA_RESIDENTIAL_STICKY_PROVIDER,
+            }:
+                provider = two_captcha_proxy_health(
+                    settings.two_captcha_api_key,
+                    provider=account_provider,
+                    force=True,
+                )
+                provider_status = str(provider.get("status") or "unavailable")
+                print(
+                    f"{'OK' if provider.get('ok') else 'FAIL':4} "
+                    f"2Captcha proxy account: {provider_status}"
+                )
+                if not provider.get("ok"):
+                    job_store.set_account_check(account.account_id, proxy_status="failed")
+                    exit_code = 1
+                    continue
             preflight = run_preflight(
                 settings,
                 write_report=True,
                 approve_baseline=args.approve_egress_baseline,
+                allow_baseline_replacement=replace_baseline,
             )
             for check in preflight.report.get("checks", []):
                 status = "OK" if check.get("ok") else "FAIL"
@@ -540,6 +678,13 @@ def cmd_pool(args: argparse.Namespace) -> int:
                     job_store.set_account_check(account.account_id, proxy_status="failed")
                     exit_code = 1
                     continue
+            if replace_baseline:
+                archive = replace_egress_baseline(
+                    settings,
+                    egress_hash=egress_hash or "",
+                    egress_country=str(preflight.report.get("egress_country") or ""),
+                )
+                print(f"OK   egress baseline replaced; sanitized archive: {archive}")
             job_store.set_account_check(
                 account.account_id,
                 proxy_status="passed",
@@ -664,6 +809,13 @@ def cmd_jobs(args: argparse.Namespace) -> int:
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get("ok") else 1
+    if args.jobs_command == "recover":
+        payload = {
+            "expired_worker_lease_cleared": store.clear_expired_lease(),
+            "abandoned_jobs_requeued": store.recover_abandoned_jobs(),
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
     pool_config = load_account_pool_config(
         config.SETTINGS,
         path=Path(args.config) if getattr(args, "config", None) else None,
@@ -751,11 +903,22 @@ def cmd_jobs(args: argparse.Namespace) -> int:
         if args.captcha_command == "status":
             print(json.dumps(budget.status(), ensure_ascii=False, indent=2))
             return 0
-        if config.SETTINGS.captcha_solver_mode != "2captcha_manual":
-            print("CBRS_CAPTCHA_SOLVER_MODE must be 2captcha_manual.", file=sys.stderr)
+        if config.SETTINGS.captcha_solver_mode not in {
+            "2captcha_manual",
+            "capsolver_manual",
+        }:
+            print(
+                "CBRS_CAPTCHA_SOLVER_MODE must be 2captcha_manual or capsolver_manual.",
+                file=sys.stderr,
+            )
             return 2
-        if not config.SETTINGS.two_captcha_api_key:
-            print("CBRS_2CAPTCHA_API_KEY is not configured.", file=sys.stderr)
+        provider_key = (
+            config.SETTINGS.capsolver_api_key
+            if config.SETTINGS.external_captcha_provider == "capsolver"
+            else config.SETTINGS.two_captcha_api_key
+        )
+        if not provider_key:
+            print("The configured external CAPTCHA provider key is missing.", file=sys.stderr)
             return 2
         account = _pool_account_by_id(pool_config, args.account)
         account_store = AccountPoolStore(store.path)
@@ -809,6 +972,8 @@ def cmd_jobs(args: argparse.Namespace) -> int:
         return 0
     if args.jobs_command == "safety-clear":
         store.clear_control("global_safety_stop")
+        store.clear_control("global_safety_cooldown")
+        store.clear_external_outage_backoff()
         store.add_event(
             "global_safety_stop_cleared",
             data={"operator_reason": args.reason},
@@ -953,7 +1118,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("doctor", help="Run local safety/configuration checks")
     subparsers.add_parser(
         "captcha-health",
-        help="Validate the configured 2Captcha key and balance without creating a task",
+        help="Validate the configured external CAPTCHA key and balance without creating a task",
     )
     readiness_parser = subparsers.add_parser(
         "readiness",
@@ -1066,6 +1231,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep individual JPEG files alongside the PDF",
     )
 
+    captcha_test_parser = subparsers.add_parser(
+        "captcha-test",
+        help="Run one headed, search-only CAPTCHA test through an account proxy",
+    )
+    captcha_test_parser.add_argument(
+        "--provider",
+        choices=["capsolver", "browser"],
+        default="capsolver",
+        help="Use CapSolver or a browser-native Google token",
+    )
+    captcha_test_parser.add_argument("--account", required=True)
+    captcha_test_parser.add_argument("--foja", required=True, type=int)
+    captcha_test_parser.add_argument("--numero", required=True, type=int)
+    captcha_test_parser.add_argument("--ano", required=True, type=int)
+    captcha_test_parser.add_argument("--config", default=None)
+
     soak_parser = subparsers.add_parser("soak", help="Run long-running CBRS soak checks")
     soak_subparsers = soak_parser.add_subparsers(dest="soak_command", required=True)
     soak_run_parser = soak_subparsers.add_parser(
@@ -1151,10 +1332,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to .cbrs/account-pool.json override",
     )
-    pool_proxy_health_parser.add_argument(
+    pool_baseline_group = pool_proxy_health_parser.add_mutually_exclusive_group()
+    pool_baseline_group.add_argument(
         "--approve-egress-baseline",
         action="store_true",
         help="Approve each account's current fixed Chilean egress hash",
+    )
+    pool_baseline_group.add_argument(
+        "--replace-egress-baseline",
+        action="store_true",
+        help=(
+            "Replace one account's existing baseline after provider, country, "
+            "portal, uniqueness, worker, and endurance gates pass"
+        ),
     )
 
     pool_init_parser = pool_subparsers.add_parser(
@@ -1281,6 +1471,11 @@ def build_parser() -> argparse.ArgumentParser:
     jobs_cancel.add_argument("--config", default=None, help=argparse.SUPPRESS)
     jobs_status = jobs_subparsers.add_parser("status", help="Show queue and worker status")
     jobs_status.add_argument("--config", default=None, help=argparse.SUPPRESS)
+    jobs_recover = jobs_subparsers.add_parser(
+        "recover",
+        help="Clear only expired worker state and requeue abandoned jobs",
+    )
+    jobs_recover.add_argument("--config", default=None, help=argparse.SUPPRESS)
     jobs_captcha = jobs_subparsers.add_parser(
         "captcha", help="Inspect or manually authorize one paid CAPTCHA solve"
     )
@@ -1372,6 +1567,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "validate":
             return cmd_validate(args)
+        if args.command == "captcha-test":
+            return cmd_captcha_test(args)
         if args.command == "soak":
             return cmd_soak(args)
         if args.command == "pool":

@@ -30,8 +30,12 @@ from .account_pool import (
     seconds_since,
     utc_now,
 )
-from .browser_session import CredentialsRejectedError
+from .browser_session import CommerceAuthState, CredentialsRejectedError
 from .config import SETTINGS, Settings
+from .dataimpulse import (
+    DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER,
+    next_unused_sticky_port,
+)
 from .pdf import create_pdf
 from .safety import SafetyStopException, StopReason, redact, redact_text
 
@@ -52,9 +56,33 @@ TERMINAL_JOB_STATES = frozenset({"completed", "partial", "failed", "cancelled"})
 GLOBAL_SAFETY_REASONS = frozenset(
     {StopReason.RATE_LIMIT, StopReason.WAF_CHALLENGE}
 )
+SAFETY_COOLDOWN_SECONDS = {
+    StopReason.CAPTCHA_REJECTED: 120.0,
+    StopReason.CAPTCHA_SOLVER: 300.0,
+    StopReason.AUTH_REQUIRED: 300.0,
+    StopReason.EGRESS_PREFLIGHT: 60.0,
+    StopReason.PROXY_HEALTH: 60.0,
+    StopReason.TEMPORARY_UNAVAILABLE: 120.0,
+    StopReason.UNEXPECTED_HTML: 120.0,
+    StopReason.UNEXPECTED_STATUS: 120.0,
+    StopReason.RATE_LIMIT: 300.0,
+    StopReason.WAF_CHALLENGE: 300.0,
+}
 WORKER_LEASE_NAME = "portal_worker"
 WORKER_STALE_SECONDS = 120
 JOB_LEASE_SECONDS = 180
+EXTERNAL_OUTAGE_BACKOFF_KEY = "external_outage_backoff"
+EXTERNAL_OUTAGE_REASON = "temporary_unavailable_all_accounts"
+# `temporary_unavailable` is CBRS's generic retry response, not proof of a
+# CAPTCHA failure.  Once every account returns it, however, repeating the same
+# protected request every two minutes only amplifies a route- or portal-wide
+# outage.  Escalate quickly and cap control probes at one per hour.  A
+# successful search clears the streak immediately.
+EXTERNAL_OUTAGE_BACKOFF_SECONDS = (300.0, 900.0, 3600.0)
+# A slot is reserved before the portal request to keep concurrent workers from
+# exceeding the account cap.  It becomes real usage only after CBRS accepts
+# the search; every failure path must release that reservation.
+QUOTA_SUCCESS_ATTEMPT_STATUSES = frozenset({"search_completed", "completed"})
 PDF_PAGE_OBJECT_RE = re.compile(rb"/Type\s*/Page(?!s)\b")
 
 
@@ -82,6 +110,239 @@ class WorkerResult:
     run_id: str | None
     status: str
     processed_jobs: int
+
+
+@dataclass
+class _ManagedAccountScraper:
+    manager: Any
+    scraper: Any
+    settings: Settings | None = None
+    username: str = ""
+    password: str = ""
+    unknown_checks: int = 0
+    last_reauth_at: float = 0.0
+    last_restart_at: float = 0.0
+
+
+class _PersistentAccountBrowsers:
+    """Own one long-lived scraper/browser context per worker account."""
+
+    def __init__(
+        self,
+        *,
+        scraper_factory: Callable[..., Any],
+        headless: bool,
+        store: "JobStore",
+        worker_id: str,
+    ) -> None:
+        self.scraper_factory = scraper_factory
+        self.headless = headless
+        self.store = store
+        self.worker_id = worker_id
+        self._entries: dict[str, _ManagedAccountScraper] = {}
+        self._known_accounts: dict[str, tuple[Settings, str, str]] = {}
+        self._last_reconcile_at = 0.0
+
+    def refresh_page_auth_states(self) -> None:
+        """Publish fail-closed DOM evidence without performing authentication."""
+        for account_id, entry in tuple(self._entries.items()):
+            browser = getattr(entry.scraper, "browser", entry.scraper)
+            detector = getattr(browser, "detect_commerce_auth_state", None)
+            if not callable(detector):
+                legacy_detector = getattr(browser, "page_requires_login", None)
+                if not callable(legacy_detector):
+                    continue
+                detector = lambda: (
+                    CommerceAuthState.LOGIN_GATE
+                    if legacy_detector()
+                    else CommerceAuthState.UNKNOWN
+                )
+            try:
+                raw_state = detector()
+                state = (
+                    raw_state
+                    if isinstance(raw_state, CommerceAuthState)
+                    else CommerceAuthState(str(raw_state))
+                )
+            except Exception:
+                state = CommerceAuthState.UNKNOWN
+            entry.unknown_checks = (
+                entry.unknown_checks + 1
+                if state is CommerceAuthState.UNKNOWN
+                else 0
+            )
+            self.store.set_account_browser_state(
+                account_id,
+                live=True,
+                authenticated=state is CommerceAuthState.AUTHENTICATED_FORM,
+                headless=self.headless,
+                owner=self.worker_id,
+                status={
+                    CommerceAuthState.AUTHENTICATED_FORM: "authenticated_form_visible",
+                    CommerceAuthState.LOGIN_GATE: "login_gate_visible",
+                    CommerceAuthState.CONFLICT: "authentication_dom_conflict",
+                    CommerceAuthState.UNKNOWN: "authentication_unknown",
+                }[state],
+                auth_state=state.value,
+            )
+
+    def reconcile(self) -> None:
+        """Keep successful per-account contexts alive without cross-account resets."""
+        now = time.monotonic()
+        intervals = [
+            settings.browser_healthcheck_seconds
+            for settings, _username, _password in self._known_accounts.values()
+        ]
+        interval = min(intervals, default=30.0)
+        if now - self._last_reconcile_at < interval:
+            return
+        self._last_reconcile_at = now
+        self.refresh_page_auth_states()
+        for account_id, credentials in tuple(self._known_accounts.items()):
+            settings, username, password = credentials
+            entry = self._entries.get(account_id)
+            if entry is None:
+                try:
+                    with self.session(account_id, settings, username, password):
+                        pass
+                except Exception:
+                    continue
+                continue
+            try:
+                browser = getattr(entry.scraper, "browser", entry.scraper)
+                page = browser.page
+                if callable(getattr(page, "is_closed", None)) and page.is_closed():
+                    self.discard(account_id, status="browser_context_closed")
+                    with self.session(account_id, settings, username, password):
+                        pass
+                    continue
+                raw_state = browser.detect_commerce_auth_state()
+                state = (
+                    raw_state
+                    if isinstance(raw_state, CommerceAuthState)
+                    else CommerceAuthState(str(raw_state))
+                )
+                if state is CommerceAuthState.UNKNOWN and entry.unknown_checks >= 2:
+                    browser.reload_current_page()
+                    state = browser.wait_for_commerce_auth_state()
+                    entry.unknown_checks = 0
+                if state is CommerceAuthState.LOGIN_GATE:
+                    if now - entry.last_reauth_at < settings.browser_reauth_backoff_seconds:
+                        continue
+                    entry.last_reauth_at = now
+                    with self.session(
+                        account_id,
+                        settings,
+                        username,
+                        password,
+                        force=True,
+                    ):
+                        pass
+            except Exception as exc:
+                if _looks_like_connection_failure(exc):
+                    self.discard(account_id, status="browser_context_failed")
+
+    @contextmanager
+    def session(
+        self,
+        account_id: str,
+        settings: Settings,
+        username: str,
+        password: str,
+        *,
+        force: bool = False,
+    ) -> Iterator[Any]:
+        self._known_accounts[account_id] = (settings, username, password)
+        entry = self._entries.get(account_id)
+        if entry is None:
+            manager = self.scraper_factory(headless=self.headless, settings=settings)
+            try:
+                scraper = manager.__enter__() if hasattr(manager, "__enter__") else manager
+            except Exception:
+                self.store.set_account_browser_state(
+                    account_id,
+                    live=False,
+                    authenticated=False,
+                    headless=self.headless,
+                    owner=self.worker_id,
+                    status="launch_failed",
+                )
+                raise
+            entry = _ManagedAccountScraper(
+                manager=manager,
+                scraper=scraper,
+                settings=settings,
+                username=username,
+                password=password,
+                last_restart_at=time.monotonic(),
+            )
+            self._entries[account_id] = entry
+            self.store.set_account_browser_state(
+                account_id,
+                live=True,
+                authenticated=False,
+                headless=self.headless,
+                owner=self.worker_id,
+                status="authenticating",
+            )
+
+        try:
+            auth_method = entry.scraper.ensure_authenticated(
+                username, password, force=force
+            )
+        except Exception as exc:
+            if _looks_like_connection_failure(exc):
+                self.discard(account_id, status="browser_context_failed")
+            else:
+                self.store.set_account_browser_state(
+                    account_id,
+                    live=True,
+                    authenticated=False,
+                    headless=self.headless,
+                    owner=self.worker_id,
+                    status="authentication_unconfirmed",
+                    auth_state=CommerceAuthState.UNKNOWN.value,
+                )
+            raise
+
+        self.store.set_account_browser_state(
+            account_id,
+            live=True,
+            authenticated=True,
+            headless=self.headless,
+            owner=self.worker_id,
+            status={
+                "refreshed": "authenticated_refresh",
+                "browser_fetch": "authenticated_login_api",
+                "browser_form": "authenticated_login_form",
+            }.get(str(auth_method or ""), "authenticated"),
+            auth_state=CommerceAuthState.AUTHENTICATED_FORM.value,
+        )
+        yield entry.scraper
+
+    def discard(self, account_id: str, *, status: str) -> None:
+        entry = self._entries.pop(account_id, None)
+        if entry is not None:
+            try:
+                if hasattr(entry.manager, "__exit__"):
+                    entry.manager.__exit__(None, None, None)
+                elif hasattr(entry.scraper, "close"):
+                    entry.scraper.close()
+            except Exception:
+                pass
+        self.store.set_account_browser_state(
+            account_id,
+            live=False,
+            authenticated=False,
+            headless=self.headless,
+            owner=self.worker_id,
+            status=status,
+        )
+
+    def close_all(self, *, status: str = "worker_stopped") -> None:
+        for account_id in tuple(self._entries):
+            self.discard(account_id, status=status)
+        self._known_accounts.clear()
 
 
 class JobStore:
@@ -208,6 +469,14 @@ class JobStore:
                     proxy_checked_at TEXT,
                     proxy_status TEXT,
                     egress_hash TEXT,
+                    browser_live INTEGER NOT NULL DEFAULT 0,
+                    browser_authenticated INTEGER NOT NULL DEFAULT 0,
+                    browser_headless INTEGER,
+                    browser_owner TEXT,
+                    browser_status TEXT,
+                    browser_auth_state TEXT,
+                    browser_started_at TEXT,
+                    browser_checked_at TEXT,
                     updated_at TEXT NOT NULL
                 );
 
@@ -242,6 +511,23 @@ class JobStore:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS account_proxy_routes (
+                    account_id TEXT PRIMARY KEY,
+                    active_port INTEGER NOT NULL,
+                    pending_port INTEGER,
+                    generation INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'configured',
+                    last_error_code TEXT,
+                    last_rotation_reason TEXT,
+                    last_rotated_at TEXT,
+                    cooldown_until TEXT,
+                    rotation_window_started_at TEXT,
+                    rotation_count INTEGER NOT NULL DEFAULT 0,
+                    temporary_window_started_at TEXT,
+                    temporary_failure_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS endurance_state (
                     name TEXT PRIMARY KEY,
                     paused INTEGER NOT NULL DEFAULT 0,
@@ -254,7 +540,7 @@ class JobStore:
             db.execute(
                 """
                 INSERT INTO schema_versions(component, version, applied_at)
-                VALUES ('jobs', 5, ?)
+                VALUES ('jobs', 7, ?)
                 ON CONFLICT(component) DO UPDATE SET
                     version = MAX(version, excluded.version),
                     applied_at = CASE
@@ -272,6 +558,19 @@ class JobStore:
                 db.execute("ALTER TABLE account_checks ADD COLUMN egress_hash TEXT")
             if "proxy_checked_at" not in columns:
                 db.execute("ALTER TABLE account_checks ADD COLUMN proxy_checked_at TEXT")
+            browser_columns = {
+                "browser_live": "INTEGER NOT NULL DEFAULT 0",
+                "browser_authenticated": "INTEGER NOT NULL DEFAULT 0",
+                "browser_headless": "INTEGER",
+                "browser_owner": "TEXT",
+                "browser_status": "TEXT",
+                "browser_auth_state": "TEXT",
+                "browser_started_at": "TEXT",
+                "browser_checked_at": "TEXT",
+            }
+            for name, definition in browser_columns.items():
+                if name not in columns:
+                    db.execute(f"ALTER TABLE account_checks ADD COLUMN {name} {definition}")
             job_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(jobs)").fetchall()
@@ -309,8 +608,10 @@ class JobStore:
         normalized = normalize_job_input(kind, input_data)
         key = _normalize_idempotency_key(idempotency_key)
         priority = max(-100, min(int(priority), 100))
-        if source not in {"production", "endurance"}:
-            raise ValueError("job source must be production or endurance")
+        if source not in {"production", "endurance", "captcha_validation"}:
+            raise ValueError(
+                "job source must be production, endurance, or captcha_validation"
+            )
         now = utc_now()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -452,6 +753,38 @@ class JobStore:
             ).fetchall()
             job_ids = [str(row["job_id"]) for row in rows]
             for job_id in job_ids:
+                attempts = db.execute(
+                    """
+                    SELECT attempt_id, account_id, quota_date, quota_consumed
+                    FROM job_attempts
+                    WHERE job_id = ? AND status = 'running'
+                    """,
+                    (job_id,),
+                ).fetchall()
+                for attempt in attempts:
+                    db.execute(
+                        """
+                        UPDATE job_attempts
+                        SET status = 'worker_recovered', quota_consumed = 0,
+                            error_message = 'Released after an expired worker lease.',
+                            finished_at = ?
+                        WHERE attempt_id = ?
+                        """,
+                        (now, attempt["attempt_id"]),
+                    )
+                    if int(attempt["quota_consumed"] or 0):
+                        self._sync_account_daily_usage_db(
+                            db,
+                            str(attempt["account_id"]),
+                            str(attempt["quota_date"]),
+                        )
+                        self._add_event_db(
+                            db,
+                            job_id,
+                            "attempt_quota_released",
+                            {"status": "worker_recovered", "reason": "expired_worker_lease"},
+                            account_id=str(attempt["account_id"]),
+                        )
                 db.execute(
                     """
                     UPDATE jobs SET status = 'queued', worker_owner = NULL,
@@ -689,15 +1022,6 @@ class JobStore:
                 usage = self._account_usage_db(db, account_id, quota_date)
                 if usage >= quota:
                     return None
-                db.execute(
-                    """
-                    INSERT INTO account_daily_usage(account_id, quota_date, used, last_used_at)
-                    VALUES (?, ?, 1, ?)
-                    ON CONFLICT(account_id, quota_date) DO UPDATE SET
-                        used = used + 1, last_used_at = excluded.last_used_at
-                    """,
-                    (account_id, quota_date, now),
-                )
             db.execute(
                 """
                 INSERT INTO job_attempts(
@@ -715,7 +1039,7 @@ class JobStore:
                 db,
                 job_id,
                 "attempt_started",
-                {"quota_consumed": consume_quota},
+                {"quota_reserved": consume_quota},
                 account_id=account_id,
             )
             return attempt_id
@@ -729,19 +1053,121 @@ class JobStore:
         error: str | None = None,
     ) -> None:
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            attempt = db.execute(
+                """
+                SELECT job_id, account_id, quota_date, quota_consumed
+                FROM job_attempts WHERE attempt_id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+            release_quota = bool(
+                attempt
+                and int(attempt["quota_consumed"] or 0)
+                and status not in QUOTA_SUCCESS_ATTEMPT_STATUSES
+            )
             db.execute(
                 """
                 UPDATE job_attempts SET status = ?, safety_stop = ?,
-                    error_message = ?, finished_at = ? WHERE attempt_id = ?
+                    error_message = ?, finished_at = ?,
+                    quota_consumed = CASE WHEN ? THEN 0 ELSE quota_consumed END
+                WHERE attempt_id = ?
                 """,
                 (
                     status,
                     safety_stop,
                     redact_text(error)[:1000] if error else None,
                     utc_now(),
+                    1 if release_quota else 0,
                     attempt_id,
                 ),
             )
+            if attempt and int(attempt["quota_consumed"] or 0):
+                self._sync_account_daily_usage_db(
+                    db,
+                    str(attempt["account_id"]),
+                    str(attempt["quota_date"]),
+                )
+            if release_quota and attempt:
+                self._add_event_db(
+                    db,
+                    str(attempt["job_id"]),
+                    "attempt_quota_released",
+                    {"status": status, "reason": safety_stop or status},
+                    account_id=str(attempt["account_id"]),
+                )
+
+    @staticmethod
+    def _sync_account_daily_usage_db(
+        db: sqlite3.Connection,
+        account_id: str,
+        quota_date: str,
+    ) -> None:
+        success_placeholders = ", ".join(
+            "?" for _ in QUOTA_SUCCESS_ATTEMPT_STATUSES
+        )
+        success_values = tuple(sorted(QUOTA_SUCCESS_ATTEMPT_STATUSES))
+        usage = db.execute(
+            f"""
+            SELECT COUNT(*) AS used, MAX(started_at) AS last_used_at
+            FROM job_attempts
+            WHERE account_id = ? AND quota_date = ? AND quota_consumed = 1
+              AND status IN ({success_placeholders})
+            """,
+            (account_id, quota_date, *success_values),
+        ).fetchone()
+        db.execute(
+            """
+            INSERT INTO account_daily_usage(account_id, quota_date, used, last_used_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(account_id, quota_date) DO UPDATE SET
+                used = excluded.used,
+                last_used_at = excluded.last_used_at
+            """,
+            (
+                account_id,
+                quota_date,
+                int(usage["used"] or 0),
+                usage["last_used_at"],
+            ),
+        )
+
+    def reconcile_quota_usage(self, *, quota_date: str | None = None) -> dict[str, int]:
+        """Release legacy failed reservations and rebuild the account ledger."""
+
+        date_filter = "AND quota_date = ?" if quota_date else ""
+        params: tuple[str, ...] = (quota_date,) if quota_date else ()
+        success_placeholders = ", ".join("?" for _ in QUOTA_SUCCESS_ATTEMPT_STATUSES)
+        success_values = tuple(sorted(QUOTA_SUCCESS_ATTEMPT_STATUSES))
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            released = db.execute(
+                f"""
+                UPDATE job_attempts
+                SET quota_consumed = 0
+                WHERE quota_consumed = 1
+                  AND status NOT IN ({success_placeholders})
+                  {date_filter}
+                """,
+                (*success_values, *params),
+            ).rowcount
+            pairs = db.execute(
+                f"""
+                SELECT account_id, quota_date FROM account_daily_usage
+                WHERE 1 = 1 {date_filter}
+                UNION
+                SELECT account_id, quota_date FROM job_attempts
+                WHERE 1 = 1 {date_filter}
+                """,
+                (*params, *params),
+            ).fetchall()
+            for row in pairs:
+                self._sync_account_daily_usage_db(
+                    db,
+                    str(row["account_id"]),
+                    str(row["quota_date"]),
+                )
+        return {"released_attempts": int(released), "accounts_updated": len(pairs)}
 
     def select_account(
         self,
@@ -966,6 +1392,55 @@ class JobStore:
                 (index, utc_now()),
             )
 
+    def set_account_browser_state(
+        self,
+        account_id: str,
+        *,
+        live: bool,
+        authenticated: bool,
+        headless: bool,
+        owner: str,
+        status: str,
+        auth_state: str | None = None,
+    ) -> None:
+        now = utc_now()
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO account_checks(
+                    account_id, browser_live, browser_authenticated, browser_headless,
+                    browser_owner, browser_status, browser_started_at,
+                    browser_checked_at, browser_auth_state, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    browser_started_at = CASE
+                        WHEN excluded.browser_live = 1 AND account_checks.browser_live = 0
+                        THEN excluded.browser_started_at
+                        ELSE account_checks.browser_started_at
+                    END,
+                    browser_live = excluded.browser_live,
+                    browser_authenticated = excluded.browser_authenticated,
+                    browser_headless = excluded.browser_headless,
+                    browser_owner = excluded.browser_owner,
+                    browser_status = excluded.browser_status,
+                    browser_auth_state = excluded.browser_auth_state,
+                    browser_checked_at = excluded.browser_checked_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    account_id,
+                    int(live),
+                    int(authenticated),
+                    int(headless),
+                    owner,
+                    status,
+                    now if live else None,
+                    now,
+                    auth_state,
+                    now,
+                ),
+            )
+
     def finalize_job(self, job_id: str) -> str:
         now = utc_now()
         with self.connect() as db:
@@ -1113,6 +1588,262 @@ class JobStore:
             ).fetchone()
             return dict(row) if row else None
 
+    def ensure_dataimpulse_route(
+        self, account_id: str, initial_port: int
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO account_proxy_routes(account_id, active_port, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(account_id) DO NOTHING
+                """,
+                (account_id, int(initial_port), now),
+            )
+            row = db.execute(
+                "SELECT * FROM account_proxy_routes WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            assert row is not None
+            return dict(row)
+
+    def dataimpulse_route(self, account_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM account_proxy_routes WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def dataimpulse_routes(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            return [
+                dict(row)
+                for row in db.execute(
+                    "SELECT * FROM account_proxy_routes ORDER BY account_id"
+                ).fetchall()
+            ]
+
+    def begin_dataimpulse_rotation(
+        self,
+        account_id: str,
+        *,
+        initial_port: int,
+        reason: str,
+        port_min: int,
+        port_max: int,
+        cooldown_seconds: float,
+        max_rotations_per_hour: int,
+    ) -> dict[str, Any]:
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.replace(microsecond=0).isoformat()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """
+                INSERT INTO account_proxy_routes(account_id, active_port, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(account_id) DO NOTHING
+                """,
+                (account_id, int(initial_port), now),
+            )
+            row = db.execute(
+                "SELECT * FROM account_proxy_routes WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            assert row is not None
+            state = dict(row)
+            cooldown_until = str(state.get("cooldown_until") or "")
+            if cooldown_until and cooldown_until > now:
+                return {**state, "ok": False, "reason": "rotation_cooldown"}
+            window_started = str(state.get("rotation_window_started_at") or "")
+            if not window_started or seconds_since(window_started) >= 3600:
+                window_started = now
+                rotation_count = 0
+            else:
+                rotation_count = int(state.get("rotation_count") or 0)
+            if rotation_count >= max_rotations_per_hour:
+                cooldown = (now_dt + timedelta(seconds=3600)).replace(
+                    microsecond=0
+                ).isoformat()
+                db.execute(
+                    """
+                    UPDATE account_proxy_routes
+                    SET status = 'proxy_recovery_exhausted', cooldown_until = ?,
+                        updated_at = ? WHERE account_id = ?
+                    """,
+                    (cooldown, now, account_id),
+                )
+                return {
+                    **state,
+                    "ok": False,
+                    "reason": "proxy_recovery_exhausted",
+                    "cooldown_until": cooldown,
+                }
+            used_ports = {
+                int(value)
+                for used in db.execute(
+                    "SELECT active_port, pending_port FROM account_proxy_routes"
+                ).fetchall()
+                for value in (used["active_port"], used["pending_port"])
+                if value is not None
+            }
+            candidate = next_unused_sticky_port(
+                int(state["active_port"]),
+                used_ports=used_ports,
+                minimum=port_min,
+                maximum=port_max,
+            )
+            cooldown = (now_dt + timedelta(seconds=cooldown_seconds)).replace(
+                microsecond=0
+            ).isoformat()
+            db.execute(
+                """
+                UPDATE account_proxy_routes
+                SET pending_port = ?, status = 'validating',
+                    last_rotation_reason = ?, cooldown_until = ?,
+                    rotation_window_started_at = ?, rotation_count = ?,
+                    updated_at = ? WHERE account_id = ?
+                """,
+                (
+                    candidate,
+                    redact_text(reason),
+                    cooldown,
+                    window_started,
+                    rotation_count + 1,
+                    now,
+                    account_id,
+                ),
+            )
+            return {
+                **state,
+                "ok": True,
+                "reason": "candidate_ready",
+                "pending_port": candidate,
+                "cooldown_until": cooldown,
+                "rotation_count": rotation_count + 1,
+            }
+
+    def finish_dataimpulse_rotation(
+        self,
+        account_id: str,
+        *,
+        promoted: bool,
+        error_code: str | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM account_proxy_routes WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(account_id)
+            if promoted and row["pending_port"] is None:
+                raise RuntimeError("DataImpulse rotation has no pending port")
+            if promoted:
+                db.execute(
+                    """
+                    UPDATE account_proxy_routes
+                    SET active_port = pending_port, pending_port = NULL,
+                        generation = generation + 1, status = 'active',
+                        last_error_code = NULL, last_rotated_at = ?,
+                        temporary_window_started_at = NULL,
+                        temporary_failure_count = 0, updated_at = ?
+                    WHERE account_id = ?
+                    """,
+                    (now, now, account_id),
+                )
+            else:
+                db.execute(
+                    """
+                    UPDATE account_proxy_routes
+                    SET pending_port = NULL, status = 'candidate_failed',
+                        last_error_code = ?, updated_at = ?
+                    WHERE account_id = ?
+                    """,
+                    (redact_text(error_code or "candidate_failed"), now, account_id),
+                )
+            updated = db.execute(
+                "SELECT * FROM account_proxy_routes WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            assert updated is not None
+            return dict(updated)
+
+    def record_dataimpulse_temporary_failure(
+        self, account_id: str, *, initial_port: int
+    ) -> int:
+        now = utc_now()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """
+                INSERT INTO account_proxy_routes(account_id, active_port, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(account_id) DO NOTHING
+                """,
+                (account_id, int(initial_port), now),
+            )
+            row = db.execute(
+                "SELECT temporary_window_started_at, temporary_failure_count "
+                "FROM account_proxy_routes WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            assert row is not None
+            started = str(row["temporary_window_started_at"] or "")
+            count = int(row["temporary_failure_count"] or 0)
+            if not started or seconds_since(started) > 600:
+                started = now
+                count = 0
+            count += 1
+            db.execute(
+                """
+                UPDATE account_proxy_routes
+                SET temporary_window_started_at = ?, temporary_failure_count = ?,
+                    updated_at = ? WHERE account_id = ?
+                """,
+                (started, count, now, account_id),
+            )
+            return count
+
+    def another_account_succeeded_recently(
+        self, account_id: str, *, within_seconds: float = 600
+    ) -> bool:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=within_seconds)
+        ).replace(microsecond=0).isoformat()
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT 1 FROM job_attempts
+                WHERE account_id != ? AND status IN ('search_completed','completed')
+                  AND COALESCE(finished_at, started_at) >= ?
+                LIMIT 1
+                """,
+                (account_id, cutoff),
+            ).fetchone()
+            return row is not None
+
+    def active_lease(self, lease_name: str = WORKER_LEASE_NAME) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM leases WHERE lease_name = ? AND expires_at >= ?",
+                (lease_name, utc_now()),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def clear_expired_lease(self, lease_name: str = WORKER_LEASE_NAME) -> bool:
+        """Remove only an expired lease; an active worker is never disturbed."""
+        with self.connect() as db:
+            changed = db.execute(
+                "DELETE FROM leases WHERE lease_name = ? AND expires_at < ?",
+                (lease_name, utc_now()),
+            ).rowcount
+        return bool(changed)
+
     def set_control(self, key: str, value: str) -> None:
         with self.connect() as db:
             db.execute(
@@ -1135,6 +1866,64 @@ class JobStore:
         with self.connect() as db:
             db.execute("DELETE FROM job_control WHERE key = ?", (key,))
 
+    def set_global_cooldown(
+        self,
+        reason: str,
+        seconds: float,
+        *,
+        max_seconds: float = 300.0,
+    ) -> dict[str, str]:
+        payload = {
+            "reason": redact_text(reason)[:80],
+            "resume_at": _utc_after(
+                min(max(1.0, float(max_seconds)), max(1.0, float(seconds)))
+            ),
+        }
+        self.set_control("global_safety_cooldown", stable_json(payload))
+        return payload
+
+    def advance_external_outage_backoff(self) -> dict[str, object]:
+        row = self.get_control(EXTERNAL_OUTAGE_BACKOFF_KEY)
+        streak = 0
+        if row:
+            try:
+                streak = max(0, int(json.loads(str(row["value"])).get("streak", 0)))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                streak = 0
+        streak += 1
+        seconds = EXTERNAL_OUTAGE_BACKOFF_SECONDS[
+            min(streak - 1, len(EXTERNAL_OUTAGE_BACKOFF_SECONDS) - 1)
+        ]
+        self.set_control(
+            EXTERNAL_OUTAGE_BACKOFF_KEY,
+            stable_json({"streak": streak, "updated_at": utc_now()}),
+        )
+        cooldown = self.set_global_cooldown(
+            EXTERNAL_OUTAGE_REASON,
+            seconds,
+            max_seconds=EXTERNAL_OUTAGE_BACKOFF_SECONDS[-1],
+        )
+        return {**cooldown, "streak": streak, "seconds": seconds}
+
+    def clear_external_outage_backoff(self) -> None:
+        self.clear_control(EXTERNAL_OUTAGE_BACKOFF_KEY)
+
+    def global_cooldown(self) -> dict[str, str] | None:
+        row = self.get_control("global_safety_cooldown")
+        if not row:
+            return None
+        try:
+            payload = json.loads(str(row["value"]))
+            reason = str(payload["reason"])
+            resume_at = str(payload["resume_at"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self.clear_control("global_safety_cooldown")
+            return None
+        if resume_at <= utc_now():
+            self.clear_control("global_safety_cooldown")
+            return None
+        return {"reason": reason, "resume_at": resume_at}
+
     def summary(self) -> dict[str, Any]:
         with self.connect() as db:
             counts = {
@@ -1153,7 +1942,7 @@ class JobStore:
                 "artifacts": int(artifact["count"]),
                 "artifact_bytes": int(artifact["bytes"]),
                 "worker": self.lease(),
-                "global_safety_stop": self.get_control("global_safety_stop"),
+                "global_safety_cooldown": self.global_cooldown(),
             }
 
     def _job_payload(
@@ -1287,9 +2076,20 @@ class JobStore:
                 SELECT COUNT(*) FROM cycles c
                 JOIN runs r ON r.run_id = c.run_id
                 WHERE c.account_id = ? AND c.quota_date = ? AND r.dry_run = 0
+            ), 0) + COALESCE((
+                SELECT COUNT(*) FROM job_attempts
+                WHERE account_id = ? AND quota_date = ?
+                  AND quota_consumed = 1 AND status = 'running'
             ), 0) AS used
             """,
-            (account_id, quota_date, account_id, quota_date),
+            (
+                account_id,
+                quota_date,
+                account_id,
+                quota_date,
+                account_id,
+                quota_date,
+            ),
         ).fetchone()
         return int(row["used"] or 0)
 
@@ -1299,13 +2099,24 @@ def default_job_store(settings: Settings = SETTINGS) -> JobStore:
 
 
 def normalize_job_input(kind: str, input_data: Mapping[str, Any]) -> dict[str, Any]:
+    sample_pages = _normalize_sample_pages(input_data.get("sample_pages"))
+    internal = {}
+    if input_data.get("validation_only"):
+        internal["validation_only"] = True
+    target_account_id = str(input_data.get("target_account_id") or "").strip()
+    if target_account_id:
+        internal["target_account_id"] = target_account_id
     if kind == "text":
         query = str(input_data.get("text") or input_data.get("query") or "").strip()
         if not query:
             raise ValueError("text jobs require a non-empty text value")
         if len(query) > 500:
             raise ValueError("text value must be 500 characters or fewer")
-        return {"text": query}
+        return {
+            "text": query,
+            **({"sample_pages": sample_pages} if sample_pages else {}),
+            **internal,
+        }
     if kind == "fna":
         try:
             foja = int(input_data["foja"])
@@ -1315,8 +2126,26 @@ def normalize_job_input(kind: str, input_data: Mapping[str, Any]) -> dict[str, A
             raise ValueError("fna jobs require integer foja, numero, and year values") from exc
         if foja <= 0 or numero <= 0 or year < 1800 or year > 2200:
             raise ValueError("fna values are outside the accepted range")
-        return {"foja": foja, "numero": numero, "year": year}
+        return {
+            "foja": foja,
+            "numero": numero,
+            "year": year,
+            **({"sample_pages": sample_pages} if sample_pages else {}),
+            **internal,
+        }
     raise ValueError("job kind must be 'text' or 'fna'")
+
+
+def _normalize_sample_pages(value: Any) -> int | None:
+    if value in {None, ""}:
+        return None
+    try:
+        pages = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("sample_pages must be an integer from 1 to 5") from exc
+    if pages < 1 or pages > 5:
+        raise ValueError("sample_pages must be an integer from 1 to 5")
+    return pages
 
 
 def stable_json(value: Mapping[str, Any]) -> str:
@@ -1362,6 +2191,7 @@ def download_job_item(
     *,
     job_id: str,
     output_root: Path,
+    sample_pages: int | None = None,
     on_expected_pages: Callable[[int], None] | None = None,
 ) -> tuple[Path, int, str, int]:
     ticket = item.get("ticket_ref")
@@ -1369,7 +2199,7 @@ def download_job_item(
         raise RuntimeError("Search result did not include an inscription ticket.")
     sequence = int(item["sequence"])
     result = item.get("result") if isinstance(item.get("result"), Mapping) else {}
-    stem = _artifact_stem(sequence, result)
+    stem = _artifact_stem(sequence, result, sample_pages=sample_pages)
     job_dir = output_root / "jobs" / job_id
     image_dir = job_dir / ".staging" / str(item["item_id"])
     final_path = job_dir / f"{stem}.pdf"
@@ -1380,6 +2210,8 @@ def download_job_item(
     _ticket_info, refs = scraper.get_image_refs(str(ticket))
     if not refs:
         raise RuntimeError("No image references returned for this inscription.")
+    if sample_pages is not None:
+        refs = refs[:sample_pages]
     if on_expected_pages:
         on_expected_pages(len(refs))
     images: list[Path] = []
@@ -1453,10 +2285,27 @@ def run_job_worker(
     exit_code = 0
     heartbeat_stop = threading.Event()
     heartbeat_thread: threading.Thread | None = None
+    startup_gates_pending = True
+    browser_pool = _PersistentAccountBrowsers(
+        scraper_factory=scraper_factory,
+        headless=runtime_headless,
+        store=store,
+        worker_id=worker_id,
+    )
     try:
         store.recover_abandoned_jobs()
-        if store.get_control("global_safety_stop"):
-            return WorkerResult(2, worker_id, None, "safety_stop", 0)
+        legacy_stop = store.get_control("global_safety_stop")
+        if legacy_stop:
+            reason = str(legacy_stop.get("value") or StopReason.WAF_CHALLENGE.value)
+            try:
+                parsed_reason = StopReason(reason)
+            except ValueError:
+                parsed_reason = StopReason.WAF_CHALLENGE
+            store.set_global_cooldown(
+                parsed_reason.value,
+                SAFETY_COOLDOWN_SECONDS.get(parsed_reason, 300.0),
+            )
+            store.clear_control("global_safety_stop")
         run_id = (
             f"jobs-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
             f"{secrets.token_hex(3)}"
@@ -1471,20 +2320,10 @@ def run_job_worker(
             daemon=True,
         )
         heartbeat_thread.start()
-        _run_startup_gates(
-            settings,
-            config,
-            store,
-            pool_store,
-            run_id,
-            preflight_runner,
-            proxy_health_runner,
-            scraper_factory,
-            runtime_headless,
-        )
-
         while max_jobs is None or processed < max_jobs:
             pool_store.reset_quota_day(run_id, local_today())
+            pool_store.reactivate_expired_cooldowns(run_id)
+            browser_pool.reconcile()
             # A replacement worker can acquire the global lease moments before
             # the previous job lease expires. Recheck on every scheduler pass
             # so that job is requeued once it becomes stale without requiring
@@ -1493,10 +2332,39 @@ def run_job_worker(
             if pool_store.stop_requested():
                 final_status = "stopped"
                 break
-            if store.get_control("global_safety_stop"):
-                final_status = "safety_stop"
-                exit_code = 2
-                break
+            cooldown = store.global_cooldown()
+            if cooldown:
+                final_status = "cooldown"
+                pool_store.update_run(
+                    run_id,
+                    status="waiting",
+                    next_cycle_at=cooldown["resume_at"],
+                    blocked_reason=cooldown["reason"],
+                )
+                if once:
+                    break
+                sleep_fn(max(0.1, runtime_poll_seconds))
+                continue
+            if startup_gates_pending:
+                # A replacement worker must not touch account browsers while a
+                # global outage circuit is active. Run the live startup gates
+                # only after the circuit expires, then exactly once.
+                _run_startup_gates(
+                    settings,
+                    config,
+                    store,
+                    pool_store,
+                    run_id,
+                    preflight_runner,
+                    proxy_health_runner,
+                    browser_pool,
+                )
+                startup_gates_pending = False
+                if store.global_cooldown():
+                    if once:
+                        final_status = "cooldown"
+                        break
+                    continue
             endurance.maybe_enqueue()
             job = store.claim_next(worker_id)
             if job is None:
@@ -1515,15 +2383,19 @@ def run_job_worker(
                 store=store,
                 pool_store=pool_store,
                 run_id=run_id,
-                headless=runtime_headless,
-                scraper_factory=scraper_factory,
+                browser_pool=browser_pool,
                 preflight_runner=preflight_runner,
                 proxy_health_runner=proxy_health_runner,
                 endurance_plan=endurance_plan,
             )
-            if outcome == "safety_stop":
+            if outcome == "cooldown":
                 final_status = outcome
-                exit_code = 2
+                if once:
+                    break
+                sleep_fn(max(0.1, runtime_poll_seconds))
+                continue
+            if job.source == "captcha_validation":
+                final_status = outcome
                 break
             if once:
                 final_status = outcome
@@ -1552,6 +2424,7 @@ def run_job_worker(
         store.add_event("worker_failed", level="error", data={"error": str(exc)})
         raise
     finally:
+        browser_pool.close_all()
         heartbeat_stop.set()
         if heartbeat_thread:
             heartbeat_thread.join(timeout=5)
@@ -1574,13 +2447,25 @@ def _process_claimed_job(
     store: JobStore,
     pool_store: AccountPoolStore,
     run_id: str,
-    headless: bool,
-    scraper_factory: Callable[..., Any],
+    browser_pool: _PersistentAccountBrowsers,
     preflight_runner: Callable[..., Any],
     proxy_health_runner: Callable[..., Any],
     endurance_plan: Any | None = None,
 ) -> str:
-    excluded: set[str] = set()
+    target_account_id = (
+        str(job.input.get("target_account_id") or "")
+        if job.source == "captcha_validation"
+        else ""
+    )
+    excluded: set[str] = (
+        {
+            account.account_id
+            for account in config.accounts
+            if account.account_id != target_account_id
+        }
+        if target_account_id
+        else set()
+    )
     quota_date = local_today()
     while True:
         if store.cancel_requested(job.job_id):
@@ -1598,7 +2483,22 @@ def _process_claimed_job(
             ),
         )
         if account is None:
-            status = _unavailable_job_status(pool_store, run_id, config, excluded)
+            if target_account_id:
+                target_state = next(
+                    (
+                        str(row["status"])
+                        for row in pool_store.accounts(run_id)
+                        if str(row["account_id"]) == target_account_id
+                    ),
+                    "paused",
+                )
+                status = (
+                    "waiting_captcha"
+                    if target_state == CAPTCHA_PENDING_STATUS
+                    else "waiting_capacity"
+                )
+            else:
+                status = _unavailable_job_status(pool_store, run_id, config, excluded)
             store.set_waiting(job.job_id, status, reason=status)
             pool_store.update_run(
                 run_id,
@@ -1609,7 +2509,7 @@ def _process_claimed_job(
             return status
         excluded.add(account.account_id)
         try:
-            runtime_settings = account_settings(settings, account)
+            runtime_settings = _runtime_account_settings(settings, account, store)
         except ValueError as exc:
             pool_store.pause_account(
                 run_id, account.account_id, reason="account_configuration_invalid"
@@ -1647,20 +2547,12 @@ def _process_claimed_job(
 
         attempt_id: str | None = None
         try:
-            with scraper_factory(headless=headless, settings=runtime_settings) as scraper:
-                try:
-                    scraper.ensure_authenticated(username, password)
-                except CredentialsRejectedError:
-                    pool_store.pause_account(
-                        run_id, account.account_id, reason="credentials_invalid"
-                    )
-                    store.add_event(
-                        "account_credentials_invalid",
-                        job_id=job.job_id,
-                        account_id=account.account_id,
-                        level="error",
-                    )
-                    continue
+            with browser_pool.session(
+                account.account_id,
+                runtime_settings,
+                username,
+                password,
+            ) as scraper:
                 store.set_account_check(account.account_id, session_checked=True)
 
                 items = store.items(job.job_id, public=False)
@@ -1685,7 +2577,14 @@ def _process_claimed_job(
                                 safety_stop=exc.reason.value,
                                 error=str(exc),
                             )
-                            scraper.ensure_authenticated(username, password, force=True)
+                            with browser_pool.session(
+                                account.account_id,
+                                runtime_settings,
+                                username,
+                                password,
+                                force=True,
+                            ) as scraper:
+                                pass
                             attempt_id = store.begin_attempt(
                                 job_id=job.job_id,
                                 account_id=account.account_id,
@@ -1699,8 +2598,33 @@ def _process_claimed_job(
                             results = _search_job(scraper, job)
                         else:
                             raise
+                    store.clear_external_outage_backoff()
                     store.finish_attempt(attempt_id, status="search_completed")
                     attempt_id = None
+                    if job.source == "captcha_validation" and job.input.get(
+                        "validation_only"
+                    ):
+                        from .captcha_budget import CaptchaBudgetStore
+
+                        CaptchaBudgetStore(
+                            settings.captcha_state_path,
+                            daily_limit=settings.two_captcha_daily_limit,
+                            circuit_seconds=settings.two_captcha_circuit_breaker_seconds,
+                            rejection_cooldown_seconds=(
+                                settings.two_captcha_rejection_cooldown_seconds
+                            ),
+                        ).finish_manual_authorization(
+                            account_id=account.account_id,
+                            status="not_required",
+                            reason="browser_token_accepted",
+                        )
+                        store.add_event(
+                            "captcha_validation_completed",
+                            job_id=job.job_id,
+                            account_id=account.account_id,
+                            data={"result_count": len(results)},
+                        )
+                        return store.finalize_job(job.job_id)
                     items = store.add_results(job.job_id, results)
                 else:
                     attempt_id = store.begin_attempt(
@@ -1719,8 +2643,16 @@ def _process_claimed_job(
                         if attempt_id:
                             store.finish_attempt(attempt_id, status="cancelled")
                         return store.finalize_job(job.job_id)
+                    sample_pages = (
+                        (int(job.input.get("sample_pages") or 0) or None)
+                        if job.source == "endurance"
+                        else None
+                    )
                     final_path = _expected_artifact_path(
-                        settings.output_dir, job.job_id, item
+                        settings.output_dir,
+                        job.job_id,
+                        item,
+                        sample_pages=sample_pages,
                     )
                     store.mark_item_downloading(str(item["item_id"]), final_path)
                     try:
@@ -1737,6 +2669,7 @@ def _process_claimed_job(
                                     item,
                                     job_id=job.job_id,
                                     output_root=settings.output_dir,
+                                    sample_pages=sample_pages,
                                     on_expected_pages=lambda count: store.set_item_expected_pages(
                                         str(item["item_id"]), count
                                     ),
@@ -1744,12 +2677,20 @@ def _process_claimed_job(
                             except SafetyStopException as exc:
                                 if exc.reason != StopReason.AUTH_REQUIRED:
                                     raise
-                                scraper.ensure_authenticated(username, password, force=True)
+                                with browser_pool.session(
+                                    account.account_id,
+                                    runtime_settings,
+                                    username,
+                                    password,
+                                    force=True,
+                                ) as scraper:
+                                    pass
                                 final_path, page_count, sha256, size = download_job_item(
                                     scraper,
                                     item,
                                     job_id=job.job_id,
                                     output_root=settings.output_dir,
+                                    sample_pages=sample_pages,
                                     on_expected_pages=lambda count: store.set_item_expected_pages(
                                         str(item["item_id"]), count
                                     ),
@@ -1772,10 +2713,21 @@ def _process_claimed_job(
                 if attempt_id:
                     store.finish_attempt(attempt_id, status="completed")
                 return store.finalize_job(job.job_id)
-        except CredentialsRejectedError:
+        except CredentialsRejectedError as exc:
+            browser_pool.discard(account.account_id, status="credentials_invalid")
             if attempt_id:
                 store.finish_attempt(attempt_id, status="credentials_invalid")
             pool_store.pause_account(run_id, account.account_id, reason="credentials_invalid")
+            store.add_event(
+                "account_credentials_invalid",
+                job_id=job.job_id,
+                account_id=account.account_id,
+                level="error",
+                data={
+                    "http_status": exc.status,
+                    "response_code": exc.response_code,
+                },
+            )
         except SafetyStopException as exc:
             if attempt_id:
                 store.finish_attempt(
@@ -1791,14 +2743,66 @@ def _process_claimed_job(
                 store=store,
                 pool_store=pool_store,
                 run_id=run_id,
+                config=config,
+                settings=settings,
+                browser_pool=browser_pool,
+                preflight_runner=preflight_runner,
+                proxy_health_runner=proxy_health_runner,
             )
-            if outcome == "safety_stop":
+            if outcome in {"safety_stop", "cooldown"}:
                 store.set_waiting(job.job_id, "queued", reason=exc.reason.value)
                 return outcome
         except Exception as exc:
             safe_error = _redact_known_values(str(exc), username, password)
             if attempt_id:
                 store.finish_attempt(attempt_id, status="failed", error=safe_error)
+            connection_failure = _looks_like_connection_failure(exc)
+            dataimpulse_failure = (
+                _dataimpulse_failure_kind(exc)
+                if _is_dataimpulse_account(account)
+                else "unknown"
+            )
+            recovered_route = False
+            if (
+                _is_dataimpulse_account(account)
+                and dataimpulse_failure != "provider_terminal"
+                and (connection_failure or dataimpulse_failure == "transient_route")
+            ):
+                recovered_route = _rotate_dataimpulse_route(
+                    account,
+                    settings,
+                    store,
+                    pool_store,
+                    run_id,
+                    browser_pool,
+                    preflight_runner,
+                    proxy_health_runner,
+                    reason="confirmed_connection_failure",
+                )
+            if dataimpulse_failure == "provider_terminal":
+                pool_store.pause_account(
+                    run_id,
+                    account.account_id,
+                    reason="dataimpulse_provider_terminal",
+                    cooldown_seconds=None,
+                )
+                store.add_event(
+                    "dataimpulse_provider_terminal",
+                    job_id=job.job_id,
+                    account_id=account.account_id,
+                    level="error",
+                    data={"action": "operator_required"},
+                )
+                continue
+            if connection_failure and not recovered_route:
+                browser_pool.discard(account.account_id, status="browser_context_failed")
+            if recovered_route:
+                store.add_event(
+                    "account_route_recovered_after_failure",
+                    job_id=job.job_id,
+                    account_id=account.account_id,
+                )
+                continue
             gate_ok = _ensure_account_gate(
                 account,
                 runtime_settings,
@@ -1836,20 +2840,13 @@ def _run_startup_gates(
     run_id: str,
     preflight_runner: Callable[..., Any],
     proxy_health_runner: Callable[..., Any],
-    scraper_factory: Callable[..., Any],
-    headless: bool,
+    browser_pool: _PersistentAccountBrowsers,
 ) -> None:
-    states = {
-        str(row["account_id"]): str(row["status"])
-        for row in pool_store.accounts(run_id)
-    }
     for account in config.accounts:
         if not account.enabled:
             continue
-        if states.get(account.account_id) == CAPTCHA_PENDING_STATUS:
-            continue
         try:
-            runtime_settings = account_settings(settings, account)
+            runtime_settings = _runtime_account_settings(settings, account, store)
         except ValueError as exc:
             pool_store.pause_account(
                 run_id, account.account_id, reason="account_configuration_invalid"
@@ -1877,26 +2874,53 @@ def _run_startup_gates(
         password = ""
         try:
             username, password = account_credentials(account)
-            with scraper_factory(headless=headless, settings=runtime_settings) as scraper:
-                scraper.ensure_authenticated(username, password)
+            with browser_pool.session(
+                account.account_id,
+                runtime_settings,
+                username,
+                password,
+            ):
+                pass
             store.set_account_check(account.account_id, session_checked=True)
             pool_store.mark_account_available(run_id, account.account_id)
-        except CredentialsRejectedError:
+        except CredentialsRejectedError as exc:
+            browser_pool.discard(account.account_id, status="credentials_invalid")
             pool_store.pause_account(run_id, account.account_id, reason="credentials_invalid")
             store.add_event(
                 "account_credentials_invalid",
                 account_id=account.account_id,
                 level="error",
+                data={
+                    "http_status": exc.status,
+                    "response_code": exc.response_code,
+                },
             )
         except SafetyStopException as exc:
             if exc.reason in GLOBAL_SAFETY_REASONS:
-                store.set_control("global_safety_stop", exc.reason.value)
+                store.set_global_cooldown(
+                    exc.reason.value,
+                    SAFETY_COOLDOWN_SECONDS[exc.reason],
+                )
+                pool_store.pause_account(
+                    run_id,
+                    account.account_id,
+                    reason=exc.reason.value,
+                    cooldown_seconds=SAFETY_COOLDOWN_SECONDS[exc.reason],
+                )
             elif exc.reason == StopReason.CAPTCHA_REJECTED:
                 pool_store.mark_account_captcha_pending(
-                    run_id, account.account_id, reason=exc.reason.value
+                    run_id,
+                    account.account_id,
+                    reason=exc.reason.value,
+                    cooldown_seconds=SAFETY_COOLDOWN_SECONDS[exc.reason],
                 )
             else:
-                pool_store.pause_account(run_id, account.account_id, reason=exc.reason.value)
+                pool_store.pause_account(
+                    run_id,
+                    account.account_id,
+                    reason=exc.reason.value,
+                    cooldown_seconds=SAFETY_COOLDOWN_SECONDS.get(exc.reason, 300.0),
+                )
             store.add_event(
                 "account_startup_auth_stopped",
                 account_id=account.account_id,
@@ -1904,6 +2928,8 @@ def _run_startup_gates(
                 data={"reason": exc.reason.value},
             )
         except Exception as exc:
+            if _looks_like_connection_failure(exc):
+                browser_pool.discard(account.account_id, status="browser_context_failed")
             pool_store.pause_account(run_id, account.account_id, reason="startup_auth_failed")
             store.add_event(
                 "account_startup_auth_failed",
@@ -1913,6 +2939,26 @@ def _run_startup_gates(
                     "error": _redact_known_values(str(exc), username, password)
                 },
             )
+
+
+def _runtime_account_settings(
+    settings: Settings,
+    account: PoolAccount,
+    store: JobStore,
+    *,
+    dataimpulse_port: int | None = None,
+) -> Settings:
+    if not _is_dataimpulse_account(account):
+        return account_settings(settings, account)
+    if account.dataimpulse_port is None:
+        raise ValueError(
+            f"Pool account {account.account_id} requires dataimpulse_port."
+        )
+    route = store.ensure_dataimpulse_route(
+        account.account_id, account.dataimpulse_port
+    )
+    port = dataimpulse_port or int(route["active_port"])
+    return account_settings(settings, account, dataimpulse_port=port)
 
 
 def _ensure_account_gate(
@@ -1937,6 +2983,43 @@ def _ensure_account_gate(
         return True
     try:
         preflight = preflight_runner(settings, write_report=True)
+        rotate_residential_baseline = False
+        if (
+            not preflight.ok
+            and _is_sticky_residential_account(account)
+        ):
+            replacement_preflight = preflight_runner(
+                settings,
+                write_report=True,
+                allow_baseline_replacement=True,
+            )
+            if (
+                replacement_preflight.ok
+                and _egress_baseline_status(replacement_preflight) == "replacement_pending"
+            ):
+                if _is_dataimpulse_account(account):
+                    from .proxy_provider import dataimpulse_configuration_health
+
+                    provider_health = dataimpulse_configuration_health(
+                        settings.dataimpulse_proxy_login,
+                        settings.dataimpulse_proxy_password,
+                    )
+                else:
+                    from .proxy_provider import two_captcha_proxy_health
+
+                    provider_health = two_captcha_proxy_health(
+                        settings.two_captcha_api_key,
+                        provider=account.proxy_provider,
+                        force=True,
+                    )
+                if not provider_health.get("ok"):
+                    raise SafetyStopException(
+                        StopReason.PROXY_HEALTH,
+                        "Residential proxy traffic is unavailable.",
+                        context="job worker startup",
+                    )
+                preflight = replacement_preflight
+                rotate_residential_baseline = True
         if not preflight.ok:
             raise SafetyStopException(
                 StopReason.EGRESS_PREFLIGHT,
@@ -1960,6 +3043,27 @@ def _ensure_account_gate(
                     "Two enabled accounts resolved to the same fixed egress.",
                     context="job worker startup",
                 )
+        if rotate_residential_baseline:
+            from .preflight import replace_egress_baseline
+
+            replace_egress_baseline(
+                settings,
+                egress_hash=str(egress_hash or ""),
+                egress_country=str(preflight.report.get("egress_country") or ""),
+            )
+            store.add_event(
+                "residential_egress_rotated",
+                account_id=account.account_id,
+                data={
+                    "provider": account.proxy_provider,
+                    "country_validated": True,
+                    "provider_healthy": True,
+                    "portal_reachable": True,
+                    "recaptcha_reachable": True,
+                    "unique_egress": True,
+                    "sanitized_baseline_archived": True,
+                },
+            )
         store.set_account_check(
             account.account_id,
             proxy_status="passed",
@@ -1979,6 +3083,188 @@ def _ensure_account_gate(
         return False
 
 
+def _is_sticky_residential_account(account: PoolAccount) -> bool:
+    from .proxy_provider import TWO_CAPTCHA_RESIDENTIAL_STICKY_PROVIDER
+
+    return account.proxy_provider in {
+        TWO_CAPTCHA_RESIDENTIAL_STICKY_PROVIDER,
+        DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER,
+    }
+
+
+def _is_dataimpulse_account(account: PoolAccount) -> bool:
+    return account.proxy_provider == DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER
+
+
+def _dataimpulse_failure_kind(exc: Exception) -> str:
+    from .dataimpulse import classify_dataimpulse_failure
+
+    status = getattr(exc, "status", None)
+    try:
+        parsed_status = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        parsed_status = None
+    return classify_dataimpulse_failure(parsed_status, str(exc))
+
+
+def _egress_baseline_status(preflight: Any) -> str:
+    checks = preflight.report.get("checks") if isinstance(preflight.report, Mapping) else []
+    for check in checks or []:
+        if isinstance(check, Mapping) and check.get("name") == "egress baseline":
+            return str(check.get("detail") or "")
+    return ""
+
+
+def _rotate_dataimpulse_route(
+    account: PoolAccount,
+    settings: Settings,
+    store: JobStore,
+    pool_store: AccountPoolStore,
+    run_id: str,
+    browser_pool: _PersistentAccountBrowsers,
+    preflight_runner: Callable[..., Any],
+    proxy_health_runner: Callable[..., Any],
+    *,
+    reason: str,
+) -> bool:
+    """Validate then promote one new sticky port for one account only."""
+    if not _is_dataimpulse_account(account) or account.dataimpulse_port is None:
+        return False
+    candidate = store.begin_dataimpulse_rotation(
+        account.account_id,
+        initial_port=account.dataimpulse_port,
+        reason=reason,
+        port_min=settings.dataimpulse_port_min,
+        port_max=settings.dataimpulse_port_max,
+        cooldown_seconds=settings.dataimpulse_rotation_cooldown_seconds,
+        max_rotations_per_hour=settings.dataimpulse_max_rotations_per_hour,
+    )
+    if not candidate.get("ok"):
+        blocked_reason = str(candidate.get("reason") or "proxy_rotation_blocked")
+        if blocked_reason == "proxy_recovery_exhausted":
+            pool_store.pause_account(
+                run_id,
+                account.account_id,
+                reason=blocked_reason,
+                cooldown_seconds=3600,
+            )
+        store.add_event(
+            "dataimpulse_rotation_skipped",
+            account_id=account.account_id,
+            level="warning",
+            data={"reason": blocked_reason},
+        )
+        return False
+    pending_port = int(candidate["pending_port"])
+    promoted = False
+    try:
+        candidate_settings = _runtime_account_settings(
+            settings,
+            account,
+            store,
+            dataimpulse_port=pending_port,
+        )
+        preflight = preflight_runner(
+            candidate_settings,
+            write_report=True,
+            allow_baseline_replacement=True,
+        )
+        if not preflight.ok:
+            raise SafetyStopException(
+                StopReason.EGRESS_PREFLIGHT,
+                "Candidate DataImpulse route failed preflight.",
+                context="dataimpulse rotation",
+            )
+        proxy = proxy_health_runner(candidate_settings, write_report=True)
+        if not proxy.ok:
+            raise SafetyStopException(
+                StopReason.PROXY_HEALTH,
+                "Candidate DataImpulse route failed proxy health.",
+                context="dataimpulse rotation",
+            )
+        egress_hash = str(preflight.report.get("egress_hash") or "")
+        if not egress_hash:
+            raise SafetyStopException(
+                StopReason.EGRESS_PREFLIGHT,
+                "Candidate DataImpulse route did not produce an egress identity.",
+                context="dataimpulse rotation",
+            )
+        owner = store.egress_owner(egress_hash, exclude_account=account.account_id)
+        if owner:
+            raise SafetyStopException(
+                StopReason.PROXY_HEALTH,
+                "Candidate DataImpulse route is already assigned to another account.",
+                context="dataimpulse rotation",
+            )
+        from .preflight import replace_egress_baseline
+
+        replace_egress_baseline(
+            candidate_settings,
+            egress_hash=egress_hash,
+            egress_country=str(preflight.report.get("egress_country") or ""),
+        )
+        route = store.finish_dataimpulse_rotation(account.account_id, promoted=True)
+        promoted = True
+        store.set_account_check(
+            account.account_id,
+            proxy_status="passed",
+            egress_hash=egress_hash,
+        )
+        browser_pool.discard(account.account_id, status="proxy_route_rotated")
+        username, password = account_credentials(account)
+        promoted_settings = _runtime_account_settings(settings, account, store)
+        with browser_pool.session(
+            account.account_id,
+            promoted_settings,
+            username,
+            password,
+        ):
+            pass
+        pool_store.mark_account_available(run_id, account.account_id)
+        store.add_event(
+            "dataimpulse_route_rotated",
+            account_id=account.account_id,
+            data={
+                "generation": int(route["generation"]),
+                "sticky_port": int(route["active_port"]),
+                "country_validated": True,
+                "portal_reachable": True,
+                "recaptcha_reachable": True,
+                "unique_egress": True,
+                "authenticated_form": True,
+            },
+        )
+        return True
+    except Exception as exc:
+        if not promoted:
+            store.finish_dataimpulse_rotation(
+                account.account_id,
+                promoted=False,
+                error_code=(
+                    exc.reason.value
+                    if isinstance(exc, SafetyStopException)
+                    else "candidate_failed"
+                ),
+            )
+        store.add_event(
+            (
+                "dataimpulse_route_promoted_auth_failed"
+                if promoted
+                else "dataimpulse_rotation_failed"
+            ),
+            account_id=account.account_id,
+            level="error",
+            data={
+                "reason": (
+                    exc.reason.value
+                    if isinstance(exc, SafetyStopException)
+                    else "candidate_failed"
+                )
+            },
+        )
+        return False
+
+
 def _handle_account_safety_stop(
     exc: SafetyStopException,
     *,
@@ -1987,23 +3273,98 @@ def _handle_account_safety_stop(
     store: JobStore,
     pool_store: AccountPoolStore,
     run_id: str,
+    config: PoolConfig,
+    settings: Settings,
+    browser_pool: _PersistentAccountBrowsers,
+    preflight_runner: Callable[..., Any],
+    proxy_health_runner: Callable[..., Any],
 ) -> str:
     if exc.reason in GLOBAL_SAFETY_REASONS:
-        store.set_control("global_safety_stop", exc.reason.value)
+        seconds = SAFETY_COOLDOWN_SECONDS[exc.reason]
+        cooldown = store.set_global_cooldown(exc.reason.value, seconds)
+        pool_store.pause_account(
+            run_id,
+            account.account_id,
+            reason=exc.reason.value,
+            cooldown_seconds=seconds,
+        )
         store.add_event(
-            "global_safety_stop",
+            "global_safety_cooldown",
             job_id=job_id,
             account_id=account.account_id,
             level="error",
-            data={"reason": exc.reason.value},
+            data={"reason": exc.reason.value, "resume_at": cooldown["resume_at"]},
         )
-        return "safety_stop"
+        return "cooldown"
     if exc.reason == StopReason.CAPTCHA_REJECTED:
         pool_store.mark_account_captcha_pending(
-            run_id, account.account_id, reason=exc.reason.value
+            run_id,
+            account.account_id,
+            reason=exc.reason.value,
+            cooldown_seconds=SAFETY_COOLDOWN_SECONDS[exc.reason],
         )
     else:
-        pool_store.pause_account(run_id, account.account_id, reason=exc.reason.value)
+        pool_store.pause_account(
+            run_id,
+            account.account_id,
+            reason=exc.reason.value,
+            cooldown_seconds=SAFETY_COOLDOWN_SECONDS.get(exc.reason, 300.0),
+        )
+    if (
+        exc.reason == StopReason.TEMPORARY_UNAVAILABLE
+        and _is_dataimpulse_account(account)
+        and account.dataimpulse_port is not None
+    ):
+        failures = store.record_dataimpulse_temporary_failure(
+            account.account_id,
+            initial_port=account.dataimpulse_port,
+        )
+        if (
+            failures >= settings.dataimpulse_temp_unavailable_threshold
+            and store.another_account_succeeded_recently(account.account_id)
+        ):
+            if _rotate_dataimpulse_route(
+                account,
+                settings,
+                store,
+                pool_store,
+                run_id,
+                browser_pool,
+                preflight_runner,
+                proxy_health_runner,
+                reason="repeated_account_temporary_unavailable",
+            ):
+                store.add_event(
+                    "dataimpulse_account_recovered",
+                    job_id=job_id,
+                    account_id=account.account_id,
+                    data={"trigger": "temporary_unavailable_threshold"},
+                )
+                return "retry_account"
+    if (
+        exc.reason == StopReason.TEMPORARY_UNAVAILABLE
+        and _all_enabled_accounts_temporarily_unavailable(
+            pool_store,
+            run_id,
+            account_ids={
+                candidate.account_id for candidate in config.accounts if candidate.enabled
+            },
+        )
+    ):
+        backoff = store.advance_external_outage_backoff()
+        store.add_event(
+            "external_portal_backoff",
+            job_id=job_id,
+            account_id=account.account_id,
+            level="warning",
+            data={
+                "reason": EXTERNAL_OUTAGE_REASON,
+                "resume_at": backoff["resume_at"],
+                "streak": backoff["streak"],
+                "seconds": backoff["seconds"],
+            },
+        )
+        return "cooldown"
     store.add_event(
         "account_safety_stop",
         job_id=job_id,
@@ -2012,6 +3373,27 @@ def _handle_account_safety_stop(
         data={"reason": exc.reason.value},
     )
     return "retry_account"
+
+
+def _all_enabled_accounts_temporarily_unavailable(
+    pool_store: AccountPoolStore,
+    run_id: str,
+    *,
+    account_ids: set[str],
+) -> bool:
+    if not account_ids:
+        return False
+    states = {
+        str(row["account_id"]): row
+        for row in pool_store.accounts(run_id)
+        if str(row["account_id"]) in account_ids
+    }
+    return len(states) == len(account_ids) and all(
+        str(states[account_id]["status"]) == "paused"
+        and str(states[account_id]["paused_reason"])
+        == StopReason.TEMPORARY_UNAVAILABLE.value
+        for account_id in account_ids
+    )
 
 
 def _search_job(scraper: Any, job: Job) -> list[dict[str, Any]]:
@@ -2067,16 +3449,35 @@ def _worker_heartbeat(
             return
 
 
-def _artifact_stem(sequence: int, result: Mapping[str, Any]) -> str:
+def _artifact_stem(
+    sequence: int,
+    result: Mapping[str, Any],
+    *,
+    sample_pages: int | None = None,
+) -> str:
     foja = result.get("foja", "unknown")
     numero = result.get("numero", result.get("num", "unknown"))
     year = result.get("ano", result.get("year", "unknown"))
-    return f"{sequence:04d}_{_safe_part(foja)}_{_safe_part(numero)}_{_safe_part(year)}"
+    stem = f"{sequence:04d}_{_safe_part(foja)}_{_safe_part(numero)}_{_safe_part(year)}"
+    if sample_pages is not None:
+        stem += f"_test-sample-max{sample_pages}p"
+    return stem
 
 
-def _expected_artifact_path(output_root: Path, job_id: str, item: Mapping[str, Any]) -> Path:
+def _expected_artifact_path(
+    output_root: Path,
+    job_id: str,
+    item: Mapping[str, Any],
+    *,
+    sample_pages: int | None = None,
+) -> Path:
     result = item.get("result") if isinstance(item.get("result"), Mapping) else {}
-    return output_root / "jobs" / job_id / f"{_artifact_stem(int(item['sequence']), result)}.pdf"
+    return (
+        output_root
+        / "jobs"
+        / job_id
+        / f"{_artifact_stem(int(item['sequence']), result, sample_pages=sample_pages)}.pdf"
+    )
 
 
 def _safe_part(value: Any) -> str:

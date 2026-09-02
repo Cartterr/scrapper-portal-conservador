@@ -122,6 +122,11 @@ python -m cbrs jobs cancel JOB_ID
 python -m cbrs jobs safety-clear --reason "revisión aprobada"
 ```
 
+Ese comando production descarga el documento completo. El fixture endurance
+añade `sample_pages=3` internamente y publica un archivo
+`test-sample-max3p.pdf`, para que las pruebas repetidas no vuelvan a transferir
+las 44 páginas.
+
 API local:
 
 ```http

@@ -9,7 +9,12 @@ from urllib.parse import urlparse
 
 from .browser_session import BrowserSession, RecaptchaSolution
 from .config import SETTINGS, Settings
-from .safety import SafetyStopException, StopReason, ensure_safe_response
+from .safety import (
+    SafetyStopException,
+    StopReason,
+    ensure_safe_response,
+    sanitized_portal_outcome,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,16 +115,21 @@ class BrowserOriginClient:
                     if exc.reason == StopReason.CAPTCHA_REJECTED
                     else "indeterminate"
                 ),
-                error_code=exc.reason.value,
+                error_code=sanitized_portal_outcome(
+                    exc.reason, response.status, response.body_text
+                ),
             )
             if (
                 exc.reason != StopReason.CAPTCHA_REJECTED
                 or not captcha_action
-                or (solution is not None and solution.source == "2captcha")
+                or (
+                    solution is not None
+                    and solution.source in {"2captcha", "capsolver"}
+                )
                 or not self.browser.has_external_recaptcha_fallback
             ):
                 raise
-            logger.info("Retrying rejected %s CAPTCHA once with 2Captcha", context)
+            logger.info("Retrying rejected %s CAPTCHA once with the external solver", context)
             solution = self._generate_recaptcha_solution(captcha_action, external=True)
             self._set_captcha_token(
                 headers,
@@ -136,16 +146,92 @@ class BrowserOriginClient:
                     context=context,
                 )
             except SafetyStopException as external_exc:
-                self._record_external_outcome(
-                    solution,
-                    status=(
-                        "rejected"
-                        if external_exc.reason == StopReason.CAPTCHA_REJECTED
-                        else "indeterminate"
-                    ),
-                    error_code=external_exc.reason.value,
+                secondary_generator = getattr(
+                    self.browser,
+                    "generate_secondary_external_recaptcha_solution",
+                    None,
                 )
-                raise
+                may_try_secondary = (
+                    external_exc.reason == StopReason.CAPTCHA_REJECTED
+                    and solution.source == "capsolver"
+                    and bool(
+                        getattr(
+                            self.browser,
+                            "has_secondary_external_recaptcha_fallback",
+                            False,
+                        )
+                    )
+                    and callable(secondary_generator)
+                )
+                if not may_try_secondary:
+                    self._record_external_outcome(
+                        solution,
+                        status=(
+                            "rejected"
+                            if external_exc.reason == StopReason.CAPTCHA_REJECTED
+                            else "indeterminate"
+                        ),
+                        error_code=sanitized_portal_outcome(
+                            external_exc.reason, response.status, response.body_text
+                        ),
+                    )
+                    raise
+
+                logger.info(
+                    "Retrying explicitly rejected CapSolver token once with 2Captcha"
+                )
+                rejected_solution = solution
+                try:
+                    solution = secondary_generator(captcha_action)
+                finally:
+                    self._record_external_outcome(
+                        rejected_solution,
+                        status="rejected",
+                        error_code=sanitized_portal_outcome(
+                            external_exc.reason, response.status, response.body_text
+                        ),
+                    )
+                self._set_captcha_token(
+                    headers,
+                    payload,
+                    solution.token,
+                    include_in_body=include_recaptcha_in_body,
+                )
+                try:
+                    response = self._post_json_response(
+                        path,
+                        headers,
+                        payload,
+                        context=context,
+                    )
+                    ensure_safe_response(
+                        response.status,
+                        response.headers,
+                        response.body_text,
+                        context=context,
+                    )
+                except SafetyStopException as secondary_exc:
+                    self._record_external_outcome(
+                        solution,
+                        status=(
+                            "rejected"
+                            if secondary_exc.reason == StopReason.CAPTCHA_REJECTED
+                            else "indeterminate"
+                        ),
+                        error_code=sanitized_portal_outcome(
+                            secondary_exc.reason,
+                            response.status,
+                            response.body_text,
+                        ),
+                    )
+                    raise
+                except Exception:
+                    self._record_external_outcome(
+                        solution,
+                        status="not_submitted",
+                        error_code="transport_error",
+                    )
+                    raise
             except Exception:
                 self._record_external_outcome(
                     solution,
@@ -187,7 +273,7 @@ class BrowserOriginClient:
         status: str,
         error_code: str | None = None,
     ) -> None:
-        if solution is None or solution.source != "2captcha":
+        if solution is None or solution.source not in {"2captcha", "capsolver"}:
             return
         recorder = getattr(self.browser, "record_external_recaptcha_outcome", None)
         if callable(recorder):
@@ -224,12 +310,16 @@ class BrowserOriginClient:
 
     def _get_bytes_with_browser(self, path: str, *, context: str) -> bytes:
         self._pace(context)
-        response = self.browser.fetch_bytes(
-            path,
-            headers={
-                "Accept": "image/jpeg,image/*,*/*",
-            },
-        )
+        headers = {"Accept": "image/jpeg,image/*,*/*"}
+        try:
+            response = self.browser.fetch_bytes(path, headers=headers)
+        except Exception:
+            logger.warning(
+                "Transient browser transport failure during %s; retrying once",
+                context,
+            )
+            self._pace(f"{context} retry")
+            response = self.browser.fetch_bytes(path, headers=headers)
         content = base64.b64decode(response.body_base64 or "")
         ensure_safe_response(
             response.status,

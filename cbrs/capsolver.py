@@ -8,47 +8,48 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-CREATE_TASK_URL = "https://api.2captcha.com/createTask"
-GET_TASK_RESULT_URL = "https://api.2captcha.com/getTaskResult"
-GET_BALANCE_URL = "https://api.2captcha.com/getBalance"
-REPORT_CORRECT_URL = "https://api.2captcha.com/reportCorrect"
-REPORT_INCORRECT_URL = "https://api.2captcha.com/reportIncorrect"
+CREATE_TASK_URL = "https://api.capsolver.com/createTask"
+GET_TASK_RESULT_URL = "https://api.capsolver.com/getTaskResult"
+GET_BALANCE_URL = "https://api.capsolver.com/getBalance"
+ENTERPRISE_V3_COST_USD = 0.003
 
 
-class TwoCaptchaError(RuntimeError):
-    """Sanitized 2Captcha failure that never includes keys or solution tokens."""
+class CapSolverError(RuntimeError):
+    """Sanitized CapSolver failure that never includes keys or task secrets."""
 
     def __init__(self, code: str, message: str | None = None) -> None:
         self.code = code
-        super().__init__(message or f"2Captcha request failed ({code}).")
+        super().__init__(message or f"CapSolver request failed ({code}).")
 
 
 @dataclass(frozen=True)
-class TwoCaptchaResult:
+class CapSolverResult:
     token: str = field(repr=False)
-    cost_usd: float | None = None
-    task_id: int | None = field(default=None, repr=False)
+    cost_usd: float | None = ENTERPRISE_V3_COST_USD
+    task_id: str | None = field(default=None, repr=False)
+    user_agent: str | None = field(default=None, repr=False)
+    sec_ch_ua: str | None = field(default=None, repr=False)
 
 
-class TwoCaptchaClient:
-    """Small API v2 client for reCAPTCHA v3 Enterprise tasks."""
+class CapSolverClient:
+    """Small CapSolver client for proxy-bound reCAPTCHA v3 Enterprise tasks."""
 
     def __init__(
         self,
         api_key: str,
         *,
         timeout_seconds: float = 120.0,
-        poll_seconds: float = 5.0,
+        poll_seconds: float = 3.0,
         request_json: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         monotonic_fn: Callable[[], float] = time.monotonic,
     ) -> None:
         if not api_key:
-            raise ValueError("A 2Captcha API key is required.")
+            raise ValueError("A CapSolver API key is required.")
         if timeout_seconds <= 0:
-            raise ValueError("2Captcha timeout must be greater than zero.")
+            raise ValueError("CapSolver timeout must be greater than zero.")
         if poll_seconds < 0:
-            raise ValueError("2Captcha poll interval cannot be negative.")
+            raise ValueError("CapSolver poll interval cannot be negative.")
         self._api_key = api_key
         self.timeout_seconds = float(timeout_seconds)
         self.poll_seconds = float(poll_seconds)
@@ -62,24 +63,7 @@ class TwoCaptchaClient:
         try:
             return float(response["balance"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise TwoCaptchaError("INVALID_RESPONSE") from exc
-
-    def report_correct(self, task_id: int) -> None:
-        self._report_task(REPORT_CORRECT_URL, task_id)
-
-    def report_incorrect(self, task_id: int) -> None:
-        self._report_task(REPORT_INCORRECT_URL, task_id)
-
-    def _report_task(self, url: str, task_id: int) -> None:
-        if not isinstance(task_id, int) or task_id <= 0:
-            raise ValueError("2Captcha task id must be a positive integer.")
-        response = self._request_json(
-            url,
-            {"clientKey": self._api_key, "taskId": task_id},
-        )
-        _raise_for_api_error(response)
-        if response.get("status") != "success":
-            raise TwoCaptchaError("INVALID_RESPONSE")
+            raise CapSolverError("INVALID_RESPONSE") from exc
 
     def solve_recaptcha_v3_enterprise(
         self,
@@ -88,12 +72,16 @@ class TwoCaptchaClient:
         website_key: str,
         page_action: str,
         min_score: float,
+        proxy: str,
+        user_agent: str,
     ) -> str:
         return self.solve_recaptcha_v3_enterprise_result(
             website_url=website_url,
             website_key=website_key,
             page_action=page_action,
             min_score=min_score,
+            proxy=proxy,
+            user_agent=user_agent,
         ).token
 
     def solve_recaptcha_v3_enterprise_result(
@@ -103,26 +91,34 @@ class TwoCaptchaClient:
         website_key: str,
         page_action: str,
         min_score: float,
-    ) -> TwoCaptchaResult:
+        proxy: str,
+        user_agent: str,
+    ) -> CapSolverResult:
+        if not proxy:
+            raise ValueError("A proxy is required for a proxy-bound CapSolver task.")
+        if not user_agent:
+            raise ValueError("A browser user agent is required for a CapSolver task.")
         create = self._request_json(
             CREATE_TASK_URL,
             {
                 "clientKey": self._api_key,
                 "task": {
-                    "type": "RecaptchaV3TaskProxyless",
+                    "type": "ReCaptchaV3EnterpriseTask",
                     "websiteURL": website_url,
                     "websiteKey": website_key,
-                    "minScore": min_score,
                     "pageAction": page_action,
-                    "isEnterprise": True,
-                    "apiDomain": "google.com",
+                    "minScore": min_score,
+                    "proxy": proxy,
+                    "userAgent": user_agent,
+                    "apiDomain": "www.google.com",
                 },
             },
         )
         _raise_for_api_error(create)
-        task_id = create.get("taskId")
-        if not isinstance(task_id, int):
-            raise TwoCaptchaError("INVALID_RESPONSE")
+        raw_task_id = create.get("taskId")
+        if not isinstance(raw_task_id, (str, int)) or not str(raw_task_id):
+            raise CapSolverError("INVALID_RESPONSE")
+        task_id = str(raw_task_id)
 
         deadline = self._monotonic() + self.timeout_seconds
         while self._monotonic() < deadline:
@@ -134,30 +130,37 @@ class TwoCaptchaClient:
             )
             _raise_for_api_error(result)
             status = result.get("status")
-            if status == "processing":
+            if status in {"idle", "processing"}:
                 continue
             if status != "ready":
-                raise TwoCaptchaError("INVALID_RESPONSE")
+                raise CapSolverError("INVALID_RESPONSE")
             solution = result.get("solution")
             token = solution.get("gRecaptchaResponse") if isinstance(solution, Mapping) else None
             if not isinstance(token, str) or not token:
-                raise TwoCaptchaError("INVALID_RESPONSE")
-            try:
-                cost = float(result["cost"]) if result.get("cost") is not None else None
-            except (TypeError, ValueError):
-                cost = None
-            return TwoCaptchaResult(token=token, cost_usd=cost, task_id=task_id)
-        raise TwoCaptchaError("TIMEOUT")
+                raise CapSolverError("INVALID_RESPONSE")
+            returned_user_agent = (
+                solution.get("userAgent") if isinstance(solution, Mapping) else None
+            )
+            returned_sec_ch_ua = (
+                solution.get("secChUa") if isinstance(solution, Mapping) else None
+            )
+            return CapSolverResult(
+                token=token,
+                task_id=task_id,
+                user_agent=returned_user_agent,
+                sec_ch_ua=returned_sec_ch_ua,
+            )
+        raise CapSolverError("TIMEOUT")
 
 
 def _raise_for_api_error(response: Mapping[str, Any]) -> None:
     try:
         error_id = int(response.get("errorId", 0))
     except (TypeError, ValueError) as exc:
-        raise TwoCaptchaError("INVALID_RESPONSE") from exc
+        raise CapSolverError("INVALID_RESPONSE") from exc
     if error_id:
         code = response.get("errorCode")
-        raise TwoCaptchaError(str(code) if code else f"ERROR_{error_id}")
+        raise CapSolverError(str(code) if code else f"ERROR_{error_id}")
 
 
 def _post_json(url: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -167,7 +170,7 @@ def _post_json(url: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         headers={
             "accept": "application/json",
             "content-type": "application/json",
-            "user-agent": "cbrs-2captcha/1.0",
+            "user-agent": "cbrs-capsolver/1.0",
         },
         method="POST",
     )
@@ -176,15 +179,15 @@ def _post_json(url: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
             status = int(response.status)
             body = response.read().decode("utf-8", errors="replace")
     except HTTPError as exc:
-        raise TwoCaptchaError(f"HTTP_{exc.code}") from exc
+        raise CapSolverError(f"HTTP_{exc.code}") from exc
     except (URLError, TimeoutError, OSError) as exc:
-        raise TwoCaptchaError("NETWORK_ERROR") from exc
+        raise CapSolverError("NETWORK_ERROR") from exc
     if status != 200:
-        raise TwoCaptchaError(f"HTTP_{status}")
+        raise CapSolverError(f"HTTP_{status}")
     try:
         data = json.loads(body)
     except json.JSONDecodeError as exc:
-        raise TwoCaptchaError("INVALID_RESPONSE") from exc
+        raise CapSolverError("INVALID_RESPONSE") from exc
     if not isinstance(data, Mapping):
-        raise TwoCaptchaError("INVALID_RESPONSE")
+        raise CapSolverError("INVALID_RESPONSE")
     return data

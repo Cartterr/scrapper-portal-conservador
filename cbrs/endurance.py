@@ -23,10 +23,10 @@ class EnduranceFixture:
 class EndurancePlan:
     enabled: bool
     fixtures: tuple[EnduranceFixture, ...]
-    cooldown_seconds: float = 600.0
+    cooldown_seconds: float = 300.0
     max_outstanding_jobs: int = 1
-    jobs_per_account_per_day: int = 15
-    production_reserve_per_account: int = 5
+    jobs_per_account_per_day: int = 20
+    production_reserve_per_account: int = 0
     no_catch_up: bool = True
     quota_exhaustion_test_mode: bool = False
 
@@ -55,17 +55,17 @@ def load_endurance_plan(path: Path) -> EndurancePlan:
     plan = EndurancePlan(
         enabled=bool(raw.get("enabled", False)),
         fixtures=fixtures,
-        cooldown_seconds=float(raw.get("cooldown_seconds", 600)),
+        cooldown_seconds=float(raw.get("cooldown_seconds", 300)),
         max_outstanding_jobs=int(raw.get("max_outstanding_jobs", 1)),
-        jobs_per_account_per_day=int(raw.get("jobs_per_account_per_day", 15)),
-        production_reserve_per_account=int(raw.get("production_reserve_per_account", 5)),
+        jobs_per_account_per_day=int(raw.get("jobs_per_account_per_day", 20)),
+        production_reserve_per_account=int(raw.get("production_reserve_per_account", 0)),
         no_catch_up=bool(raw.get("no_catch_up", True)),
         quota_exhaustion_test_mode=bool(raw.get("quota_exhaustion_test_mode", False)),
     )
     if plan.max_outstanding_jobs != 1:
         raise ValueError("endurance max_outstanding_jobs must be exactly 1")
-    if plan.cooldown_seconds < 0:
-        raise ValueError("endurance cooldown_seconds cannot be negative")
+    if not 60 <= plan.cooldown_seconds <= 300:
+        raise ValueError("endurance cooldown_seconds must be between 60 and 300 seconds")
     if plan.jobs_per_account_per_day <= 0 or plan.production_reserve_per_account < 0:
         raise ValueError("endurance quotas must be positive and reserve cannot be negative")
     if not plan.no_catch_up:

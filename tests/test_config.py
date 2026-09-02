@@ -87,12 +87,38 @@ def test_two_captcha_fallback_settings_are_loaded_without_exposing_key(tmp_path:
     assert "private-key" not in repr(settings)
 
 
+def test_capsolver_fallback_requires_api_key(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="CBRS_CAPSOLVER_API_KEY"):
+        load_settings(
+            {"CBRS_CAPTCHA_SOLVER_MODE": "capsolver_fallback"},
+            root=tmp_path,
+        )
+
+
+def test_capsolver_manual_settings_are_secret_safe(tmp_path: Path) -> None:
+    settings = load_settings(
+        {
+            "CBRS_CAPTCHA_SOLVER_MODE": "capsolver_manual",
+            "CBRS_CAPSOLVER_API_KEY": "CAP-private-key",
+            "CBRS_CAPSOLVER_TIMEOUT_SECONDS": "90",
+            "CBRS_CAPSOLVER_POLL_SECONDS": "3",
+        },
+        root=tmp_path,
+    )
+
+    assert settings.external_captcha_provider == "capsolver"
+    assert settings.capsolver_api_key == "CAP-private-key"
+    assert settings.capsolver_timeout_seconds == 90
+    assert settings.capsolver_poll_seconds == 3
+    assert "CAP-private-key" not in repr(settings)
+
+
 def test_settings_parse_production_defaults(tmp_path: Path) -> None:
     settings = load_settings({}, root=tmp_path)
 
     assert settings.browser_backend == "chrome"
     assert settings.browser_executable_path is None
-    assert settings.headless is False
+    assert settings.headless is True
     assert settings.egress_mode == ""
     assert settings.allow_personal_egress is False
     assert settings.expected_egress_country == "CL"
@@ -139,6 +165,28 @@ def test_egress_mode_is_loaded(tmp_path: Path) -> None:
     settings = load_settings({"CBRS_EGRESS_MODE": "Client_VPN"}, root=tmp_path)
 
     assert settings.egress_mode == "client_vpn"
+
+
+def test_dataimpulse_runtime_settings_are_loaded_and_secret_repr_is_safe(
+    tmp_path: Path,
+) -> None:
+    settings = load_settings(
+        {
+            "CBRS_EGRESS_MODE": "residential_sticky",
+            "DATAIMPULSE_PROXY_LOGIN": "private-login",
+            "DATAIMPULSE_PROXY_PASSWORD": "private-password",
+            "DATAIMPULSE_STICKY_TTL_MINUTES": "120",
+            "CBRS_BROWSER_HEALTHCHECK_SECONDS": "30",
+            "CBRS_BROWSER_REAUTH_BACKOFF_SECONDS": "60",
+        },
+        root=tmp_path,
+    )
+
+    assert settings.egress_mode == "residential_sticky"
+    assert settings.dataimpulse_sticky_ttl_minutes == 120
+    assert settings.browser_healthcheck_seconds == 30
+    assert "private-login" not in repr(settings)
+    assert "private-password" not in repr(settings)
 
 
 def test_personal_egress_ack_is_loaded(tmp_path: Path) -> None:

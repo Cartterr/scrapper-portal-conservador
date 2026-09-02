@@ -24,6 +24,14 @@ ACCOUNT_ENV_PATTERN = re.compile(
     r"^CBRS_ACCOUNT_\d+_(?:USERNAME|PASSWORD|PROXY_URL)$"
 )
 ACCOUNT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
+PROXY_PROVIDERS = frozenset(
+    {
+        "generic_static",
+        "2captcha_dedicated_isp",
+        "2captcha_residential_sticky",
+        "dataimpulse_residential_sticky",
+    }
+)
 MAX_INPUT_BYTES = 2 * 1024 * 1024
 
 
@@ -34,6 +42,23 @@ def _single_line(value: object, label: str, *, allow_empty: bool = False) -> str
     if not allow_empty and not text:
         raise ValueError(f"{label} is required")
     return text
+
+
+def _proxy_provider(value: object) -> str:
+    provider = str(value or "generic_static").strip().lower()
+    if provider not in PROXY_PROVIDERS:
+        raise ValueError(
+            "proxy_provider must be generic_static, 2captcha_dedicated_isp, "
+            "2captcha_residential_sticky, or dataimpulse_residential_sticky"
+        )
+    return provider
+
+
+def _proxy_brand(value: object) -> str | None:
+    brand = _single_line(value, "proxy brand", allow_empty=True).strip()
+    if len(brand) > 80:
+        raise ValueError("proxy brand must contain at most 80 characters")
+    return brand or None
 
 
 def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -59,16 +84,34 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
 
         username = _single_line(raw.get("username"), f"{account_id} username")
         password = _single_line(raw.get("password"), f"{account_id} password")
-        proxy_url = _single_line(raw.get("proxy_url"), f"{account_id} proxy URL")
-        parsed_proxy = urlparse(proxy_url)
-        if parsed_proxy.scheme.lower() not in {"http", "https"}:
-            raise ValueError(f"{account_id} proxy URL must use http:// or https://")
-        try:
-            proxy_port = parsed_proxy.port
-        except ValueError as exc:
-            raise ValueError(f"{account_id} proxy port is invalid") from exc
-        if not parsed_proxy.hostname or proxy_port is None:
-            raise ValueError(f"{account_id} proxy URL must include host and port")
+        proxy_provider = _proxy_provider(raw.get("proxy_provider"))
+        proxy_url = _single_line(
+            raw.get("proxy_url"),
+            f"{account_id} proxy URL",
+            allow_empty=proxy_provider == "dataimpulse_residential_sticky",
+        )
+        dataimpulse_port = None
+        if proxy_provider == "dataimpulse_residential_sticky":
+            try:
+                dataimpulse_port = int(raw.get("dataimpulse_port"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{account_id} requires a DataImpulse sticky port"
+                ) from exc
+            if not 10000 <= dataimpulse_port <= 20000:
+                raise ValueError(
+                    f"{account_id} DataImpulse sticky port must be between 10000 and 20000"
+                )
+        else:
+            parsed_proxy = urlparse(proxy_url)
+            if parsed_proxy.scheme.lower() not in {"http", "https"}:
+                raise ValueError(f"{account_id} proxy URL must use http:// or https://")
+            try:
+                proxy_port = parsed_proxy.port
+            except ValueError as exc:
+                raise ValueError(f"{account_id} proxy port is invalid") from exc
+            if not parsed_proxy.hostname or proxy_port is None:
+                raise ValueError(f"{account_id} proxy URL must include host and port")
 
         try:
             quota = int(raw.get("daily_quota", 20))
@@ -79,10 +122,15 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
 
         username_env = f"CBRS_ACCOUNT_{index}_USERNAME"
         password_env = f"CBRS_ACCOUNT_{index}_PASSWORD"
-        proxy_url_env = f"CBRS_ACCOUNT_{index}_PROXY_URL"
-        if proxy_url_env in proxy_references:
-            raise ValueError("proxy environment references must be unique")
-        proxy_references.add(proxy_url_env)
+        proxy_url_env = (
+            None
+            if proxy_provider == "dataimpulse_residential_sticky"
+            else f"CBRS_ACCOUNT_{index}_PROXY_URL"
+        )
+        if proxy_url_env:
+            if proxy_url_env in proxy_references:
+                raise ValueError("proxy environment references must be unique")
+            proxy_references.add(proxy_url_env)
         profile_dir = f"/var/lib/cbrs/accounts/{account_id}/chrome-profile"
         if profile_dir in profile_dirs:
             raise ValueError("profile directories must be unique")
@@ -95,6 +143,7 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 f"{account_id} egress group must contain only letters, digits, or underscores"
             )
+        proxy_brand = _proxy_brand(raw.get("proxy_brand"))
         accounts.append(
             {
                 "id": account_id,
@@ -111,8 +160,19 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
                 "profile_dir": profile_dir,
                 "daily_quota": quota,
                 "egress_group": egress_group or None,
+                "proxy_provider": proxy_provider,
+                "proxy_brand": proxy_brand,
+                "dataimpulse_port": dataimpulse_port,
             }
         )
+
+    dataimpulse_ports = [
+        int(account["dataimpulse_port"])
+        for account in accounts
+        if account["proxy_provider"] == "dataimpulse_residential_sticky"
+    ]
+    if len(dataimpulse_ports) != len(set(dataimpulse_ports)):
+        raise ValueError("DataImpulse sticky ports must be unique")
 
     raw_backup = payload.get("backup")
     if not isinstance(raw_backup, Mapping):
@@ -156,13 +216,19 @@ def build_environment(
         if ACCOUNT_ENV_PATTERN.fullmatch(key):
             del environment[key]
 
+    dataimpulse_only = all(
+        account["proxy_provider"] == "dataimpulse_residential_sticky"
+        for account in validated["accounts"]
+    )
     environment.update(
         {
             "CBRS_BROWSER_BACKEND": "chrome",
             "CBRS_BROWSER_EXECUTABLE_PATH": "/usr/bin/google-chrome-stable",
-            "CBRS_HEADLESS": "0",
+            "CBRS_HEADLESS": "1",
             "CBRS_WINDOW_MODE": "normal",
-            "CBRS_EGRESS_MODE": "dedicated_static_isp",
+            "CBRS_EGRESS_MODE": (
+                "residential_sticky" if dataimpulse_only else "dedicated_static_isp"
+            ),
             "CBRS_EXPECTED_EGRESS_COUNTRY": "CL",
             "CBRS_PROFILE_DIR": "/var/lib/cbrs/chrome-profile",
             "CBRS_OUTPUT_DIR": "/var/lib/cbrs/outputs",
@@ -174,7 +240,8 @@ def build_environment(
     for account in validated["accounts"]:
         environment[account["username_env"]] = account["username"]
         environment[account["password_env"]] = account["password"]
-        environment[account["proxy_url_env"]] = account["proxy_url"]
+        if account["proxy_url_env"]:
+            environment[account["proxy_url_env"]] = account["proxy_url"]
     backup = validated["backup"]
     environment["RESTIC_REPOSITORY"] = backup["repository"]
     environment["RESTIC_PASSWORD_FILE"] = backup["password_file"]
@@ -189,12 +256,18 @@ def build_pool_config(validated: Mapping[str, Any]) -> dict[str, Any]:
             "label": account["label"],
             "username_env": account["username_env"],
             "password_env": account["password_env"],
-            "proxy_url_env": account["proxy_url_env"],
             "profile_dir": account["profile_dir"],
             "daily_quota": account["daily_quota"],
         }
         if account["egress_group"]:
             item["egress_group"] = account["egress_group"]
+        item["proxy_provider"] = account["proxy_provider"]
+        if account.get("proxy_url_env"):
+            item["proxy_url_env"] = account["proxy_url_env"]
+        if account.get("dataimpulse_port") is not None:
+            item["dataimpulse_port"] = account["dataimpulse_port"]
+        if account.get("proxy_brand"):
+            item["proxy_brand"] = account["proxy_brand"]
         accounts.append(item)
     return {
         "daily_quota_per_account": 20,
@@ -320,6 +393,9 @@ def _existing_account_values(
             "daily_quota": account.get("daily_quota", 20),
             "label": account.get("label") or account_id,
             "egress_group": account.get("egress_group") or "",
+            "proxy_provider": account.get("proxy_provider") or "generic_static",
+            "proxy_brand": account.get("proxy_brand") or None,
+            "dataimpulse_port": account.get("dataimpulse_port"),
         }
     return values
 
@@ -351,6 +427,12 @@ def build_account_update_payload(
                 "proxy_url": raw.get("proxy_url") or prior.get("proxy_url"),
                 "daily_quota": raw.get("daily_quota", prior.get("daily_quota", 20)),
                 "egress_group": raw.get("egress_group") or prior.get("egress_group") or "",
+                "proxy_provider": raw.get("proxy_provider")
+                or prior.get("proxy_provider")
+                or "generic_static",
+                "proxy_brand": raw.get("proxy_brand") or prior.get("proxy_brand") or None,
+                "dataimpulse_port": raw.get("dataimpulse_port")
+                or prior.get("dataimpulse_port"),
             }
         )
     repository = existing_environment.get("RESTIC_REPOSITORY") or ""

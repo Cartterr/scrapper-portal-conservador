@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import json
 import mimetypes
 import os
@@ -17,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 from .account_pool import (
     AccountPoolStore,
     PoolConfig,
+    account_settings,
     account_credentials,
     dashboard_status,
     load_account_pool_config,
@@ -24,6 +27,7 @@ from .account_pool import (
     resolve_account_captcha,
 )
 from .config import SETTINGS, Settings
+from .dataimpulse import DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER
 from .safety import redact
 
 if TYPE_CHECKING:
@@ -118,6 +122,7 @@ def _handler_factory(
             if parsed.path == "/api/status":
                 payload = dashboard_status(store, config=config)
                 payload["runtime"] = _runtime_summary(settings)
+                payload["proxy_provider"] = _proxy_provider_summary(settings, config)
                 if job_store is not None:
                     from .backup import backup_health
                     from .captcha_budget import CaptchaBudgetStore
@@ -137,11 +142,15 @@ def _handler_factory(
                         ),
                     )
                     payload["captcha_solver"] = captcha_budget.status()
-                    payload["captcha_attempts"] = captcha_budget.recent_attempts()
+                    payload["captcha_attempts"] = captcha_budget.recent_activity()
                     payload["backup"] = backup_health(settings)
+                    payload = _with_proxy_state(payload, job_store, settings, config)
                 payload = _with_account_username_prefixes(payload, config)
                 payload = _with_captcha_phases(payload, captcha_phases)
-                self._send_json(_with_artifact_urls(payload))
+                self._send_json(
+                    _with_artifact_urls(payload),
+                    reveal_proxy_endpoints=True,
+                )
                 return
             if job_store is not None and parsed.path == "/api/settings":
                 self._send_json(_production_settings_payload(settings, config))
@@ -289,6 +298,66 @@ def _handler_factory(
                 _request_worker_resume(settings)
                 self._send_json({"ok": True, "status": "resume_requested"})
                 return
+            if job_store is not None and parsed.path == "/api/captcha/automatic":
+                provider = settings.external_captcha_provider
+                provider_key = (
+                    settings.capsolver_api_key
+                    if provider == "capsolver"
+                    else settings.two_captcha_api_key
+                )
+                if settings.captcha_solver_mode not in {
+                    "2captcha_manual",
+                    "2captcha_fallback",
+                    "capsolver_manual",
+                    "capsolver_fallback",
+                } or not provider_key:
+                    self._send_api_error(
+                        HTTPStatus.CONFLICT, "automatic_external_solver_not_configured"
+                    )
+                    return
+                payload = self._read_json()
+                enabled = payload.get("enabled")
+                if not isinstance(enabled, bool):
+                    self._send_api_error(
+                        HTTPStatus.BAD_REQUEST,
+                        "automatic_external_solver_enabled_must_be_boolean",
+                    )
+                    return
+                from .captcha_budget import CaptchaBudgetStore
+
+                budget = CaptchaBudgetStore(
+                    settings.captcha_state_path,
+                    daily_limit=settings.two_captcha_daily_limit,
+                    circuit_seconds=settings.two_captcha_circuit_breaker_seconds,
+                    rejection_cooldown_seconds=(
+                        settings.two_captcha_rejection_cooldown_seconds
+                    ),
+                )
+                budget.set_automatic_enabled(enabled)
+                released = 0
+                worker_requested = False
+                if enabled:
+                    run = store.latest_run(dry_run=False)
+                    if run:
+                        run_id = str(run["run_id"])
+                        for account_state in store.accounts(run_id):
+                            if account_state["status"] == "captcha_pending":
+                                store.mark_account_available(
+                                    run_id, str(account_state["account_id"])
+                                )
+                    released = job_store.release_waiting_captcha()
+                    if job_store.summary()["queued"] and job_store.active_lease() is None:
+                        _request_worker_resume(settings)
+                        worker_requested = True
+                self._send_json(
+                    {
+                        "ok": True,
+                        "automatic_enabled": enabled,
+                        "released_jobs": released,
+                        "worker_requested": worker_requested,
+                    }
+                )
+                return
             if parsed.path == "/api/onboarding/accounts":
                 status = str(dashboard_status(store, config=config).get("status") or "")
                 if status in {"running", "waiting", "waiting_capacity", "waiting_captcha"}:
@@ -314,14 +383,23 @@ def _handler_factory(
                 if account_id not in known_ids:
                     self._send_api_error(HTTPStatus.NOT_FOUND, "unknown_account")
                     return
-                if settings.captcha_solver_mode != "2captcha_manual":
+                if settings.captcha_solver_mode not in {
+                    "2captcha_manual",
+                    "capsolver_manual",
+                }:
                     self._send_api_error(
-                        HTTPStatus.CONFLICT, "manual_2captcha_mode_not_enabled"
+                        HTTPStatus.CONFLICT, "manual_external_solver_mode_not_enabled"
                     )
                     return
-                if not settings.two_captcha_api_key:
+                provider = settings.external_captcha_provider
+                provider_key = (
+                    settings.capsolver_api_key
+                    if provider == "capsolver"
+                    else settings.two_captcha_api_key
+                )
+                if not provider_key:
                     self._send_api_error(
-                        HTTPStatus.CONFLICT, "two_captcha_api_key_not_configured"
+                        HTTPStatus.CONFLICT, "external_solver_api_key_not_configured"
                     )
                     return
                 run = store.latest_run(dry_run=False)
@@ -353,26 +431,65 @@ def _handler_factory(
                 except CaptchaBudgetError as exc:
                     self._send_api_error(HTTPStatus.CONFLICT, exc.code)
                     return
-                store.mark_account_available(str(run["run_id"]), account_id)
-                job_store.set_next_account(account_id, config)
                 released = job_store.release_waiting_captcha()
+                store.mark_account_available(str(run["run_id"]), account_id)
                 store.add_event(
                     str(run["run_id"]),
                     account_id=account_id,
-                    message="one manual 2Captcha solve authorized",
+                    message="one manual external CAPTCHA solve authorized",
                 )
-                status = str(dashboard_status(store, config=config).get("status") or "")
                 worker_requested = False
-                if status not in {"running", "waiting", "waiting_capacity", "waiting_captcha"}:
-                    _request_worker_resume(settings)
-                    worker_requested = True
+                validation_job_id = None
+                response_status = "one_solve_armed"
+                if released:
+                    job_store.set_next_account(account_id, config)
+                    if job_store.active_lease() is None:
+                        _request_worker_resume(settings)
+                        worker_requested = True
+                else:
+                    examples = job_store.successful_fna_examples(limit=1)
+                    coordinates = (
+                        examples[0]
+                        if examples
+                        else {"foja": 9441, "numero": 4580, "year": 1980}
+                    )
+                    validation_job, _ = job_store.create_job(
+                        kind="fna",
+                        input_data={
+                            "foja": coordinates["foja"],
+                            "numero": coordinates["numero"],
+                            "year": coordinates["year"],
+                            "validation_only": True,
+                            "target_account_id": account_id,
+                        },
+                        idempotency_key=(
+                            f"captcha-validation:{account_id}:{time.time_ns()}"
+                        ),
+                        priority=2,
+                        source="captcha_validation",
+                    )
+                    validation_job_id = str(validation_job["job_id"])
+                    job_store.set_next_account(account_id, config)
+                    if job_store.active_lease() is None:
+                        _request_worker_resume(settings)
+                        worker_requested = True
+                    response_status = "captcha_validation_queued"
+                    store.add_event(
+                        str(run["run_id"]),
+                        account_id=account_id,
+                        message=(
+                            "manual external CAPTCHA authorization queued for targeted "
+                            "browser-first validation"
+                        ),
+                    )
                 self._send_json(
                     {
                         "ok": True,
-                        "status": "one_solve_armed",
+                        "status": response_status,
                         "account_id": account_id,
                         "released_jobs": released,
                         "worker_requested": worker_requested,
+                        "validation_job_id": validation_job_id,
                     },
                     status=HTTPStatus.ACCEPTED,
                 )
@@ -588,8 +705,17 @@ def _handler_factory(
             payload: dict[str, Any],
             *,
             status: HTTPStatus = HTTPStatus.OK,
+            reveal_proxy_endpoints: bool = False,
         ) -> None:
-            encoded = json.dumps(redact(payload), ensure_ascii=False, indent=2).encode("utf-8")
+            safe_payload = redact(payload)
+            if reveal_proxy_endpoints:
+                try:
+                    is_loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
+                except ValueError:
+                    is_loopback = False
+                if is_loopback:
+                    safe_payload = _restore_proxy_endpoints(payload, safe_payload)
+            encoded = json.dumps(safe_payload, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(encoded)))
@@ -692,6 +818,240 @@ def _with_account_username_prefixes(
     return enriched
 
 
+def _proxy_provider_summary(settings: Settings, config: PoolConfig) -> dict[str, Any]:
+    from .proxy_provider import (
+        DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER,
+        TWO_CAPTCHA_DEDICATED_ISP_PROVIDER,
+        TWO_CAPTCHA_RESIDENTIAL_STICKY_PROVIDER,
+        dataimpulse_configuration_health,
+        two_captcha_proxy_health,
+    )
+
+    providers = {
+        account.proxy_provider for account in config.accounts if account.enabled
+    }
+    brands = {
+        account.proxy_brand for account in config.accounts if account.enabled and account.proxy_brand
+    }
+    brand = next(iter(brands)) if len(brands) == 1 else "mixed" if brands else None
+    dataimpulse_accounts = [
+        account
+        for account in config.accounts
+        if account.enabled
+        and account.proxy_provider == DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER
+    ]
+    if dataimpulse_accounts and len(dataimpulse_accounts) == len(
+        [account for account in config.accounts if account.enabled]
+    ):
+        result = dataimpulse_configuration_health(
+            settings.dataimpulse_proxy_login,
+            settings.dataimpulse_proxy_password,
+        )
+        result["brand"] = "DataImpulse"
+        result["configured_accounts"] = len(dataimpulse_accounts)
+        result["sticky_ttl_minutes"] = settings.dataimpulse_sticky_ttl_minutes
+        return result
+    two_captcha_providers = {
+        TWO_CAPTCHA_DEDICATED_ISP_PROVIDER,
+        TWO_CAPTCHA_RESIDENTIAL_STICKY_PROVIDER,
+    }
+    managed_accounts = [
+        account
+        for account in config.accounts
+        if account.enabled and account.proxy_provider in two_captcha_providers
+    ]
+    managed_count = len(managed_accounts)
+    if not managed_count:
+        summary = {
+            "provider": "generic_static" if providers == {"generic_static"} else "mixed",
+            "status": "not_applicable",
+            "ok": True,
+            "configured_accounts": 0,
+        }
+        if brand:
+            summary["brand"] = brand
+        return summary
+    managed_provider = (
+        managed_accounts[0].proxy_provider
+        if len({account.proxy_provider for account in managed_accounts}) == 1
+        else TWO_CAPTCHA_RESIDENTIAL_STICKY_PROVIDER
+    )
+    result = two_captcha_proxy_health(
+        settings.two_captcha_api_key,
+        provider=managed_provider,
+    )
+    result["brand"] = brand or "2Captcha"
+    result["configured_accounts"] = managed_count
+    return result
+
+
+def _with_proxy_state(
+    payload: dict[str, Any],
+    job_store: "JobStore",
+    settings: Settings,
+    config: PoolConfig,
+) -> dict[str, Any]:
+    configured = {account.account_id: account for account in config.accounts}
+    active_worker = job_store.active_lease()
+    active_worker_owner = str(active_worker.get("owner") or "") if active_worker else ""
+    enriched = dict(payload)
+    accounts = []
+    for raw in enriched.get("accounts", []):
+        item = dict(raw)
+        account_id = str(item.get("account_id") or "")
+        account = configured.get(account_id)
+        profile_dir = (
+            account.profile_dir
+            if account and account.profile_dir
+            else settings.profile_dir.parent / "accounts" / account_id / "chrome-profile"
+        )
+        baseline_path = profile_dir.parent / "fixed-egress-baseline.json"
+        baseline_status = "missing"
+        baseline_hash = None
+        baseline_country = None
+        if baseline_path.is_file():
+            try:
+                baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+                if (
+                    baseline.get("schema") == "cbrs-fixed-egress-baseline-v1"
+                    and baseline.get("egress_hash")
+                ):
+                    baseline_status = "unverified"
+                    baseline_hash = str(baseline["egress_hash"])
+                    baseline_country = str(baseline.get("egress_country") or "") or None
+                else:
+                    baseline_status = "invalid"
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                baseline_status = "invalid"
+        check = job_store.account_check(account_id) or {}
+        route = job_store.dataimpulse_route(account_id) or {}
+        checked_hash = str(check.get("egress_hash") or "") or None
+        proxy_status = str(check.get("proxy_status") or "") or None
+        if baseline_hash and checked_hash:
+            baseline_status = "matched" if baseline_hash == checked_hash else "mismatch"
+        if proxy_status == "failed" and baseline_status not in {"missing", "invalid"}:
+            baseline_status = "failed"
+        item["proxy_provider"] = (
+            account.proxy_provider if account else "generic_static"
+        )
+        item["proxy_brand"] = account.proxy_brand if account else None
+        item["proxy_health_status"] = proxy_status or "not_checked"
+        item["egress_baseline_status"] = baseline_status
+        item["egress_country"] = baseline_country
+        route_hash = checked_hash or baseline_hash
+        item["egress_route_id"] = (
+            f"ip-{hashlib.sha256(route_hash.encode('utf-8')).hexdigest()[:10]}"
+            if route_hash
+            else None
+        )
+        item["proxy_checked_at"] = check.get("proxy_checked_at")
+        active_port = int(route["active_port"]) if route.get("active_port") else None
+        item["proxy_endpoint"] = _safe_proxy_endpoint(
+            settings,
+            account,
+            dataimpulse_port=active_port,
+        )
+        item["proxy_sticky_port"] = active_port
+        item["proxy_generation"] = int(route.get("generation") or 0)
+        item["proxy_route_status"] = str(route.get("status") or "not_initialized")
+        item["proxy_rotation_reason"] = route.get("last_rotation_reason")
+        item["proxy_last_rotated_at"] = route.get("last_rotated_at")
+        item["proxy_rotation_cooldown_until"] = route.get("cooldown_until")
+        item["proxy_rotation_count_hour"] = int(route.get("rotation_count") or 0)
+        item["proxy_sticky_ttl_minutes"] = (
+            settings.dataimpulse_sticky_ttl_minutes
+            if account
+            and account.proxy_provider == DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER
+            else None
+        )
+        browser_owner = str(check.get("browser_owner") or "")
+        item["worker_active"] = bool(active_worker_owner)
+        browser_live = bool(check.get("browser_live")) and bool(active_worker_owner)
+        browser_live = browser_live and browser_owner == active_worker_owner
+        item["browser_live"] = browser_live
+        item["browser_authenticated"] = browser_live and bool(
+            check.get("browser_authenticated")
+        )
+        item["browser_mode"] = (
+            "headless" if bool(check.get("browser_headless")) else "headed"
+        ) if check.get("browser_headless") is not None else None
+        if browser_live:
+            item["browser_status"] = str(check.get("browser_status") or "unknown")
+        elif active_worker_owner and browser_owner == active_worker_owner:
+            item["browser_status"] = str(check.get("browser_status") or "not_started")
+        elif active_worker_owner:
+            item["browser_status"] = "not_started"
+        else:
+            item["browser_status"] = "worker_stopped"
+        item["browser_started_at"] = check.get("browser_started_at")
+        item["browser_checked_at"] = check.get("browser_checked_at")
+        item["browser_auth_state"] = str(
+            check.get("browser_auth_state") or "unknown"
+        )
+        accounts.append(item)
+    enriched["accounts"] = accounts
+    pool = dict(enriched.get("pool") or {})
+    pool["browser_live_count"] = sum(bool(account["browser_live"]) for account in accounts)
+    pool["browser_authenticated_count"] = sum(
+        bool(account["browser_authenticated"]) for account in accounts
+    )
+    pool["browser_expected_count"] = len(accounts)
+    enriched["pool"] = pool
+    return enriched
+
+
+def _safe_proxy_endpoint(
+    settings: Settings,
+    account: Any,
+    *,
+    dataimpulse_port: int | None = None,
+) -> str | None:
+    """Return only the proxy host and port, never credentials or the full URL."""
+    if account is None:
+        return None
+    try:
+        proxy_url = account_settings(
+            settings,
+            account,
+            dataimpulse_port=dataimpulse_port,
+        ).proxy_url
+        parsed = urlparse(proxy_url or "")
+        host = parsed.hostname
+        port = parsed.port
+    except (OSError, TypeError, ValueError):
+        return None
+    if not host:
+        return None
+    safe_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"{safe_host}:{port}" if port else safe_host
+
+
+def _restore_proxy_endpoints(
+    original: dict[str, Any],
+    redacted_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Reveal credential-free proxy endpoints only in the local admin status view."""
+    original_accounts = original.get("accounts")
+    safe_accounts = redacted_payload.get("accounts")
+    if not isinstance(original_accounts, list) or not isinstance(safe_accounts, list):
+        return redacted_payload
+    originals_by_id = {
+        str(account.get("account_id") or ""): account
+        for account in original_accounts
+        if isinstance(account, dict)
+    }
+    for account in safe_accounts:
+        if not isinstance(account, dict):
+            continue
+        original_account = originals_by_id.get(str(account.get("account_id") or ""))
+        if not original_account:
+            continue
+        endpoint = original_account.get("proxy_endpoint")
+        if isinstance(endpoint, str) and endpoint:
+            account["proxy_endpoint"] = endpoint
+    return redacted_payload
+
+
 def _with_captcha_phases(
     payload: dict[str, Any], phases: dict[str, str]
 ) -> dict[str, Any]:
@@ -748,11 +1108,32 @@ def _request_account_configuration(settings: Settings, payload: dict[str, Any]) 
             raise ValueError("Cada cuenta debe tener un identificador único y seguro.")
         account_ids.add(account_id)
         item: dict[str, Any] = {"id": account_id}
-        for field in ("username", "password", "proxy_url", "label", "egress_group"):
+        for field in (
+            "username",
+            "password",
+            "proxy_url",
+            "label",
+            "egress_group",
+            "proxy_provider",
+            "proxy_brand",
+        ):
             value = str(raw.get(field) or "")
             if len(value) > 1000 or any(ord(char) < 32 or ord(char) == 127 for char in value):
                 raise ValueError(f"El campo {field} de la cuenta {index} es inválido.")
             item[field] = value
+        raw_dataimpulse_port = raw.get("dataimpulse_port")
+        if raw_dataimpulse_port not in {None, ""}:
+            try:
+                dataimpulse_port = int(raw_dataimpulse_port)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"El puerto DataImpulse de la cuenta {index} es inválido."
+                ) from exc
+            if not 10000 <= dataimpulse_port <= 20000:
+                raise ValueError(
+                    f"El puerto DataImpulse de la cuenta {index} debe estar entre 10000 y 20000."
+                )
+            item["dataimpulse_port"] = dataimpulse_port
         try:
             quota = int(raw.get("daily_quota", 20))
         except (TypeError, ValueError) as exc:
@@ -834,6 +1215,7 @@ def _production_settings_payload(
             "request_delay_seconds": settings.request_delay_seconds,
             "proxy_recheck_seconds": settings.proxy_recheck_seconds,
             "captcha_solver_mode": settings.captcha_solver_mode,
+            "captcha_solver_provider": settings.external_captcha_provider or "browser",
             "two_captcha_daily_limit": settings.two_captcha_daily_limit,
             "browser_headless": settings.headless,
             "expected_egress_country": settings.expected_egress_country,
@@ -927,7 +1309,7 @@ def _save_production_settings(
                 endurance_update,
                 "cooldown_seconds",
                 minimum=60,
-                maximum=86_400,
+                maximum=300,
             ),
             "jobs_per_account_per_day": _bounded_int(
                 endurance_update,
@@ -1271,6 +1653,18 @@ def _dashboard_html() -> str:
     }
     .onboarding-action.visual { border-color: #7c3aed; background: #7c3aed; }
     .onboarding-action.results { border-color: #475569; background: #475569; }
+    .auto-captcha-card {
+      display: flex; align-items: center; justify-content: space-between; gap: 20px;
+      margin-bottom: 16px; padding: 18px 20px; border: 2px solid #7c3aed;
+      border-radius: 14px; background: linear-gradient(135deg, #f5f3ff, #eef2ff);
+      box-shadow: 0 8px 24px rgba(124,58,237,.12);
+    }
+    .auto-captcha-copy strong { display: block; font-size: 18px; font-weight: 950; color: #4c1d95; }
+    .auto-captcha-copy small { display: block; margin-top: 5px; color: #5b6475; line-height: 1.45; }
+    .auto-captcha-control { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; font-weight: 900; }
+    .auto-captcha-control .switch { width: 58px; height: 32px; }
+    .auto-captcha-control .switch span::after { width: 24px; height: 24px; left: 4px; top: 4px; }
+    .auto-captcha-control .switch input:checked + span::after { transform: translateX(26px); }
     .request-type-tabs { display: flex; gap: 7px; margin-top: 12px; }
     .request-type-tab,
     .example-trigger,
@@ -1416,9 +1810,72 @@ def _dashboard_html() -> str:
     .account.quota_reached { border-color: var(--warn); background: var(--warn-soft); }
     .account-top { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
     .account-name { font-weight: 850; }
+    .account-status-stack { display: grid; justify-items: end; gap: 4px; text-align: right; }
+    .account-eligibility { color: var(--muted); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .03em; }
+    .status.browser_authenticated { background: var(--ok-soft); color: var(--ok); }
+    .status.browser_unconfirmed { background: var(--warn-soft); color: var(--warn); }
+    .status.browser_offline { background: var(--bad-soft); color: var(--bad); }
     .account-count { font-size: 28px; font-weight: 900; margin: 8px 0; }
     .mini-bar { height: 10px; border-radius: 999px; overflow: hidden; background: #e8eef5; }
     .mini-bar span { display: block; height: 100%; background: var(--accent); }
+    .account-route {
+      margin-top: 12px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: color-mix(in srgb, var(--panel) 82%, var(--accent-soft));
+    }
+    .account-route-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 9px;
+    }
+    .account-route-title { font-size: 12px; font-weight: 900; }
+    .route-live {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--ok);
+      font-size: 10px;
+      font-weight: 900;
+      text-transform: uppercase;
+      letter-spacing: .03em;
+      white-space: nowrap;
+    }
+    .route-live::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+      box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 18%, transparent);
+    }
+    .route-live.standby { color: var(--muted); }
+    .account-route-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px 12px;
+      margin: 0;
+    }
+    .account-route-grid div { min-width: 0; }
+    .account-route-grid dt {
+      margin: 0 0 2px;
+      color: var(--muted);
+      font-size: 9px;
+      font-weight: 900;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    .account-route-grid dd {
+      margin: 0;
+      color: var(--ink);
+      font-size: 11px;
+      font-weight: 800;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
     .account-action {
       margin-top: 12px;
       border-color: var(--bad);
@@ -1498,15 +1955,53 @@ def _dashboard_html() -> str:
     /* Tables scroll horizontally inside their own container. Keeping their
        headers in normal flow avoids overlays from the page-level header. */
     .jobs-table thead th { position: static; background: var(--panel); }
-    .captcha-attempts-table { min-width: 1120px; table-layout: fixed; }
-    .captcha-attempts-table th:nth-child(1) { width: 13%; }
+    .captcha-attempts-table { min-width: 1220px; table-layout: fixed; }
+    .captcha-attempts-table th:nth-child(1) { width: 12%; }
     .captcha-attempts-table th:nth-child(2) { width: 13%; }
-    .captcha-attempts-table th:nth-child(3) { width: 12%; }
-    .captcha-attempts-table th:nth-child(4) { width: 12%; }
-    .captcha-attempts-table th:nth-child(5),
-    .captcha-attempts-table th:nth-child(6) { width: 8%; }
-    .captcha-attempts-table th:nth-child(7) { width: 13%; }
-    .captcha-attempts-table th:nth-child(8) { width: 21%; }
+    .captcha-attempts-table th:nth-child(3) { width: 14%; }
+    .captcha-attempts-table th:nth-child(4) { width: 11%; }
+    .captcha-attempts-table th:nth-child(5) { width: 10%; }
+    .captcha-attempts-table th:nth-child(6),
+    .captcha-attempts-table th:nth-child(7) { width: 7%; }
+    .captcha-attempts-table th:nth-child(8) { width: 12%; }
+    .captcha-attempts-table th:nth-child(9) { width: 14%; }
+    .captcha-attempts-table td:nth-child(3) { overflow: hidden; }
+    .captcha-action {
+      display: block;
+      width: 100%;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      box-sizing: border-box;
+      padding: 3px 4px;
+      border-radius: 4px;
+      cursor: help;
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    .captcha-action:hover,
+    .captcha-action:focus-visible {
+      color: var(--accent);
+      background: var(--accent-soft);
+      outline: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    }
+    .captcha-provider {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 84px;
+      padding: 5px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 900;
+      letter-spacing: .01em;
+      white-space: nowrap;
+    }
+    .captcha-provider.capsolver { color: #087f5b; background: #e6fcf5; border-color: #96f2d7; }
+    .captcha-provider.two-captcha { color: #5f3dc4; background: #f3f0ff; border-color: #d0bfff; }
+    .captcha-provider.external { color: var(--muted); background: var(--soft); }
     .captcha-attempts-table td:last-child { overflow-wrap: anywhere; }
     .job-id { display: inline-block; max-width: 94px; white-space: nowrap; font-size: 11px; }
     .job-account { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; font-size: 12px; font-weight: 700; }
@@ -1776,6 +2271,9 @@ def _dashboard_html() -> str:
       border-color: #343f72;
       background: linear-gradient(135deg, #111b2d 0%, #171d3a 100%);
     }
+    :root[data-theme="dark"] .auto-captcha-card { border-color: #8b5cf6; background: linear-gradient(135deg, #21183d, #17203b); }
+    :root[data-theme="dark"] .auto-captcha-copy strong { color: #ddd6fe; }
+    :root[data-theme="dark"] .auto-captcha-copy small { color: #aebbd0; }
     :root[data-theme="dark"] .headline {
       background: radial-gradient(circle at 100% 0, #202950 0, transparent 44%), var(--panel);
     }
@@ -1970,7 +2468,7 @@ def _dashboard_html() -> str:
                 <label class="switch"><input id="settingEnduranceEnabled" type="checkbox"><span></span></label>
               </div>
               <div class="field-grid" style="margin-top:14px">
-                <label class="setting-field"><span>Cooldown</span><input id="settingCooldown" type="number" min="60" max="86400" step="60"><small>segundos tras finalizar</small></label>
+                <label class="setting-field"><span>Cooldown</span><input id="settingCooldown" type="number" min="60" max="300" step="60"><small>máximo 5 minutos</small></label>
                 <label class="setting-field"><span>Asignación diaria</span><input id="settingEnduranceQuota" type="number" min="1" max="20" step="1"><small>jobs por cuenta</small></label>
                 <label class="setting-field"><span>Reserva producción</span><input id="settingProductionReserve" type="number" min="0" max="20" step="1"><small>cupos por cuenta</small></label>
                 <label class="setting-field"><span>Cupo base</span><input id="settingDailyQuota" type="number" min="1" max="20" step="1"><small>máximo diario por cuenta</small></label>
@@ -1983,7 +2481,7 @@ def _dashboard_html() -> str:
               <div class="locked-grid">
                 <div class="locked-item"><i data-lucide="rotate-cw" aria-hidden="true"></i><div><strong>Round-robin estricto</strong><small>Producción tiene prioridad.</small></div></div>
                 <div class="locked-item"><i data-lucide="badge-check" aria-hidden="true"></i><div><strong>Una IP por cuenta</strong><small>Egreso chileno verificado.</small></div></div>
-                <div class="locked-item"><i data-lucide="bot-off" aria-hidden="true"></i><div><strong>2Captcha manual</strong><small>Un solve pagado por autorización.</small></div></div>
+                <div class="locked-item"><i data-lucide="bot-off" aria-hidden="true"></i><div><strong>Solver externo manual</strong><small>Un solve pagado por autorización.</small></div></div>
                 <div class="locked-item"><i data-lucide="file-lock-2" aria-hidden="true"></i><div><strong>Transporte browser-only</strong><small>PDFs por el perfil asignado.</small></div></div>
                 <div class="locked-item"><i data-lucide="gauge" aria-hidden="true"></i><div><strong>Sin catch-up</strong><small>No crea ráfagas tras downtime.</small></div></div>
                 <div class="locked-item"><i data-lucide="server" aria-hidden="true"></i><div><strong>Loopback-only</strong><small>Dashboard sólo en este equipo.</small></div></div>
@@ -2033,7 +2531,7 @@ def _dashboard_html() -> str:
       <div class="kpi"><div class="kpi-top"><div class="muted">Restantes hoy</div><span class="kpi-icon ok"><i data-lucide="battery-charging"></i></span></div><div id="remainingToday" class="value">-</div></div>
       <div class="kpi"><div class="kpi-top"><div class="muted">PDFs generados</div><span class="kpi-icon"><i data-lucide="file-text"></i></span></div><div id="downloads" class="value">-</div></div>
       <div class="kpi"><div class="kpi-top"><div class="muted">Captchas pendientes</div><span class="kpi-icon warn"><i data-lucide="shield-question"></i></span></div><div id="captchaPending" class="value">-</div></div>
-      <div class="kpi"><div class="kpi-top"><div class="muted">2Captcha hoy</div><span class="kpi-icon"><i data-lucide="key-round"></i></span></div><div id="paidCaptcha" class="value">-</div></div>
+      <div class="kpi"><div class="kpi-top"><div class="muted">Solves pagados hoy</div><span class="kpi-icon"><i data-lucide="key-round"></i></span></div><div id="paidCaptcha" class="value">-</div></div>
       <div class="kpi"><div class="kpi-top"><div class="muted">Jobs en cola</div><span class="kpi-icon"><i data-lucide="list-todo"></i></span></div><div id="queuedJobs" class="value">-</div></div>
       <div class="kpi"><div class="kpi-top"><div class="muted">Respaldo</div><span class="kpi-icon ok"><i data-lucide="database-backup"></i></span></div><div id="backupState" class="value" style="font-size:18px">-</div></div>
     </div>
@@ -2045,6 +2543,20 @@ def _dashboard_html() -> str:
         <button data-endurance-action="pause" type="button"><i data-lucide="pause"></i> Pausar</button>
         <button class="onboarding-action" data-endurance-action="resume" type="button"><i data-lucide="play"></i> Reanudar</button>
         <button class="instant-action" data-endurance-action="run-once" type="button"><i data-lucide="play-circle"></i> Ejecutar una vez</button>
+      </div>
+    </section>
+
+    <section class="auto-captcha-card" aria-label="Control automático del solver externo">
+      <div class="auto-captcha-copy">
+        <strong>🤖 SOLVER EXTERNO AUTOMÁTICO</strong>
+        <small>Si lo activas, cada cuenta prueba primero el token del navegador y usa un solve pagado únicamente tras un rechazo real de CBRS. Los intentos y costos siguen visibles abajo.</small>
+      </div>
+      <div class="auto-captcha-control">
+        <span id="automaticCaptchaLabel">DESACTIVADO</span>
+        <label class="switch" title="Permitir solves automáticos del proveedor configurado">
+          <input id="automaticCaptchaToggle" type="checkbox" aria-label="Activar solves automáticos del proveedor configurado">
+          <span></span>
+        </label>
       </div>
     </section>
 
@@ -2071,12 +2583,12 @@ def _dashboard_html() -> str:
     </section>
 
     <section class="panel" style="margin-top:16px">
-      <div class="section-title"><span class="section-title-icon"><i data-lucide="key-round"></i></span><h2>Intentos 2Captcha</h2></div>
-      <p class="muted">Distingue si 2Captcha produjo un token y si CBRS realmente lo aceptó. Nunca incluye tokens, claves ni datos del worker.</p>
+      <div class="section-title"><span class="section-title-icon"><i data-lucide="key-round"></i></span><h2>Intentos de solver externo</h2></div>
+      <p class="muted">Registra el proveedor, si realmente creó un token y si CBRS lo aceptó. Nunca incluye tokens, claves, proxies ni datos del worker.</p>
       <div class="table-scroll">
         <table class="jobs-table captcha-attempts-table">
           <thead>
-            <tr><th>Inicio</th><th>Cuenta</th><th>Acción</th><th>2Captcha</th><th>Costo</th><th>Demora</th><th>Resultado CBRS</th><th>Detalle</th></tr>
+            <tr><th>Inicio</th><th>Cuenta</th><th title="Pasa el cursor sobre una acción para ver su nombre completo">Acción</th><th>Servicio CAPTCHA</th><th>Resultado solver</th><th>Costo</th><th>Demora</th><th>Resultado CBRS</th><th>Detalle</th></tr>
           </thead>
           <tbody id="captchaAttempts"></tbody>
         </table>
@@ -2117,6 +2629,25 @@ def _dashboard_html() -> str:
       validating: "validando sesión y reCAPTCHA"
     };
     const label = (value) => statusLabels[value] || value || "-";
+    const providerLabel = (value) => value === "2captcha_dedicated_isp"
+      ? "2Captcha ISP dedicado"
+      : value === "2captcha_residential_sticky"
+        ? "2Captcha residencial · 120 min"
+        : value === "dataimpulse_residential_sticky"
+          ? "DataImpulse residencial sticky"
+        : value === "generic_static" ? "Estático genérico" : value || "-";
+    const providerHealthLabel = (provider) => {
+      if (!provider) return "No aplica";
+      const labels = {
+        healthy: "Activo · tráfico disponible",
+        configured: "Configurado · validación por ruta",
+        inactive: "Cuenta proxy inactiva",
+        depleted: "Sin tráfico disponible",
+        unavailable: "API no disponible",
+        not_configured: "API key no configurada",
+      };
+      return labels[provider.status] || provider.status || "-";
+    };
     const localTime = (value) => value ? new Date(value).toLocaleString() : "-";
     const shortJobId = (value) => {
       const suffix = String(value || "").split("-").at(-1);
@@ -2247,6 +2778,9 @@ def _dashboard_html() -> str:
       document.getElementById("captchaPending").textContent = pool.captcha_pending_accounts ?? 0;
       const captchaSolver = current.captcha_solver || {};
       document.getElementById("paidCaptcha").textContent = `${captchaSolver.attempts ?? 0}/${captchaSolver.daily_limit ?? 0}`;
+      const automaticToggle = document.getElementById("automaticCaptchaToggle");
+      automaticToggle.checked = Boolean(captchaSolver.automatic_enabled);
+      document.getElementById("automaticCaptchaLabel").textContent = automaticToggle.checked ? "ACTIVADO" : "DESACTIVADO";
       const routeCount = pool.egress_routes ?? (current.accounts || []).length;
       const routeMode = pool.shared_egress ? `${routeCount} salida Chile compartida` : `${routeCount} salidas dedicadas`;
       document.getElementById("accountSummary").textContent = `${(current.accounts || []).length} cuentas autorizadas · ${quota} consultas teóricas por día · ${routeMode}`;
@@ -2303,6 +2837,10 @@ def _dashboard_html() -> str:
         ["Cupo diario", `${pool.daily_quota || 60}`],
         ["Disponible", `${pool.available_accounts ?? 0} cuenta(s)`],
         ["Rutas de salida", `${pool.egress_routes ?? "-"}${pool.shared_egress ? " (compartida)" : ""}`],
+        ["Proveedor proxy", current.proxy_provider?.brand || providerLabel(current.proxy_provider?.provider)],
+        ["Salud proveedor", providerHealthLabel(current.proxy_provider)],
+        ["Chrome persistente", `${pool.browser_live_count ?? 0}/${pool.browser_expected_count ?? 0} abiertos`],
+        ["Acceso protegido", `${pool.browser_authenticated_count ?? 0}/${pool.browser_expected_count ?? 0} formularios verificados`],
         ["Siguiente cuenta", pool.next_account_label || "-"],
         ["Próximo ciclo", nextSeconds === null ? "-" : fmtSeconds(nextSeconds)],
         ["Fecha de cupo", pool.quota_date || "-"],
@@ -2317,12 +2855,97 @@ def _dashboard_html() -> str:
         const pct = account.daily_quota ? Math.min(100, (account.used_today / account.daily_quota) * 100) : 0;
         const route = account.egress_shared
           ? `Salida compartida: ${account.egress_group || "Chile"}`
-          : "Salida dedicada";
+          : `Salida aislada · ${account.proxy_brand || providerLabel(account.proxy_provider)}`;
+        const baseline = account.egress_baseline_status
+          ? ` · baseline ${account.egress_baseline_status}`
+          : "";
+        const retrySeconds = secondsUntil(account.resume_at);
+        const retryNote = retrySeconds === null ? "" : ` · reintento en ${fmtSeconds(retrySeconds)}`;
+        const accountAttempts = (current.jobs?.recent || [])
+          .flatMap((job) => job.attempts || [])
+          .filter((attempt) => attempt.account_id === account.account_id)
+          .sort((left, right) => String(right.finished_at || right.started_at || "")
+            .localeCompare(String(left.finished_at || left.started_at || "")));
+        const latestAttempt = accountAttempts[0] || null;
+        const protectedAccess = !latestAttempt
+          ? "Sin intento registrado"
+          : latestAttempt.status === "search_completed" || latestAttempt.status === "completed"
+            ? `ACEPTADO · ${localTime(latestAttempt.finished_at)}`
+            : latestAttempt.reason === "temporary_unavailable"
+              ? `BLOQUEADO · temporary_unavailable · ${localTime(latestAttempt.finished_at)}`
+              : `${label(latestAttempt.status)} · ${label(latestAttempt.reason)} · ${localTime(latestAttempt.finished_at)}`;
         const note = account.paused_reason
-          ? `Motivo: ${account.paused_reason} · ${route}`
-          : `${account.remaining_today} restantes hoy · ${route}`;
+          ? `Motivo: ${account.paused_reason}${retryNote} · ${route}${baseline}`
+          : `${account.remaining_today} restantes hoy · ${route}${baseline}`;
+        const routeIsHealthy = account.proxy_health_status === "passed"
+          && account.egress_baseline_status === "matched";
+        const routeState = routeIsHealthy ? "Ruta validada" : "Ruta sin validar";
+        const routeStateClass = routeIsHealthy ? "" : " standby";
+        const commerceBlocked = account.browser_authenticated
+          && account.paused_reason === "temporary_unavailable";
+        const authMethod = account.browser_status === "authenticated_login_api"
+          ? "Login API aceptado"
+          : account.browser_status === "authenticated_login_form"
+            ? "Formulario aceptado"
+            : account.browser_status === "authenticated_form_visible"
+              ? "Formulario protegido visible"
+              : "Formulario protegido confirmado";
+        const chromeState = account.browser_live ? "ABIERTA" : "CERRADA";
+        const authenticationState = account.browser_authenticated
+          ? `SÍ · ${authMethod}`
+          : account.browser_status === "login_gate_visible"
+            ? "NO · Portal solicita iniciar sesión"
+          : account.browser_live
+            ? "NO CONFIRMADA"
+            : "NO · Chrome cerrada";
+        const chromeStateLabel = commerceBlocked
+          ? "LOGUEADA · BÚSQUEDA BLOQUEADA"
+          : account.browser_authenticated
+          ? `LOGUEADA · ${authMethod.toUpperCase()}`
+          : account.browser_status === "login_gate_visible"
+            ? "NO LOGUEADA · LOGIN REQUERIDO"
+          : account.browser_live
+            ? "LOGIN NO CONFIRMADO"
+            : "NO LOGUEADA";
+        const chromeStateClass = account.browser_authenticated ? "" : " standby";
+        const routeView = `<div class="account-route" aria-label="Ruta proxy configurada de ${escapeHtml(account.username_prefix || account.label || account.account_id)}">
+          <div class="account-route-head">
+            <span class="account-route-title">Ruta proxy</span>
+            <span class="route-live${routeStateClass}">${escapeHtml(routeState)}</span>
+          </div>
+          <dl class="account-route-grid">
+            <div><dt>Marca / servicio</dt><dd>${escapeHtml(account.proxy_brand || providerLabel(account.proxy_provider))}</dd></div>
+            <div><dt>IP / host proxy</dt><dd><code>${escapeHtml(account.proxy_endpoint || "No configurado")}</code></dd></div>
+            <div><dt>País de salida</dt><dd>${escapeHtml(account.egress_country || "No verificado")}</dd></div>
+            <div><dt>Salud / baseline</dt><dd>${escapeHtml(label(account.proxy_health_status))} · ${escapeHtml(account.egress_baseline_status || "-")}</dd></div>
+            <div><dt>Puerto sticky</dt><dd>${escapeHtml(account.proxy_sticky_port ?? "-")}</dd></div>
+            <div><dt>TTL / generación</dt><dd>${account.proxy_sticky_ttl_minutes ? `${escapeHtml(account.proxy_sticky_ttl_minutes)} min` : "-"} · ${escapeHtml(account.proxy_generation ?? 0)}</dd></div>
+            <div><dt>Estado de recuperación</dt><dd>${escapeHtml(label(account.proxy_route_status || "not_initialized"))}</dd></div>
+            <div><dt>Última rotación</dt><dd>${escapeHtml(localTime(account.proxy_last_rotated_at))}</dd></div>
+            <div><dt>Aislamiento</dt><dd>${account.egress_shared ? "Compartida" : "Exclusiva por cuenta"}</dd></div>
+            <div><dt>Último control</dt><dd>${escapeHtml(localTime(account.proxy_checked_at))}</dd></div>
+            <div><dt>Chrome</dt><dd><span class="route-live${account.browser_live ? "" : " standby"}">${escapeHtml(chromeState)}</span></dd></div>
+            <div><dt>Modo Chrome</dt><dd>${escapeHtml(account.browser_mode || "-")}</dd></div>
+            <div><dt>Cuenta autenticada</dt><dd><span class="route-live${chromeStateClass}">${escapeHtml(authenticationState)}</span></dd></div>
+            <div><dt>Evidencia DOM</dt><dd><code>${escapeHtml(account.browser_auth_state || "unknown")}</code></dd></div>
+            <div><dt>Autenticación verificada</dt><dd>${escapeHtml(localTime(account.browser_checked_at))}</dd></div>
+            <div><dt>Última consulta protegida</dt><dd>${escapeHtml(protectedAccess)}</dd></div>
+          </dl>
+        </div>`;
         const phase = account.captcha_phase || "";
         const phaseLabel = captchaPhaseLabels[phase] || "";
+        const browserBadge = commerceBlocked
+          ? { label: "LOGUEADA · BÚSQUEDA BLOQUEADA", css: "browser_unconfirmed" }
+          : account.browser_authenticated
+          ? { label: chromeStateLabel, css: "browser_authenticated" }
+          : account.browser_status === "login_gate_visible"
+            ? { label: "No logueada · Login requerido", css: "browser_offline" }
+          : account.browser_live
+            ? { label: "Login no confirmado", css: "browser_unconfirmed" }
+            : account.worker_active
+              ? { label: "Chrome no iniciado", css: "browser_offline" }
+              : { label: "Chrome detenido", css: "browser_offline" };
+        const eligibilityLabel = phaseLabel || label(account.status);
         const latestPaidAttempt = (current.captcha_attempts || []).find(
           (attempt) => attempt.account_id === account.account_id
         );
@@ -2332,8 +2955,8 @@ def _dashboard_html() -> str:
         );
         const paidSolveButton = current.runtime?.captcha_solver_mode === "2captcha_manual"
           ? paidRetryBlocked
-            ? `<button class="account-action" disabled title="CBRS rechazó el solve anterior; usa recuperación visual.">2Captcha en cooldown</button>`
-            : `<button class="account-action" data-captcha-account="${escapeHtml(account.account_id)}" data-captcha-action="solve-external">Autorizar 1 solve 2Captcha</button>`
+            ? `<button class="account-action" disabled title="CBRS rechazó el solve anterior; usa recuperación visual.">Solver en cooldown</button>`
+            : `<button class="account-action" data-captcha-account="${escapeHtml(account.account_id)}" data-captcha-action="solve-external">Autorizar 1 solve externo</button>`
           : "";
         const action = account.status === "captcha_pending"
           ? `${paidSolveButton}<button class="account-action" data-captcha-account="${escapeHtml(account.account_id)}" data-captcha-action="trigger">Resolver captcha visualmente</button>`
@@ -2348,11 +2971,15 @@ def _dashboard_html() -> str:
         return `<section class="account ${escapeHtml(account.status)}" style="--wave-index:${index % 9}">
           <div class="account-top">
             <div class="account-name">${escapeHtml(account.username_prefix || account.label || account.account_id)}</div>
-            <div class="status ${escapeHtml(account.status)}">${escapeHtml(phaseLabel || label(account.status))}</div>
+            <div class="account-status-stack">
+              <div class="status ${browserBadge.css}">${escapeHtml(browserBadge.label)}</div>
+              <div class="account-eligibility">Cupo: ${escapeHtml(eligibilityLabel)}</div>
+            </div>
           </div>
           <div class="account-count">${account.used_today}/${account.daily_quota}</div>
           <div class="mini-bar"><span style="width:${pct}%"></span></div>
           <div class="muted" style="margin-top:8px">${escapeHtml(note)}</div>
+          ${routeView}
           ${phaseView}
           ${action}
         </section>`;
@@ -2370,9 +2997,9 @@ def _dashboard_html() -> str:
       const result = await response.json().catch(() => ({}));
       if (!response.ok) {
         const errors = {
-          RECENT_PORTAL_REJECTION: "CBRS rechazó el solve anterior. 2Captcha queda temporalmente bloqueado para evitar gasto repetido; usa la recuperación visual.",
+          RECENT_PORTAL_REJECTION: "CBRS rechazó el solve anterior. El proveedor queda temporalmente bloqueado para evitar gasto repetido; usa la recuperación visual.",
           DAILY_LIMIT: "Se alcanzó el límite diario de solves pagados.",
-          CIRCUIT_OPEN: "2Captcha está en cooldown por un fallo temporal.",
+          CIRCUIT_OPEN: "El solver externo está en cooldown por un fallo temporal.",
         };
         setControlFeedback(errors[result.error] || "No se pudo autorizar el solve pagado.", true);
         await refresh();
@@ -2385,8 +3012,37 @@ def _dashboard_html() -> str:
           setControlFeedback("Chrome se está abriendo localmente para la recuperación visual.");
         }
       }
+      if (action === "solve-external") {
+        setControlFeedback(result.status === "captcha_validation_queued"
+          ? "Validación dirigida iniciada: probará primero un token del navegador y solo recurrirá al proveedor externo si CBRS vuelve a rechazarlo. No descargará ningún PDF."
+          : "Se autorizó un solve. El próximo intento usará primero un token del navegador y solo recurrirá al proveedor externo si CBRS vuelve a rechazarlo.");
+      }
       await refresh();
     }
+    document.getElementById("automaticCaptchaToggle").addEventListener("change", async (event) => {
+      const toggle = event.currentTarget;
+      const enabled = Boolean(toggle.checked);
+      toggle.disabled = true;
+      document.getElementById("automaticCaptchaLabel").textContent = enabled ? "ACTIVANDO…" : "DESACTIVANDO…";
+      try {
+        const response = await fetch("/api/captcha/automatic", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.message || result.error || `HTTP ${response.status}`);
+        setControlFeedback(enabled
+          ? "Solver externo automático activado. Los rechazos reales usarán el fallback pagado dentro de sus límites y cooldowns."
+          : "Solver externo automático desactivado. Los solves pagados vuelven a requerir autorización individual.");
+      } catch (error) {
+        toggle.checked = !enabled;
+        setControlFeedback(`No se pudo cambiar el solver automático: ${error.message}`, true);
+      } finally {
+        toggle.disabled = false;
+        await refresh();
+      }
+    });
     function maybeNotifyCaptcha(alert) {
       if (!("Notification" in window)) return;
       if (alert.reason !== "captcha_rejected") return;
@@ -2565,22 +3221,42 @@ def _dashboard_html() -> str:
         account.account_id,
         account.username_prefix || account.label || account.account_id,
       ]));
-      const solverLabels = { reserved: "en espera", succeeded: "token resuelto", failed: "falló" };
-      const portalLabels = { accepted: "aceptado", rejected: "rechazado", indeterminate: "sin decisión", not_submitted: "no enviado" };
+      const solverLabels = {
+        reserved: "en espera",
+        succeeded: "token resuelto",
+        failed: "falló",
+        armed: "autorizado",
+        consumed: "autorización usada",
+        not_required: "no fue necesario",
+        cancelled: "cancelado",
+        expired: "expiró",
+        replaced: "reemplazado",
+      };
+      const portalLabels = { accepted: "aceptado", rejected: "rechazado", indeterminate: "sin decisión", not_submitted: "no enviado", not_required: "no requerido" };
+      const captchaProvider = (value) => {
+        const normalized = String(value || "external").trim().toLowerCase();
+        if (normalized.includes("capsolver")) return { label: "CapSolver", css: "capsolver" };
+        if (normalized.includes("2captcha")) return { label: "2Captcha", css: "two-captcha" };
+        return { label: normalized === "external" ? "Sin proveedor" : value, css: "external" };
+      };
       if (!attempts.length) {
-        body.innerHTML = '<tr><td colspan="8" class="muted">Aún no hay intentos pagados de 2Captcha.</td></tr>';
+        body.innerHTML = '<tr><td colspan="9" class="muted">Aún no hay intentos pagados del solver externo.</td></tr>';
         return;
       }
-      body.innerHTML = attempts.map((attempt) => `<tr>
+      body.innerHTML = attempts.map((attempt) => {
+        const provider = captchaProvider(attempt.provider);
+        return `<tr>
         <td>${localTime(attempt.started_at)}</td>
         <td>${escapeHtml(accountLabels.get(attempt.account_id) || attempt.account_id || "-")}</td>
-        <td>${escapeHtml(attempt.action || "-")}</td>
+        <td><code class="captcha-action" tabindex="0" title="${escapeHtml(attempt.action || "-")}" aria-label="Acción completa: ${escapeHtml(attempt.action || "-")}">${escapeHtml(attempt.action || "-")}</code></td>
+        <td><span class="captcha-provider ${provider.css}" title="Servicio usado para generar este intento">${escapeHtml(provider.label)}</span></td>
         <td><span class="status ${escapeHtml(attempt.status || "")}">${escapeHtml(solverLabels[attempt.status] || attempt.status || "-")}</span></td>
         <td>${attempt.cost_usd == null ? "-" : `$${Number(attempt.cost_usd).toFixed(5)}`}</td>
         <td>${attempt.latency_seconds == null ? "-" : `${Number(attempt.latency_seconds).toFixed(1)} s`}</td>
         <td><span class="status ${attempt.portal_status === "accepted" ? "completed" : attempt.portal_status === "rejected" ? "failed" : ""}">${escapeHtml(portalLabels[attempt.portal_status] || "pendiente de confirmación")}</span></td>
         <td><code>${escapeHtml(attempt.portal_error_code || attempt.error_code || "sin error")}</code>${attempt.paid_retry_blocked_until ? `<br><small class="muted">Nuevo solve bloqueado hasta ${escapeHtml(localTime(attempt.paid_retry_blocked_until))}</small>` : ""}</td>
-      </tr>`).join("");
+      </tr>`;
+      }).join("");
     }
     document.getElementById("stopButton").addEventListener("click", async () => {
       const button = document.getElementById("stopButton");
@@ -2619,6 +3295,14 @@ def _dashboard_html() -> str:
           <label>Correo de acceso<input data-field="username" type="email" autocomplete="username" placeholder="${existing ? "Se conserva si está vacío" : "nombre@empresa.cl"}" /></label>
           <label>Contraseña<div class="password-input"><input data-field="password" type="password" autocomplete="new-password" placeholder="${existing ? "Se conserva si está vacía" : "Contraseña"}" /><button class="password-toggle" type="button">Ver</button></div></label>
           <label>Proxy dedicado<input data-field="proxy_url" type="text" autocomplete="off" placeholder="${existing ? "Se conserva si está vacío" : "http://usuario:clave@host:puerto"}" /></label>
+          <label>Proveedor<select data-field="proxy_provider">
+            <option value="generic_static" ${(account.proxy_provider || "generic_static") === "generic_static" ? "selected" : ""}>Estático genérico</option>
+            <option value="2captcha_dedicated_isp" ${account.proxy_provider === "2captcha_dedicated_isp" ? "selected" : ""}>2Captcha ISP dedicado</option>
+            <option value="2captcha_residential_sticky" ${account.proxy_provider === "2captcha_residential_sticky" ? "selected" : ""}>2Captcha residencial · 120 min</option>
+            <option value="dataimpulse_residential_sticky" ${account.proxy_provider === "dataimpulse_residential_sticky" ? "selected" : ""}>DataImpulse residencial sticky</option>
+          </select></label>
+          <label>Puerto sticky DataImpulse<input data-field="dataimpulse_port" type="number" min="10000" max="20000" value="${escapeHtml(account.proxy_sticky_port || account.dataimpulse_port || "")}" placeholder="10000" /></label>
+          <label>Marca del proxy<input data-field="proxy_brand" type="text" maxlength="80" value="${escapeHtml(account.proxy_brand || "")}" placeholder="Ej.: Proxy-Cheap" /></label>
           <label>Cupo diario<input data-field="daily_quota" type="number" min="1" max="10000" value="${escapeHtml(quota)}" /></label>
         </div>
       </section>`;
@@ -2669,11 +3353,20 @@ def _dashboard_html() -> str:
           username: field("username"),
           password: field("password"),
           proxy_url: field("proxy_url"),
+          proxy_provider: field("proxy_provider"),
+          dataimpulse_port: field("dataimpulse_port") ? Number(field("dataimpulse_port")) : null,
+          proxy_brand: field("proxy_brand"),
           daily_quota: Number(field("daily_quota")),
           existing: row.dataset.existing === "true",
         };
       });
-      const incompleteNewAccount = accounts.some((account) => !account.existing && (!account.username || !account.password || !account.proxy_url));
+      const incompleteNewAccount = accounts.some((account) => !account.existing && (
+        !account.username || !account.password || (
+          account.proxy_provider === "dataimpulse_residential_sticky"
+            ? !account.dataimpulse_port
+            : !account.proxy_url
+        )
+      ));
       if (incompleteNewAccount) {
         setConfigFeedback("Las cuentas nuevas requieren correo, contraseña y proxy dedicado.", true);
         return;
@@ -2724,14 +3417,14 @@ def _dashboard_html() -> str:
       document.getElementById("settingWorkerPoll").value = pool.worker_poll_seconds ?? 5;
       document.getElementById("settingInstantJobs").checked = Boolean(pool.instant_jobs_enabled);
       document.getElementById("settingEnduranceEnabled").checked = Boolean(endurance.enabled);
-      document.getElementById("settingCooldown").value = endurance.cooldown_seconds ?? 600;
-      document.getElementById("settingEnduranceQuota").value = endurance.jobs_per_account_per_day ?? 15;
-      document.getElementById("settingProductionReserve").value = endurance.production_reserve_per_account ?? 5;
+      document.getElementById("settingCooldown").value = endurance.cooldown_seconds ?? 300;
+      document.getElementById("settingEnduranceQuota").value = endurance.jobs_per_account_per_day ?? 20;
+      document.getElementById("settingProductionReserve").value = endurance.production_reserve_per_account ?? 0;
       document.getElementById("settingDailyQuota").value = pool.daily_quota_per_account ?? 20;
       document.getElementById("runtimeSettingsSummary").textContent =
         `Demora segura por petición: ${runtime.request_delay_seconds ?? "-"}s · ` +
         `revalidación proxy: ${runtime.proxy_recheck_seconds ?? "-"}s · ` +
-        `2Captcha: ${runtime.captcha_solver_mode || "-"}, límite ${runtime.two_captcha_daily_limit ?? "-"}/día · ` +
+        `Solver: ${runtime.captcha_solver_provider || "-"} (${runtime.captcha_solver_mode || "-"}), límite ${runtime.two_captcha_daily_limit ?? "-"}/día · ` +
         `egreso esperado: ${runtime.expected_egress_country || "-"}.`;
       setJitterFieldsEnabled();
     }

@@ -1,8 +1,10 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from cbrs.config import load_settings
-from cbrs.preflight import baseline_file, run_preflight
+from cbrs.preflight import baseline_file, replace_egress_baseline, run_preflight
 
 
 def test_preflight_requires_explicit_baseline_approval(tmp_path: Path) -> None:
@@ -137,6 +139,66 @@ def test_preflight_fails_when_egress_hash_changes(tmp_path: Path) -> None:
     assert "fixed egress hash differs" in " ".join(result.report["errors"])
 
 
+def test_preflight_can_validate_a_pending_baseline_replacement(tmp_path: Path) -> None:
+    settings = _settings_with_browser(tmp_path)
+    run_preflight(
+        settings,
+        fetch_egress=lambda: {"ip": "1.2.3.4", "country": "CL"},
+        approve_baseline=True,
+        write_report=False,
+    )
+
+    result = run_preflight(
+        settings,
+        fetch_egress=lambda: {"ip": "5.6.7.8", "country": "CL"},
+        allow_baseline_replacement=True,
+        write_report=False,
+    )
+
+    assert result.ok is True
+    assert result.report["checks"][-1]["detail"] == "replacement_pending"
+
+
+def test_replace_egress_baseline_archives_sanitized_prior_value(tmp_path: Path) -> None:
+    settings = _settings_with_browser(tmp_path)
+    first = run_preflight(
+        settings,
+        fetch_egress=lambda: {"ip": "1.2.3.4", "country": "CL"},
+        approve_baseline=True,
+        write_report=False,
+    )
+    second = run_preflight(
+        settings,
+        fetch_egress=lambda: {"ip": "5.6.7.8", "country": "CL"},
+        allow_baseline_replacement=True,
+        write_report=False,
+    )
+
+    archive = replace_egress_baseline(
+        settings,
+        egress_hash=second.report["egress_hash"],
+        egress_country="CL",
+    )
+
+    current = json.loads(baseline_file(settings).read_text(encoding="utf-8"))
+    previous = json.loads(archive.read_text(encoding="utf-8"))
+    assert current["egress_hash"] == second.report["egress_hash"]
+    assert previous["egress_hash"] == first.report["egress_hash"]
+    assert archive.name.endswith(".bak.json")
+    serialized = baseline_file(settings).read_text(encoding="utf-8") + archive.read_text(
+        encoding="utf-8"
+    )
+    assert "1.2.3.4" not in serialized
+    assert "5.6.7.8" not in serialized
+
+
+def test_replace_egress_baseline_requires_existing_valid_baseline(tmp_path: Path) -> None:
+    settings = _settings_with_browser(tmp_path)
+
+    with pytest.raises(ValueError, match="existing egress baseline"):
+        replace_egress_baseline(settings, egress_hash="hash", egress_country="CL")
+
+
 def test_preflight_fails_when_country_is_not_expected(tmp_path: Path) -> None:
     settings = _settings_with_browser(tmp_path)
 
@@ -180,7 +242,8 @@ def test_preflight_fails_when_browser_proxy_has_wrong_mode(tmp_path: Path) -> No
 
     assert result.ok is False
     assert (
-        "browser proxy route: CBRS_PROXY_URL requires CBRS_EGRESS_MODE=dedicated_static_isp"
+        "browser proxy route: CBRS_PROXY_URL requires CBRS_EGRESS_MODE="
+        "dedicated_static_isp or residential_sticky"
         in result.report["errors"]
     )
 
@@ -191,6 +254,25 @@ def test_preflight_allows_browser_proxy_for_dedicated_static_isp(tmp_path: Path)
         {
             "CBRS_EGRESS_MODE": "dedicated_static_isp",
             "CBRS_PROXY_URL": "http://user:pass@example.test:33335",
+        },
+    )
+
+    result = run_preflight(
+        settings,
+        fetch_egress=lambda: {"ip": "1.2.3.4", "country": "CL"},
+        approve_baseline=True,
+        write_report=False,
+    )
+
+    assert result.ok is True
+
+
+def test_preflight_allows_browser_proxy_for_residential_sticky(tmp_path: Path) -> None:
+    settings = _settings_with_browser(
+        tmp_path,
+        {
+            "CBRS_EGRESS_MODE": "residential_sticky",
+            "CBRS_PROXY_URL": "http://user:pass@example.test:10000",
         },
     )
 

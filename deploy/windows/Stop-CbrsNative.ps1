@@ -10,8 +10,15 @@ $runner = Join-Path $RepoRoot 'deploy\run_with_env.py'
 & $python $runner $EnvFile -- $python -m cbrs jobs endurance pause
 & $python $runner $EnvFile -- $python -m cbrs pool stop
 Start-Sleep -Seconds 2
-foreach ($name in @('CBRS Worker', 'CBRS Dashboard')) {
+foreach ($name in @(
+    'CBRS Worker',
+    'CBRS Dashboard',
+    'CBRS User Worker',
+    'CBRS User Dashboard',
+    'CBRS Runtime Watchdog',
+    'CBRS User Runtime Watchdog'
+)) {
     Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-    Disable-ScheduledTask -TaskName $name | Out-Null
+    Disable-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue | Out-Null
 }
 Write-Host 'Worker and dashboard stopped; queue, completed PDFs, and endurance state were preserved.'

@@ -6,6 +6,15 @@ param(
 
 $python = Join-Path $RepoRoot '.venv\Scripts\python.exe'
 $runner = Join-Path $RepoRoot 'deploy\run_with_env.py'
-Get-ScheduledTask -TaskName 'CBRS Worker','CBRS Dashboard','CBRS Daily Backup' |
+Get-ScheduledTask -TaskName @(
+    'CBRS Worker',
+    'CBRS Dashboard',
+    'CBRS Daily Backup',
+    'CBRS Runtime Watchdog',
+    'CBRS User Worker',
+    'CBRS User Dashboard',
+    'CBRS User Daily Backup',
+    'CBRS User Runtime Watchdog'
+) -ErrorAction SilentlyContinue |
     Select-Object TaskName, State
 & $python $runner $EnvFile -- $python -m cbrs jobs status

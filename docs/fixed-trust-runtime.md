@@ -30,13 +30,19 @@ connectivity experiments, never for production validation.
   fallback before operator recovery.
 - Pacing: fixed `5.0s` minimum-safe delay by default.
 - Reports: sanitized JSON under `.cbrs/logs/`.
-- Stops: one auth recovery attempt; no proxy fallback. CAPTCHA removes only the
-  affected account, while rate-limit/WAF signals stop the complete worker.
+- Stops: daily quota waits until the next quota day. Other safety states have a
+  bounded `resume_at`; rate-limit/WAF pause all traffic for their cooldown and
+  are never bypassed.
 
 ## Dedicated Static ISP Proxy
 
 Use a static ISP proxy only when the provider gives one stable Chilean endpoint
 for the account/profile. Configure it through `.env`, never in committed files:
+
+The finite provider validation uses three 2Captcha Chile residential sticky
+sessions capped at 120 minutes; see
+[`2captcha-proxy-options.md`](2captcha-proxy-options.md). They are not a
+permanent production fallback.
 
 ```dotenv
 CBRS_EGRESS_MODE=dedicated_static_isp
@@ -62,9 +68,10 @@ production access path:
 We need to operate a low-volume, single-operator automation against the CBRS
 commerce portal from a stable Chilean office/client network or client VPN.
 
-The automation does not bypass login or rotate IPs, and stops immediately on
-rate-limit or WAF signals. Optional external CAPTCHA fallback requires separate
-approval and makes one attempt before stopping. It schedules
+The automation does not bypass login. Residential-session renewal is accepted
+only after country, portal, reCAPTCHA, provider and uniqueness gates. It pauses
+immediately on rate-limit or WAF signals. Optional external CAPTCHA fallback is
+operator-controlled. It schedules
 only separately authorized named accounts, each with its own fixed Chrome
 profile and egress, using automatic normal login and fixed sequential pacing.
 

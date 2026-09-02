@@ -255,11 +255,52 @@ try {
 }
 
 $taskScript = Join-Path $RepoRoot 'deploy\windows\Invoke-CbrsNativeTask.ps1'
+$watchdogScript = Join-Path $RepoRoot 'deploy\windows\Invoke-CbrsRuntimeWatchdog.ps1'
 $taskUser = $identity.Name
 $principalTask = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited
-$taskSettings = New-ScheduledTaskSettingsSet -RestartCount 20 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -MultipleInstances IgnoreNew
+$persistentTaskSettings = New-ScheduledTaskSettingsSet `
+    -RestartCount 999 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -StartWhenAvailable `
+    -MultipleInstances IgnoreNew `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries
+$backupTaskSettings = New-ScheduledTaskSettingsSet `
+    -RestartCount 20 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -StartWhenAvailable `
+    -MultipleInstances IgnoreNew `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries
+
+function New-CbrsHiddenTaskAction {
+    param(
+        [Parameter(Mandatory = $true)][string]$ScriptPath,
+        [Parameter(Mandatory = $true)][string]$ScriptArguments,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory
+    )
+
+    $powershellArguments = "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" $ScriptArguments"
+    $silentRun = Join-Path $env:LOCALAPPDATA 'Programs\NativeTaskLauncher\SilentRun.exe'
+    if (Test-Path -LiteralPath $silentRun) {
+        return New-ScheduledTaskAction `
+            -Execute $silentRun `
+            -Argument "--wait powershell.exe $powershellArguments" `
+            -WorkingDirectory $WorkingDirectory
+    }
+    return New-ScheduledTaskAction `
+        -Execute 'powershell.exe' `
+        -Argument $powershellArguments `
+        -WorkingDirectory $WorkingDirectory
+}
+
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
 $dailyTrigger = New-ScheduledTaskTrigger -Daily -At '02:00'
+$watchdogTrigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) `
+    -RepetitionInterval (New-TimeSpan -Minutes 1) `
+    -RepetitionDuration (New-TimeSpan -Days 3650)
 foreach ($task in @(
     @{ Name = 'CBRS Worker'; Role = 'worker'; Trigger = $logonTrigger },
     @{ Name = 'CBRS Dashboard'; Role = 'dashboard'; Trigger = $logonTrigger },
@@ -267,14 +308,25 @@ foreach ($task in @(
 )) {
     $existingTask = Get-ScheduledTask -TaskName $task.Name -ErrorAction SilentlyContinue
     $preserveEnabled = $existingTask -and $existingTask.State -ne 'Disabled'
-    $taskArguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$taskScript`" -Role $($task.Role) -RepoRoot `"$RepoRoot`" -EnvFile `"$EnvFile`""
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $taskArguments -WorkingDirectory $RepoRoot
-    Register-ScheduledTask -TaskName $task.Name -Action $action -Trigger $task.Trigger -Principal $principalTask -Settings $taskSettings -Force | Out-Null
+    $taskArguments = "-Role $($task.Role) -RepoRoot `"$RepoRoot`" -EnvFile `"$EnvFile`""
+    $action = New-CbrsHiddenTaskAction -ScriptPath $taskScript -ScriptArguments $taskArguments -WorkingDirectory $RepoRoot
+    $settings = if ($task.Role -eq 'backup') { $backupTaskSettings } else { $persistentTaskSettings }
+    Register-ScheduledTask -TaskName $task.Name -Action $action -Trigger $task.Trigger -Principal $principalTask -Settings $settings -Force | Out-Null
     if ($preserveEnabled) {
         Enable-ScheduledTask -TaskName $task.Name | Out-Null
     } else {
         Disable-ScheduledTask -TaskName $task.Name | Out-Null
     }
+}
+$existingWatchdog = Get-ScheduledTask -TaskName 'CBRS Runtime Watchdog' -ErrorAction SilentlyContinue
+$preserveWatchdogEnabled = $existingWatchdog -and $existingWatchdog.State -ne 'Disabled'
+$watchdogArguments = '-TaskScope System'
+$watchdogAction = New-CbrsHiddenTaskAction -ScriptPath $watchdogScript -ScriptArguments $watchdogArguments -WorkingDirectory $RepoRoot
+Register-ScheduledTask -TaskName 'CBRS Runtime Watchdog' -Action $watchdogAction -Trigger $watchdogTrigger -Principal $principalTask -Settings $backupTaskSettings -Force | Out-Null
+if ($preserveWatchdogEnabled) {
+    Enable-ScheduledTask -TaskName 'CBRS Runtime Watchdog' | Out-Null
+} else {
+    Disable-ScheduledTask -TaskName 'CBRS Runtime Watchdog' | Out-Null
 }
 
 $installStatus = [ordered]@{
@@ -286,7 +338,7 @@ $installStatus = [ordered]@{
     runtime_requirements_installed = $true
     development_requirements_installed = [bool]$InstallDevelopmentRequirements
     restic_repository_initialized = $true
-    scheduled_tasks_registered = 3
+    scheduled_tasks_registered = 4
     scheduled_tasks_started = $false
     live_traffic_started = $false
 }

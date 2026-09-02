@@ -38,6 +38,34 @@ La instalación no aprueba egresos ni inicia el worker sin confirmaciones
 separadas. El arranque requiere explícitamente
 `-AcknowledgeAuthorizedLiveTraffic`.
 
+### Recuperación de sesiones persistentes
+
+La guía cliente para recuperar las tres cuentas sin cruzar identidad, perfil ni
+proxy está en
+[`docs/persistent-account-session-recovery.md`](docs/persistent-account-session-recovery.md).
+Incluye el diagnóstico verificado del 31-08-2026, la relación uno a uno entre
+cuenta/perfil/ruta, el refresh acotado de cookies, los campos de estado en tiempo
+real y las limitaciones del keeper usado para validar la recuperación sin tocar
+la cola. **Disponible** expresa elegibilidad; solo **Sesión saludable** confirma
+que existe un Chrome vivo y autenticado bajo el lease vigente.
+
+### DataImpulse: egreso recomendado
+
+El runtime de producción usa **DataImpulse Residential Proxy** como proveedor
+de egreso: tres rutas sticky de Chile, un puerto distinto por cuenta y una
+duración de sesión de 120 minutos. Las URLs autenticadas se construyen solo en
+memoria desde `DATAIMPULSE_PROXY_LOGIN` y `DATAIMPULSE_PROXY_PASSWORD`; nunca se
+guardan en el pool ni se muestran en el dashboard. `DATAIMPULSE_EMAIL` y
+`DATAIMPULSE_PASSWORD`, si se configuran, son credenciales administrativas del
+panel y no credenciales proxy ni una API de rotación.
+
+La rotación normal se controla mediante los puertos sticky documentados por el
+proveedor. Ante una falla confirmada se prueba otro puerto, se exige egreso
+chileno, acceso a CBRS/reCAPTCHA y unicidad, y solo entonces se promueve la ruta
+para esa cuenta. 2Captcha y CapSolver permanecen como solvers CAPTCHA; no son el
+proxy principal. El procedimiento completo está en
+[`docs/dataimpulse-cbrs-operations.md`](docs/dataimpulse-cbrs-operations.md).
+
 Esta plataforma facilita consultas documentales autorizadas en el portal CBRS y
 convierte las imágenes obtenidas en archivos PDF ordenados para revisión local.
 La operación combina sesiones de navegador persistentes, validaciones previas,
@@ -294,12 +322,13 @@ ejecutar esta ruta mediante WSL, Docker, Xvfb o una máquina virtual. Los assets
 Ubuntu/WSL permanecen en el repositorio solo como material legacy y no forman
 parte del runbook activo.
 
-### Operación sin ventana
+### Operación headless persistente
 
-El worker programado ejecuta Chrome en modo headless. Para recuperación manual,
-primero se pausa endurance y se detiene el worker; solo entonces se abre headed
-el perfil de la cuenta afectada. El worker y la recuperación nunca comparten un
-perfil simultáneamente.
+El worker programado ejecuta tres Chrome reales en modo headless
+(`CBRS_HEADLESS=1`). Los conserva durante periodos idle, cooldowns y fallas
+funcionales del portal mientras las tareas del runtime continúen activas. Para
+recuperación visual manual, primero se pausa endurance y se detiene el worker.
+El worker y la recuperación nunca comparten un perfil simultáneamente.
 
 ## Inicio rápido
 
@@ -317,12 +346,17 @@ El procedimiento completo y el gate de aceptación están en
 
 ### 2. Configurar el egreso autorizado
 
-Crea un archivo `.env` local. Para producción utiliza una red del cliente o un
-egreso dedicado:
+Parte desde `.env.example`; el ejemplo solo contiene placeholders. Para
+producción, los secretos viven en `C:\ProgramData\CBRS\cbrs.env`:
 
 ```dotenv
-CBRS_EGRESS_MODE=client_office
+CBRS_EGRESS_MODE=residential_sticky
 CBRS_EXPECTED_EGRESS_COUNTRY=CL
+CBRS_HEADLESS=1
+CBRS_WINDOW_MODE=normal
+DATAIMPULSE_PROXY_HOST=gw.dataimpulse.com
+DATAIMPULSE_COUNTRY=cl
+DATAIMPULSE_STICKY_TTL_MINUTES=120
 CBRS_REQUEST_DELAY_SECONDS=5.0
 CBRS_PROFILE_DIR=.cbrs/chrome-profile
 CBRS_OUTPUT_DIR=outputs
@@ -481,16 +515,25 @@ de observación están en
 ```bash
 python -m cbrs pool proxy-health
 python -m cbrs pool proxy-health --account ejecutivo_1
+python -m cbrs pool proxy-health --account ejecutivo_1 --replace-egress-baseline
 ```
 
 Este gate verifica país `CL`, carga de Google reCAPTCHA Enterprise y respuesta
 inicial del portal CBRS. Si falla, `pool init`, `pool login-debug` y los ciclos
 reales no deben abrir el flujo del portal.
 
+El reemplazo de baseline sólo se acepta con endurance pausado y sin lease del
+worker. Exige egreso chileno, CBRS y reCAPTCHA accesibles, y una salida distinta
+de las otras cuentas; archiva el baseline anterior saneado antes del cambio
+atómico.
+
 La integración opcional de 2Captcha y el procedimiento de prueba larga están en
 [`docs/2captcha-long-run.md`](docs/2captcha-long-run.md). El proxy del navegador
 y el solver v3 son rutas separadas: 2Captcha documenta reCAPTCHA Enterprise v3
 únicamente como tarea `proxyless`.
+La decisión de usar tres sesiones residenciales sticky de Chile con duración de
+120 minutos para la validación finita está documentada en
+[`docs/2captcha-proxy-options.md`](docs/2captcha-proxy-options.md).
 
 ### Diagnosticar perfiles separados manualmente
 
@@ -535,29 +578,28 @@ contener los proxies reales:
       "label": "Ejecutivo 1",
       "username_env": "CBRS_ACCOUNT_1_USERNAME",
       "password_env": "CBRS_ACCOUNT_1_PASSWORD",
-      "proxy_url_env": "CBRS_ACCOUNT_1_PROXY_URL",
-      "egress_group": "chile_compartida_1",
-      "profile_dir": "/var/lib/cbrs/accounts/ejecutivo_1/chrome-profile",
+      "proxy_provider": "dataimpulse_residential_sticky",
+      "proxy_brand": "DataImpulse",
+      "dataimpulse_port": 10000,
+      "profile_dir": "G:\\CBRS\\accounts\\ejecutivo_1\\chrome-profile",
       "daily_quota": 20
     }
   ]
 }
 ```
 
-La URL real se define fuera de Git:
+Las credenciales comunes del proxy se definen fuera de Git:
 
-```bash
-export CBRS_ACCOUNT_1_PROXY_URL="http://usuario:password@host:puerto"
+```dotenv
+DATAIMPULSE_PROXY_LOGIN=REPLACE_ME
+DATAIMPULSE_PROXY_PASSWORD=REPLACE_ME
 ```
 
-Por defecto, el pool exige una URL proxy distinta por cuenta. Cuando varias
-cuentas autorizadas deben compartir deliberadamente una misma salida chilena,
-cada una conserva su propia referencia `proxy_url_env` y declara el mismo
-`egress_group`. El valor compartido nunca se infiere silenciosamente: sin ese
-grupo explícito la configuración se rechaza. El dashboard muestra la cantidad
-de rutas de salida y marca cada cuenta como **salida compartida**, mientras los
-perfiles, sesiones y cupos siguen siendo independientes. Compartir una salida
-no modifica el límite de 20 consultas por cuenta ni permite tráfico paralelo.
+Cada cuenta DataImpulse declara un puerto sticky distinto (`10000`, `10001`,
+`10002` inicialmente). El runtime agrega `cr.cl;sessttl.120`, codifica la URL en
+memoria y rechaza configuraciones ambiguas que también incluyan
+`proxy_url_env`. Los proveedores genéricos heredados siguen aceptando una URL
+por cuenta para compatibilidad.
 
 En modo `2captcha_manual`, un rechazo del token del navegador deja la cuenta como
 `captcha pendiente` sin contactar a 2Captcha. El operador puede pulsar
@@ -644,4 +686,6 @@ reinicio durante descarga, 24 horas y luego siete días de endurance.
 - [Plan de validación](docs/validation-plan.md)
 - [Prerrequisitos Windows nativo](docs/native-windows-prerequisites.md)
 - [Endurance E2E nativo](docs/native-windows-endurance.md)
+- [Recuperación E2E de sesiones persistentes](docs/persistent-account-session-recovery.md)
+- [Operación CBRS con DataImpulse](docs/dataimpulse-cbrs-operations.md)
 - [Preparación Ubuntu legacy](docs/e2e-production-readiness.md)

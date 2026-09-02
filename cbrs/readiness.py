@@ -180,8 +180,10 @@ def build_readiness_report(
             setting_problems.append("headed mode is required for the live soak")
         if settings.expected_egress_country != "CL":
             setting_problems.append("expected egress country must be CL")
-        if settings.egress_mode != "dedicated_static_isp":
-            setting_problems.append("egress mode must be dedicated_static_isp")
+        if settings.egress_mode not in {"dedicated_static_isp", "residential_sticky"}:
+            setting_problems.append(
+                "egress mode must be dedicated_static_isp or residential_sticky"
+            )
         if settings.request_delay_seconds < MIN_SAFE_DELAY_SECONDS:
             setting_problems.append("request delay is below the safety minimum")
         add(
@@ -776,6 +778,7 @@ def _build_windows_readiness_report(
     from urllib.parse import urlparse
 
     from .browser_runtime import get_browser_status
+    from .capsolver import CapSolverClient, CapSolverError
     from .captcha_solver import TwoCaptchaClient, TwoCaptchaError
 
     checks: list[ReadinessCheck] = []
@@ -787,11 +790,18 @@ def _build_windows_readiness_report(
     settings_environment = dict(environment)
     configured_solver_mode = environment.get("CBRS_CAPTCHA_SOLVER_MODE", "browser")
     configured_solver_key = environment.get("CBRS_2CAPTCHA_API_KEY", "").strip()
+    configured_capsolver_key = environment.get("CBRS_CAPSOLVER_API_KEY", "").strip()
     if configured_solver_mode in {
         "2captcha",
         "2captcha_manual",
         "2captcha_fallback",
     } and not configured_solver_key:
+        settings_environment["CBRS_CAPTCHA_SOLVER_MODE"] = "browser"
+    if configured_solver_mode in {
+        "capsolver",
+        "capsolver_manual",
+        "capsolver_fallback",
+    } and not configured_capsolver_key:
         settings_environment["CBRS_CAPTCHA_SOLVER_MODE"] = "browser"
     settings = load_settings(settings_environment, root=repo_root)
     native_assets = (
@@ -800,6 +810,7 @@ def _build_windows_readiness_report(
         "deploy/windows/Stop-CbrsNative.ps1",
         "deploy/windows/Get-CbrsNativeStatus.ps1",
         "deploy/windows/Invoke-CbrsNativeTask.ps1",
+        "deploy/windows/Invoke-CbrsRuntimeWatchdog.ps1",
         "deploy/windows/Open-CbrsNativeRecovery.ps1",
         "deploy/cbrs-native.env.example",
         "deploy/account-pool.native.json.example",
@@ -838,10 +849,12 @@ def _build_windows_readiness_report(
     )
     add(
         "captcha_manual_only",
-        "pass" if configured_solver_mode == "2captcha_manual" else "fail",
-        "2Captcha requires a manual one-shot authorization"
-        if configured_solver_mode == "2captcha_manual"
-        else "set CBRS_CAPTCHA_SOLVER_MODE=2captcha_manual; automatic modes are forbidden",
+        "pass"
+        if configured_solver_mode in {"2captcha_manual", "capsolver_manual"}
+        else "fail",
+        "the external solver requires a manual one-shot authorization"
+        if configured_solver_mode in {"2captcha_manual", "capsolver_manual"}
+        else "set CBRS_CAPTCHA_SOLVER_MODE to a supported manual mode",
     )
     state_root = settings.profile_dir.parent
     output_drive = settings.output_dir.drive.upper()
@@ -866,43 +879,86 @@ def _build_windows_readiness_report(
         "pass" if restic_ok else "fail",
         "native restic is available" if restic_ok else "native restic is unavailable",
     )
-    task_names = ("CBRS Worker", "CBRS Dashboard", "CBRS Daily Backup")
-    task_results = [
-        subprocess.run(
-            ["schtasks.exe", "/Query", "/TN", name],
-            capture_output=True,
-            text=True,
-            check=False,
-        ).returncode
-        for name in task_names
-    ] if system_name == "Windows" else [1, 1, 1]
+    base_task_name_sets = (
+        ("CBRS Worker", "CBRS Dashboard", "CBRS Daily Backup"),
+        ("CBRS User Worker", "CBRS User Dashboard", "CBRS User Daily Backup"),
+    )
+    task_name_sets = (
+        ("CBRS Worker", "CBRS Dashboard", "CBRS Daily Backup", "CBRS Runtime Watchdog"),
+        (
+            "CBRS User Worker",
+            "CBRS User Dashboard",
+            "CBRS User Daily Backup",
+            "CBRS User Runtime Watchdog",
+        ),
+    )
+    task_results_by_set = {
+        names: [
+            subprocess.run(
+                ["schtasks.exe", "/Query", "/TN", name],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).returncode
+            for name in names
+        ]
+        for names in task_name_sets
+    } if system_name == "Windows" else {names: [1, 1, 1, 1] for names in task_name_sets}
+    base_task_results_by_set = {
+        names: [
+            subprocess.run(
+                ["schtasks.exe", "/Query", "/TN", name],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).returncode
+            for name in names
+        ]
+        for names in base_task_name_sets
+    } if system_name == "Windows" else {names: [1, 1, 1] for names in base_task_name_sets}
+    registered_task_set = next(
+        (
+            names
+            for names, results in base_task_results_by_set.items()
+            if all(code == 0 for code in results)
+        ),
+        None,
+    )
     add(
         "scheduled_tasks",
-        "pass" if all(code == 0 for code in task_results) else "fail",
-        "worker, dashboard, and daily backup tasks are registered"
-        if all(code == 0 for code in task_results)
+        "pass" if registered_task_set else "fail",
+        "worker, dashboard, daily backup, and recovery watchdog tasks are registered"
+        if registered_task_set
         else "one or more CBRS scheduled tasks are missing",
     )
     task_statuses: dict[str, dict[str, Any]] = {}
     if require_active_runtime:
-        task_statuses = _windows_task_statuses(task_names) if system_name == "Windows" else {}
-        enabled = all(
-            bool(task_statuses.get(name, {}).get("enabled")) for name in task_names
-        )
-        persistent_running = all(
-            str(task_statuses.get(name, {}).get("state") or "").lower() == "running"
-            for name in ("CBRS Worker", "CBRS Dashboard")
-        )
-        backup_state = str(
-            task_statuses.get("CBRS Daily Backup", {}).get("state") or ""
-        ).lower()
-        tasks_active = enabled and persistent_running and backup_state in {"ready", "running"}
+        all_task_names = tuple(name for names in task_name_sets for name in names)
+        task_statuses = _windows_task_statuses(all_task_names) if system_name == "Windows" else {}
+
+        def task_set_active(names: tuple[str, str, str, str]) -> bool:
+            enabled = all(bool(task_statuses.get(name, {}).get("enabled")) for name in names)
+            persistent_registered = all(
+                str(task_statuses.get(name, {}).get("state") or "").lower()
+                in {"ready", "running"}
+                for name in names[:2]
+            )
+            backup_state = str(task_statuses.get(names[2], {}).get("state") or "").lower()
+            watchdog_state = str(task_statuses.get(names[3], {}).get("state") or "").lower()
+            return (
+                enabled
+                and persistent_registered
+                and backup_state in {"ready", "running"}
+                and watchdog_state in {"ready", "running"}
+            )
+
+        tasks_active = any(task_set_active(names) for names in task_name_sets)
         add(
             "scheduled_tasks_active",
             "pass" if tasks_active else "fail",
-            "worker and dashboard are running and daily backup is enabled"
+            "runtime tasks are enabled; service liveness is checked by lease and health gates"
             if tasks_active
-            else "registered tasks are disabled or the worker/dashboard are not running",
+            else "one or more registered runtime tasks are disabled or unavailable",
             "Start the native runtime through Start-CbrsNative.ps1 and rerun operational readiness."
             if not tasks_active
             else None,
@@ -932,20 +988,46 @@ def _build_windows_readiness_report(
     )
     raw_pool: dict[str, Any] = {}
     proxy_refs: list[str] = []
+    proxy_providers: list[str] = []
+    proxy_providers_ok = False
     pool_ok = False
     credentials_ok = False
     try:
+        from .proxy_provider import normalize_proxy_provider
+
         raw_pool = json.loads(pool_config_path.read_text(encoding="utf-8"))
         enabled_accounts = [
             account
             for account in raw_pool.get("accounts", [])
             if account.get("enabled", True)
         ]
+        proxy_providers = [
+            normalize_proxy_provider(account.get("proxy_provider"))
+            for account in enabled_accounts
+        ]
+        proxy_providers_ok = len(proxy_providers) == 3
         proxy_refs = [
             str(account.get("proxy_url_env") or "")
             for account in enabled_accounts
+            if normalize_proxy_provider(account.get("proxy_provider"))
+            != "dataimpulse_residential_sticky"
         ]
         proxy_values = [environment.get(name, "") for name in proxy_refs]
+        dataimpulse_accounts = [
+            account
+            for account in enabled_accounts
+            if normalize_proxy_provider(account.get("proxy_provider"))
+            == "dataimpulse_residential_sticky"
+        ]
+        dataimpulse_ports = [
+            int(account.get("dataimpulse_port"))
+            for account in dataimpulse_accounts
+        ]
+        dataimpulse_credentials_ok = all(
+            environment.get(name, "").strip()
+            and not environment.get(name, "").strip().upper().startswith("REPLACE_")
+            for name in ("DATAIMPULSE_PROXY_LOGIN", "DATAIMPULSE_PROXY_PASSWORD")
+        ) if dataimpulse_accounts else True
         credential_refs = [
             (
                 str(account.get("username_env") or ""),
@@ -968,9 +1050,12 @@ def _build_windows_readiness_report(
         )
         pool_ok = (
             raw_pool.get("selection_policy") == "round_robin"
-            and len(proxy_values) == 3
+            and len(proxy_values) + len(dataimpulse_ports) == 3
             and all(urlparse(value).scheme in {"http", "https"} for value in proxy_values)
-            and len(set(proxy_values)) == 3
+            and len(set(proxy_values)) == len(proxy_values)
+            and len(set(dataimpulse_ports)) == len(dataimpulse_ports)
+            and all(10000 <= port <= 20000 for port in dataimpulse_ports)
+            and dataimpulse_credentials_ok
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         pass
@@ -986,6 +1071,65 @@ def _build_windows_readiness_report(
         "pass" if pool_ok else "fail",
         "three distinct account proxy endpoints are configured"
         if pool_ok else "three distinct account proxy endpoints are required",
+    )
+    two_captcha_providers = {
+        "2captcha_dedicated_isp",
+        "2captcha_residential_sticky",
+    }
+    two_captcha_provider_count = sum(
+        provider in two_captcha_providers for provider in proxy_providers
+    )
+    dataimpulse_provider_count = sum(
+        provider == "dataimpulse_residential_sticky"
+        for provider in proxy_providers
+    )
+    add(
+        "proxy_provider_configuration",
+        "pass" if proxy_providers_ok else "fail",
+        (
+            f"provider metadata is valid ({dataimpulse_provider_count} DataImpulse, "
+            f"{two_captcha_provider_count} 2Captcha, "
+            f"{len(proxy_providers) - two_captcha_provider_count - dataimpulse_provider_count} generic static)"
+        )
+        if proxy_providers_ok
+        else "three valid account proxy providers are required",
+    )
+    provider_health: dict[str, Any] = {
+        "status": "not_applicable",
+        "ok": True,
+    }
+    if dataimpulse_provider_count:
+        from .proxy_provider import dataimpulse_configuration_health
+
+        provider_health = dataimpulse_configuration_health(
+            environment.get("DATAIMPULSE_PROXY_LOGIN"),
+            environment.get("DATAIMPULSE_PROXY_PASSWORD"),
+        )
+    elif two_captcha_provider_count:
+        from .proxy_provider import two_captcha_proxy_health
+
+        provider_name = next(
+            provider for provider in proxy_providers if provider in two_captcha_providers
+        )
+        provider_health = two_captcha_proxy_health(
+            configured_solver_key,
+            provider=provider_name,
+            force=True,
+        )
+    add(
+        "proxy_provider_health",
+        "pass" if provider_health.get("ok") else "fail",
+        (
+            "DataImpulse proxy credentials are configured; live health is verified per route"
+            if dataimpulse_provider_count and provider_health.get("ok")
+            else "DataImpulse proxy credentials are missing"
+            if dataimpulse_provider_count
+            else "2Captcha proxy account is active with traffic remaining"
+            if two_captcha_provider_count and provider_health.get("ok")
+            else "2Captcha proxy account is not active with usable traffic"
+            if two_captcha_provider_count
+            else "generic static proxies do not use a provider account check"
+        ),
     )
     baseline_ok = False
     db_path = Path(environment.get("CBRS_CAPTCHA_STATE_PATH", state_root / "pool" / "pool.sqlite3"))
@@ -1025,15 +1169,27 @@ def _build_windows_readiness_report(
         else "prove and approve three unique stable Chilean egress baselines",
     )
     captcha_ok = False
-    captcha_detail = "2Captcha API key is missing"
-    usable_solver_key = configured_solver_key and not configured_solver_key.startswith("REPLACE_")
+    using_capsolver = configured_solver_mode.startswith("capsolver")
+    captcha_provider = "CapSolver" if using_capsolver else "2Captcha"
+    selected_solver_key = configured_capsolver_key if using_capsolver else configured_solver_key
+    captcha_detail = f"{captcha_provider} API key is missing"
+    usable_solver_key = selected_solver_key and not selected_solver_key.startswith("REPLACE_")
     if usable_solver_key:
         try:
-            balance = TwoCaptchaClient(configured_solver_key).get_balance()
+            client = (
+                CapSolverClient(selected_solver_key)
+                if using_capsolver
+                else TwoCaptchaClient(selected_solver_key)
+            )
+            balance = client.get_balance()
             captcha_ok = balance > 0
-            captcha_detail = "2Captcha authentication succeeded and balance is positive" if captcha_ok else "2Captcha balance is zero"
-        except TwoCaptchaError as exc:
-            captcha_detail = f"2Captcha balance check failed ({exc.code})"
+            captcha_detail = (
+                f"{captcha_provider} authentication succeeded and balance is positive"
+                if captcha_ok
+                else f"{captcha_provider} balance is zero"
+            )
+        except (CapSolverError, TwoCaptchaError) as exc:
+            captcha_detail = f"{captcha_provider} balance check failed ({exc.code})"
     add("captcha_balance", "pass" if captcha_ok else "fail", captcha_detail)
     stale_lease = False
     active_lease = False

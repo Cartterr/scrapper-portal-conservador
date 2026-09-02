@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from cbrs.cli import _runtime_headless, build_parser, cmd_pool, main, missing_fna_fields
 
 
@@ -126,6 +128,53 @@ def test_pool_dashboard_and_stop_parsers() -> None:
     assert stop_args.pool_command == "stop"
 
 
+def test_captcha_test_parser_supports_native_browser_control() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "captcha-test",
+            "--provider",
+            "browser",
+            "--account",
+            "ejecutivo_2",
+            "--foja",
+            "12597",
+            "--numero",
+            "6347",
+            "--ano",
+            "1992",
+        ]
+    )
+
+    assert args.command == "captcha-test"
+    assert args.provider == "browser"
+    assert args.account == "ejecutivo_2"
+
+
+def test_jobs_recover_parser() -> None:
+    args = build_parser().parse_args(["jobs", "recover"])
+
+    assert args.command == "jobs"
+    assert args.jobs_command == "recover"
+
+
+def test_pool_proxy_health_parser_supports_guarded_baseline_replacement() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "pool",
+            "proxy-health",
+            "--account",
+            "ejecutivo_1",
+            "--replace-egress-baseline",
+        ]
+    )
+
+    assert args.account == "ejecutivo_1"
+    assert args.replace_egress_baseline is True
+    assert args.approve_egress_baseline is False
+
+
 def test_pool_proxy_health_records_successful_live_gate(monkeypatch) -> None:
     accounts = [
         SimpleNamespace(account_id="ejecutivo_1", label="Ejecutivo 1"),
@@ -204,6 +253,193 @@ def test_pool_proxy_health_records_successful_live_gate(monkeypatch) -> None:
             "egress_hash": "hash-ejecutivo_2",
         },
     }
+
+
+def test_pool_proxy_health_replaces_baseline_only_after_safe_gates(monkeypatch) -> None:
+    account = SimpleNamespace(
+        account_id="ejecutivo_1",
+        label="Ejecutivo 1",
+        proxy_provider="generic_static",
+    )
+    pool_config = SimpleNamespace(accounts=[account])
+
+    class FakeJobStore:
+        def __init__(self) -> None:
+            self.checks = {}
+
+        def summary(self):
+            return {"worker": None}
+
+        def egress_owner(self, _egress_hash, *, exclude_account):
+            assert exclude_account == "ejecutivo_1"
+            return None
+
+        def set_account_check(self, account_id, *, proxy_status, egress_hash=None):
+            self.checks[account_id] = (proxy_status, egress_hash)
+
+    job_store = FakeJobStore()
+    replaced = []
+    monkeypatch.setattr(
+        "cbrs.account_pool.load_account_pool_config", lambda *args, **kwargs: pool_config
+    )
+    monkeypatch.setattr("cbrs.account_pool.default_pool_store", lambda *args: object())
+    monkeypatch.setattr(
+        "cbrs.account_pool.account_settings", lambda settings, selected: selected.account_id
+    )
+    monkeypatch.setattr("cbrs.jobs.default_job_store", lambda *args: job_store)
+    monkeypatch.setattr("cbrs.endurance.load_endurance_plan", lambda *_args: object())
+    monkeypatch.setattr(
+        "cbrs.endurance.EnduranceController",
+        lambda *_args: SimpleNamespace(status=lambda: {"paused": True}),
+    )
+    monkeypatch.setattr(
+        "cbrs.cli.run_preflight",
+        lambda settings, **kwargs: SimpleNamespace(
+            ok=True,
+            report={
+                "egress_hash": "new-hash",
+                "egress_country": "CL",
+                "checks": [{"name": "egress baseline", "ok": True, "detail": "replacement_pending"}],
+            },
+            report_path=None,
+        ),
+    )
+    monkeypatch.setattr(
+        "cbrs.proxy_health.run_proxy_health",
+        lambda settings, **kwargs: SimpleNamespace(ok=True, report={"checks": []}, report_path=None),
+    )
+    monkeypatch.setattr(
+        "cbrs.cli.replace_egress_baseline",
+        lambda settings, **kwargs: replaced.append((settings, kwargs)) or "archive.json",
+    )
+
+    result = cmd_pool(
+        SimpleNamespace(
+            pool_command="proxy-health",
+            config=None,
+            account="ejecutivo_1",
+            approve_egress_baseline=False,
+            replace_egress_baseline=True,
+        )
+    )
+
+    assert result == 0
+    assert replaced == [
+        ("ejecutivo_1", {"egress_hash": "new-hash", "egress_country": "CL"})
+    ]
+    assert job_store.checks["ejecutivo_1"] == ("passed", "new-hash")
+
+
+@pytest.mark.parametrize(
+    ("worker", "paused", "expected"),
+    [({"owner": "worker"}, True, "no worker lease"), (None, False, "paused endurance")],
+)
+def test_pool_proxy_health_replacement_refuses_active_runtime(
+    monkeypatch, capsys, worker, paused, expected
+) -> None:
+    account = SimpleNamespace(
+        account_id="ejecutivo_1",
+        label="Ejecutivo 1",
+        proxy_provider="generic_static",
+    )
+    pool_config = SimpleNamespace(accounts=[account])
+    job_store = SimpleNamespace(summary=lambda: {"worker": worker})
+    monkeypatch.setattr(
+        "cbrs.account_pool.load_account_pool_config", lambda *args, **kwargs: pool_config
+    )
+    monkeypatch.setattr("cbrs.account_pool.default_pool_store", lambda *args: object())
+    monkeypatch.setattr("cbrs.jobs.default_job_store", lambda *args: job_store)
+    monkeypatch.setattr("cbrs.endurance.load_endurance_plan", lambda *_args: object())
+    monkeypatch.setattr(
+        "cbrs.endurance.EnduranceController",
+        lambda *_args: SimpleNamespace(status=lambda: {"paused": paused}),
+    )
+    monkeypatch.setattr(
+        "cbrs.cli.run_preflight",
+        lambda *_args, **_kwargs: pytest.fail("preflight must not run"),
+    )
+
+    result = cmd_pool(
+        SimpleNamespace(
+            pool_command="proxy-health",
+            config=None,
+            account="ejecutivo_1",
+            approve_egress_baseline=False,
+            replace_egress_baseline=True,
+        )
+    )
+
+    assert result == 1
+    assert expected in capsys.readouterr().err
+
+
+def test_pool_proxy_health_replacement_refuses_duplicate_egress(monkeypatch) -> None:
+    account = SimpleNamespace(
+        account_id="ejecutivo_1",
+        label="Ejecutivo 1",
+        proxy_provider="generic_static",
+    )
+    pool_config = SimpleNamespace(accounts=[account])
+
+    class FakeJobStore:
+        def __init__(self) -> None:
+            self.checks = []
+
+        def summary(self):
+            return {"worker": None}
+
+        def egress_owner(self, _egress_hash, *, exclude_account):
+            assert exclude_account == "ejecutivo_1"
+            return "ejecutivo_2"
+
+        def set_account_check(self, account_id, *, proxy_status, egress_hash=None):
+            self.checks.append((account_id, proxy_status, egress_hash))
+
+    job_store = FakeJobStore()
+    monkeypatch.setattr(
+        "cbrs.account_pool.load_account_pool_config", lambda *args, **kwargs: pool_config
+    )
+    monkeypatch.setattr("cbrs.account_pool.default_pool_store", lambda *args: object())
+    monkeypatch.setattr(
+        "cbrs.account_pool.account_settings", lambda _settings, selected: selected.account_id
+    )
+    monkeypatch.setattr("cbrs.jobs.default_job_store", lambda *args: job_store)
+    monkeypatch.setattr("cbrs.endurance.load_endurance_plan", lambda *_args: object())
+    monkeypatch.setattr(
+        "cbrs.endurance.EnduranceController",
+        lambda *_args: SimpleNamespace(status=lambda: {"paused": True}),
+    )
+    monkeypatch.setattr(
+        "cbrs.cli.run_preflight",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ok=True,
+            report={"egress_hash": "duplicate", "egress_country": "CL", "checks": []},
+            report_path=None,
+        ),
+    )
+    monkeypatch.setattr(
+        "cbrs.proxy_health.run_proxy_health",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ok=True, report={"checks": []}, report_path=None
+        ),
+    )
+    monkeypatch.setattr(
+        "cbrs.cli.replace_egress_baseline",
+        lambda *_args, **_kwargs: pytest.fail("duplicate egress must not be installed"),
+    )
+
+    result = cmd_pool(
+        SimpleNamespace(
+            pool_command="proxy-health",
+            config=None,
+            account="ejecutivo_1",
+            approve_egress_baseline=False,
+            replace_egress_baseline=True,
+        )
+    )
+
+    assert result == 1
+    assert job_store.checks == [("ejecutivo_1", "failed", None)]
 
 
 def test_jobs_cli_parses_text_fna_worker_and_dashboard() -> None:

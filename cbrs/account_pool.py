@@ -15,6 +15,13 @@ from typing import Any, Callable, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 from .config import SETTINGS, Settings
+from .dataimpulse import (
+    DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER,
+    active_dataimpulse_port,
+    build_dataimpulse_proxy_url,
+    validate_dataimpulse_port,
+)
+from .proxy_provider import GENERIC_STATIC_PROXY_PROVIDER, normalize_proxy_provider
 from .safety import SafetyStopException, StopReason, redact, redact_text
 from .validation import (
     ValidationRunResult,
@@ -36,6 +43,7 @@ CAPTCHA_PENDING_STATUS = "captcha_pending"
 CAPTCHA_SOLVING_STATUS = "captcha_solving"
 ACTIVE_RUN_STATUSES = frozenset({"running", "waiting", "waiting_capacity", "waiting_captcha"})
 RUN_STALE_AFTER_SECONDS = 120.0
+DEFAULT_SECURITY_COOLDOWN_SECONDS = 300.0
 LOCAL_TZ = ZoneInfo("America/Santiago")
 SECRET_ACCOUNT_KEYS = {
     "email",
@@ -65,6 +73,9 @@ class PoolAccount:
     profile_dir: Path | None = None
     daily_quota: int | None = None
     egress_group: str | None = None
+    proxy_provider: str = GENERIC_STATIC_PROXY_PROVIDER
+    proxy_brand: str | None = None
+    dataimpulse_port: int | None = None
 
 
 @dataclass(frozen=True)
@@ -122,29 +133,37 @@ def _initial_account_state(
     prior: dict[str, Any] | None,
     *,
     quota_date: str,
-) -> tuple[str, str | None, str | None]:
+) -> tuple[str, str | None, str | None, str | None]:
     if not account.enabled:
-        return "disabled", None, None
+        return "disabled", None, None, None
     if not prior:
-        return "available", None, None
+        return "available", None, None, None
 
     status = str(prior.get("status") or "available")
     reason = str(prior.get("paused_reason") or "") or None
     paused_at = str(prior.get("paused_at") or "") or None
+    resume_at = str(prior.get("resume_at") or "") or None
     prior_quota_date = str(prior.get("quota_date") or "")
 
     # A process crash while the headed recovery window was open must not make
     # the account schedulable again on restart.
     if status == CAPTCHA_SOLVING_STATUS:
-        return CAPTCHA_PENDING_STATUS, reason or CAPTCHA_REJECTED_REASON, paused_at
+        return (
+            CAPTCHA_PENDING_STATUS,
+            reason or CAPTCHA_REJECTED_REASON,
+            paused_at,
+            resume_at or _cooldown_until(DEFAULT_SECURITY_COOLDOWN_SECONDS),
+        )
 
     # Portal daily limits expire with the Chilean quota day. Security, auth and
     # CAPTCHA pauses remain durable until an operator explicitly clears them.
     if status == "paused" and reason == "daily_limit" and prior_quota_date != quota_date:
-        return "available", None, None
+        return "available", None, None, None
     if status in {"paused", CAPTCHA_PENDING_STATUS}:
-        return status, reason, paused_at
-    return "available", None, None
+        if not resume_at or resume_at <= utc_now():
+            return "available", None, None, None
+        return status, reason, paused_at, resume_at
+    return "available", None, None, None
 
 
 class AccountPoolStore:
@@ -178,6 +197,7 @@ class AccountPoolStore:
                     status TEXT NOT NULL,
                     paused_reason TEXT,
                     paused_at TEXT,
+                    resume_at TEXT,
                     quota_date TEXT NOT NULL,
                     daily_quota INTEGER NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -237,6 +257,12 @@ class AccountPoolStore:
                 """,
                 (CAPTCHA_PENDING_STATUS, CAPTCHA_REJECTED_REASON),
             )
+            account_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(accounts)").fetchall()
+            }
+            if "resume_at" not in account_columns:
+                db.execute("ALTER TABLE accounts ADD COLUMN resume_at TEXT")
 
     def create_run(
         self,
@@ -304,7 +330,7 @@ class AccountPoolStore:
             )
             account_rows = []
             for account in config.accounts:
-                status, paused_reason, paused_at = _initial_account_state(
+                status, paused_reason, paused_at, resume_at = _initial_account_state(
                     account,
                     prior_states.get(account.account_id),
                     quota_date=quota_date,
@@ -317,6 +343,7 @@ class AccountPoolStore:
                         status,
                         paused_reason,
                         paused_at,
+                        resume_at,
                         quota_date,
                         config.quota_for(account),
                         now,
@@ -326,9 +353,9 @@ class AccountPoolStore:
                 """
                 INSERT INTO accounts (
                     run_id, account_id, label, status, paused_reason, paused_at,
-                    quota_date, daily_quota, updated_at
+                    resume_at, quota_date, daily_quota, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 account_rows,
             )
@@ -497,16 +524,30 @@ class AccountPoolStore:
         account_id: str,
         *,
         reason: str,
+        cooldown_seconds: float | None = DEFAULT_SECURITY_COOLDOWN_SECONDS,
     ) -> None:
         now = utc_now()
+        resume_at = (
+            None
+            if reason == "daily_limit" or cooldown_seconds is None
+            else _cooldown_until(cooldown_seconds)
+        )
         with self._connect() as db:
             db.execute(
                 """
                 UPDATE accounts
-                SET status = ?, paused_reason = ?, paused_at = ?, updated_at = ?
+                SET status = ?, paused_reason = ?, paused_at = ?, resume_at = ?, updated_at = ?
                 WHERE run_id = ? AND account_id = ?
                 """,
-                ("paused", redact_text(reason), now, now, run_id, account_id),
+                (
+                    "paused",
+                    redact_text(reason),
+                    now,
+                    resume_at,
+                    now,
+                    run_id,
+                    account_id,
+                ),
             )
 
     def mark_account_captcha_pending(
@@ -515,16 +556,26 @@ class AccountPoolStore:
         account_id: str,
         *,
         reason: str = CAPTCHA_REJECTED_REASON,
+        cooldown_seconds: float = DEFAULT_SECURITY_COOLDOWN_SECONDS,
     ) -> None:
         now = utc_now()
+        resume_at = _cooldown_until(cooldown_seconds)
         with self._connect() as db:
             db.execute(
                 """
                 UPDATE accounts
-                SET status = ?, paused_reason = ?, paused_at = ?, updated_at = ?
+                SET status = ?, paused_reason = ?, paused_at = ?, resume_at = ?, updated_at = ?
                 WHERE run_id = ? AND account_id = ?
                 """,
-                (CAPTCHA_PENDING_STATUS, redact_text(reason), now, now, run_id, account_id),
+                (
+                    CAPTCHA_PENDING_STATUS,
+                    redact_text(reason),
+                    now,
+                    resume_at,
+                    now,
+                    run_id,
+                    account_id,
+                ),
             )
 
     def mark_account_captcha_solving(self, run_id: str, account_id: str) -> None:
@@ -545,7 +596,8 @@ class AccountPoolStore:
             db.execute(
                 """
                 UPDATE accounts
-                SET status = ?, paused_reason = NULL, paused_at = NULL, updated_at = ?
+                SET status = ?, paused_reason = NULL, paused_at = NULL,
+                    resume_at = NULL, updated_at = ?
                 WHERE run_id = ? AND account_id = ?
                 """,
                 ("available", now, run_id, account_id),
@@ -567,11 +619,32 @@ class AccountPoolStore:
                     paused_at = CASE
                         WHEN status = 'paused' AND paused_reason = 'daily_limit'
                         THEN NULL ELSE paused_at END,
+                    resume_at = CASE
+                        WHEN status = 'paused' AND paused_reason = 'daily_limit'
+                        THEN NULL ELSE resume_at END,
                     quota_date = ?, updated_at = ?
                 WHERE run_id = ? AND quota_date != ?
                 """,
                 (quota_date, now, run_id, quota_date),
             )
+
+    def reactivate_expired_cooldowns(self, run_id: str) -> int:
+        """Return timed safety pauses to the pool without touching daily limits."""
+        now = utc_now()
+        with self._connect() as db:
+            changed = db.execute(
+                """
+                UPDATE accounts
+                SET status = 'available', paused_reason = NULL, paused_at = NULL,
+                    resume_at = NULL, updated_at = ?
+                WHERE run_id = ?
+                  AND status IN ('paused', 'captcha_pending')
+                  AND paused_reason != 'daily_limit'
+                  AND resume_at IS NOT NULL AND resume_at <= ?
+                """,
+                (now, run_id, now),
+            ).rowcount
+        return int(changed)
 
     def latest_run(self, *, dry_run: bool | None = None) -> dict[str, Any] | None:
         where = ""
@@ -812,6 +885,25 @@ def load_account_pool_config(
     ]
     if len(proxy_refs) != len(set(proxy_refs)):
         raise ValueError("enabled pool accounts must use distinct proxy_url_env references")
+    dataimpulse_ports: list[int] = []
+    for account in config.accounts:
+        is_dataimpulse = (
+            account.proxy_provider == DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER
+        )
+        if is_dataimpulse and account.proxy_url_env:
+            raise ValueError(
+                "DataImpulse accounts must use dataimpulse_port, not proxy_url_env"
+            )
+        if is_dataimpulse:
+            if account.dataimpulse_port is None:
+                raise ValueError("DataImpulse accounts require dataimpulse_port")
+            dataimpulse_ports.append(account.dataimpulse_port)
+        elif account.dataimpulse_port is not None:
+            raise ValueError(
+                "dataimpulse_port is only valid for DataImpulse accounts"
+            )
+    if len(dataimpulse_ports) != len(set(dataimpulse_ports)):
+        raise ValueError("enabled DataImpulse accounts must use distinct sticky ports")
     accounts_by_proxy: dict[str, list[PoolAccount]] = {}
     for account in config.accounts:
         if not account.enabled or not account.proxy_url_env:
@@ -831,12 +923,39 @@ def load_account_pool_config(
     return config
 
 
-def account_settings(settings: Settings, account: PoolAccount) -> Settings:
+def account_settings(
+    settings: Settings,
+    account: PoolAccount,
+    *,
+    dataimpulse_port: int | None = None,
+) -> Settings:
     profile_dir = account.profile_dir
     if profile_dir is None:
         profile_dir = settings.profile_dir.parent / "accounts" / account.account_id / "chrome-profile"
     proxy_url = settings.proxy_url
-    if account.proxy_url_env:
+    if account.proxy_provider == DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER:
+        port = dataimpulse_port or account.dataimpulse_port
+        if port is None:
+            raise ValueError(
+                f"Pool account {account.account_id} requires a DataImpulse sticky port."
+            )
+        if dataimpulse_port is None:
+            port = active_dataimpulse_port(
+                settings.captcha_state_path,
+                account.account_id,
+                port,
+            )
+        proxy_url = build_dataimpulse_proxy_url(
+            login=settings.dataimpulse_proxy_login,
+            password=settings.dataimpulse_proxy_password,
+            host=settings.dataimpulse_host,
+            country=settings.dataimpulse_country,
+            ttl_minutes=settings.dataimpulse_sticky_ttl_minutes,
+            port=port,
+            port_min=settings.dataimpulse_port_min,
+            port_max=settings.dataimpulse_port_max,
+        )
+    elif account.proxy_url_env:
         proxy_url = os.environ.get(account.proxy_url_env)
         if not proxy_url:
             raise ValueError(
@@ -1426,6 +1545,11 @@ def dashboard_status(
 
     run_id = str(run["run_id"])
     quota_date = local_today()
+    # Keep the overview truthful even when the scheduled worker is disabled.
+    # These maintenance operations release only expired timed cooldowns and
+    # daily-limit pauses from a previous Chilean quota day.
+    store.reset_quota_day(run_id, quota_date)
+    store.reactivate_expired_cooldowns(run_id)
     cycles = store.recent_cycles(run_id=run_id, limit=100)
     events = store.recent_events(run_id=run_id, limit=100)
     artifacts = store.artifacts(run_id=run_id, limit=100)
@@ -1451,6 +1575,12 @@ def dashboard_status(
             else None
         )
         egress_group = configured_account.egress_group if configured_account else None
+        proxy_provider = (
+            configured_account.proxy_provider
+            if configured_account
+            else GENERIC_STATIC_PROXY_PROVIDER
+        )
+        proxy_brand = configured_account.proxy_brand if configured_account else None
         egress_shared = bool(
             config
             and egress_group
@@ -1471,7 +1601,15 @@ def dashboard_status(
                 "remaining_today": max(0, quota - used),
                 "paused_reason": row["paused_reason"],
                 "paused_at": row["paused_at"],
+                "resume_at": row["resume_at"],
                 "egress_group": egress_group,
+                "proxy_provider": proxy_provider,
+                "proxy_brand": proxy_brand,
+                "dataimpulse_port": (
+                    configured_account.dataimpulse_port
+                    if configured_account
+                    else None
+                ),
                 "egress_shared": egress_shared,
             }
         )
@@ -1657,6 +1795,19 @@ def _parse_accounts(raw_accounts: Any, *, profile_root: Path) -> Iterable[PoolAc
         egress_group = _safe_account_id(raw_egress_group) if raw_egress_group else None
         if raw_egress_group and not egress_group:
             raise ValueError("account egress_group must contain only letters, digits, or underscores")
+        proxy_provider = normalize_proxy_provider(raw.get("proxy_provider"))
+        raw_dataimpulse_port = raw.get("dataimpulse_port")
+        dataimpulse_port = (
+            int(raw_dataimpulse_port)
+            if raw_dataimpulse_port not in {None, ""}
+            else None
+        )
+        if dataimpulse_port is not None:
+            validate_dataimpulse_port(
+                dataimpulse_port,
+                minimum=10000,
+                maximum=20000,
+            )
         accounts.append(
             PoolAccount(
                 account_id=account_id,
@@ -1668,6 +1819,9 @@ def _parse_accounts(raw_accounts: Any, *, profile_root: Path) -> Iterable[PoolAc
                 profile_dir=profile_dir,
                 daily_quota=daily_quota,
                 egress_group=egress_group,
+                proxy_provider=proxy_provider,
+                proxy_brand=_safe_proxy_brand(raw.get("proxy_brand")),
+                dataimpulse_port=dataimpulse_port,
             )
         )
     return accounts
@@ -1742,6 +1896,15 @@ def _safe_env_var(value: str) -> str | None:
     return value
 
 
+def _safe_proxy_brand(value: object) -> str | None:
+    brand = str(value or "").strip()
+    if not brand:
+        return None
+    if len(brand) > 80 or any(ord(char) < 32 or ord(char) == 127 for char in brand):
+        raise ValueError("account proxy_brand must be one printable line of 80 characters or less")
+    return brand
+
+
 def _default_account_status(config: PoolConfig | None) -> list[dict[str, Any]]:
     accounts = config.accounts if config else DEFAULT_ACCOUNTS
     return [
@@ -1754,7 +1917,17 @@ def _default_account_status(config: PoolConfig | None) -> list[dict[str, Any]]:
             "remaining_today": config.quota_for(account) if config else DEFAULT_DAILY_QUOTA_PER_ACCOUNT,
             "paused_reason": None,
             "paused_at": None,
+            "resume_at": None,
             "egress_group": account.egress_group,
+            "proxy_provider": account.proxy_provider,
+            "proxy_brand": account.proxy_brand,
+            "dataimpulse_port": account.dataimpulse_port,
+            "browser_live": False,
+            "browser_authenticated": False,
+            "browser_mode": None,
+            "browser_status": "worker_stopped",
+            "browser_started_at": None,
+            "browser_checked_at": None,
             "egress_shared": bool(
                 account.egress_group
                 and sum(
@@ -1885,6 +2058,13 @@ def next_quota_reset_at() -> str:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _cooldown_until(seconds: float) -> str:
+    duration = min(DEFAULT_SECURITY_COOLDOWN_SECONDS, max(1.0, float(seconds)))
+    return (
+        datetime.now(timezone.utc) + timedelta(seconds=duration)
+    ).replace(microsecond=0).isoformat()
 
 
 def utc_from_epoch(value: float) -> str:

@@ -3,28 +3,72 @@ from __future__ import annotations
 import logging
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 
 from .browser_runtime import detect_browser
+from .capsolver import CapSolverClient, CapSolverError, CapSolverResult
 from .captcha_budget import CaptchaBudgetError, CaptchaBudgetStore
 from .captcha_solver import TwoCaptchaClient, TwoCaptchaError, TwoCaptchaResult
 from .cloak import apply_cloak_environment, cloak_launch_args, cloak_proxy
 from .config import SETTINGS, Settings
-from .safety import SafetyStopException, StopReason, classify_response
+from .safety import (
+    SafetyStopException,
+    StopReason,
+    classify_response,
+    sanitized_portal_outcome,
+    sanitized_portal_response_code,
+)
 
 logger = logging.getLogger(__name__)
 LOGIN_COOKIE_NAMES = {
     "auth_cbrs_token",
     "cbrs_refresh_token",
 }
+
+
+class CommerceAuthState(str, Enum):
+    """Page-level evidence for access to the protected commerce search."""
+
+    AUTHENTICATED_FORM = "authenticated_form"
+    LOGIN_GATE = "login_gate"
+    UNKNOWN = "unknown"
+    CONFLICT = "conflict"
 OFFSCREEN_CHROME_ARGS = [
     "--window-size=1366,900",
     "--window-position=-32000,-32000",
 ]
+_PLAYWRIGHT_RUNTIME = threading.local()
+
+
+def _acquire_sync_playwright() -> Any:
+    runtime = getattr(_PLAYWRIGHT_RUNTIME, "runtime", None)
+    if runtime is None:
+        from playwright.sync_api import sync_playwright
+
+        runtime = sync_playwright().start()
+        _PLAYWRIGHT_RUNTIME.runtime = runtime
+        _PLAYWRIGHT_RUNTIME.references = 0
+    _PLAYWRIGHT_RUNTIME.references += 1
+    return runtime
+
+
+def _release_sync_playwright(runtime: Any) -> None:
+    if getattr(_PLAYWRIGHT_RUNTIME, "runtime", None) is not runtime:
+        return
+    references = max(0, int(getattr(_PLAYWRIGHT_RUNTIME, "references", 1)) - 1)
+    _PLAYWRIGHT_RUNTIME.references = references
+    if references == 0:
+        try:
+            runtime.stop()
+        finally:
+            delattr(_PLAYWRIGHT_RUNTIME, "runtime")
+            delattr(_PLAYWRIGHT_RUNTIME, "references")
 
 
 @dataclass(frozen=True)
@@ -40,21 +84,38 @@ class RecaptchaSolution:
     token: str
     source: str
     attempt_id: str | None = None
-    provider_task_id: int | None = None
+    provider_task_id: int | str | None = None
 
 
 class CredentialsRejectedError(RuntimeError):
     """The portal rejected configured credentials without exposing their values."""
 
+    def __init__(
+        self,
+        message: str = "CBRS rejected the configured account credentials.",
+        *,
+        status: int | None = None,
+        response_code: str | None = None,
+    ) -> None:
+        self.status = status
+        self.response_code = response_code
+        super().__init__(message)
+
 
 class BrowserSession:
-    """Persistent headed browser profile used as the single trusted session."""
+    """Persistent Chrome profile used as the single trusted session."""
 
-    def __init__(self, settings: Settings = SETTINGS, *, headless: bool = False) -> None:
+    def __init__(
+        self,
+        settings: Settings = SETTINGS,
+        *,
+        headless: bool | None = None,
+    ) -> None:
         self.settings = settings
-        self.headless = headless
+        self.headless = settings.headless if headless is None else headless
         self._context: Any = None
         self._playwright: Any = None
+        self._capsolver_cdp: Any = None
 
     def open(self) -> BrowserSession:
         if self._context is not None:
@@ -70,9 +131,7 @@ class BrowserSession:
             proxy = _playwright_proxy(self.settings.proxy_url)
             executable = detect_browser(self.settings)
 
-            from playwright.sync_api import sync_playwright
-
-            self._playwright = sync_playwright().start()
+            self._playwright = _acquire_sync_playwright()
             try:
                 self._context = self._playwright.chromium.launch_persistent_context(
                     str(self.settings.profile_dir),
@@ -87,7 +146,7 @@ class BrowserSession:
             except Exception:
                 # A failed persistent-context launch otherwise leaves the sync
                 # Playwright event loop alive and poisons the next account.
-                self._playwright.stop()
+                _release_sync_playwright(self._playwright)
                 self._playwright = None
                 raise
             return self
@@ -171,6 +230,91 @@ class BrowserSession:
                 context="auth",
             )
 
+    def detect_commerce_auth_state(self) -> CommerceAuthState:
+        """Return fail-closed DOM evidence for the protected commerce page.
+
+        A cookie or a successful refresh request is supporting evidence only.
+        The protected search form must be visibly rendered before the session is
+        allowed to become authenticated in runtime state.
+        """
+        try:
+            raw = self.page.evaluate(
+                    """() => {
+                        const normalize = (value) =>
+                            String(value || "").replace(/\\s+/g, " ").trim();
+                        const visible = (element) => {
+                            if (!(element instanceof HTMLElement)) return false;
+                            const style = window.getComputedStyle(element);
+                            return style.display !== "none" &&
+                                style.visibility !== "hidden" &&
+                                element.getClientRects().length > 0;
+                        };
+                        const loginGate = Array.from(
+                            document.querySelectorAll("div.m3-card-outlined")
+                        ).some((card) => {
+                            const heading = card.querySelector("h2.m3-title-large");
+                            const loginLink = card.querySelector("a[href^='/login/']");
+                            const registerLink = card.querySelector("a[href='/crear-cuenta']");
+                            return visible(card) &&
+                                visible(heading) &&
+                                visible(loginLink) &&
+                                normalize(heading.textContent) ===
+                                    "Para acceder debe iniciar sesión" &&
+                                normalize(loginLink.textContent) === "Iniciar sesión" &&
+                                Boolean(registerLink);
+                        });
+
+                        const protectedForm = Array.from(
+                            document.querySelectorAll("section.m3-card-outlined")
+                        ).some((section) => {
+                            if (!visible(section)) return false;
+                            if (normalize(section.getAttribute("aria-label")) !==
+                                "Búsqueda por foja, número y año") return false;
+                            const inputs = [
+                                section.querySelector("#input-fojas"),
+                                section.querySelector("#input-numero"),
+                                section.querySelector("#input-ano")
+                            ];
+                            if (!inputs.every((input) => visible(input))) return false;
+                            const buttons = Array.from(section.querySelectorAll("button"))
+                                .filter((button) => visible(button))
+                                .map((button) => normalize(button.textContent));
+                            return buttons.includes("Buscar") && buttons.includes("Limpiar");
+                        });
+
+                        if (loginGate && protectedForm) return "conflict";
+                        if (loginGate) return "login_gate";
+                        if (protectedForm) return "authenticated_form";
+                        return "unknown";
+                    }"""
+                )
+            try:
+                return CommerceAuthState(str(raw))
+            except ValueError:
+                return CommerceAuthState.UNKNOWN
+        except Exception:
+            return CommerceAuthState.UNKNOWN
+
+    def wait_for_commerce_auth_state(
+        self,
+        *,
+        timeout_ms: int = 5000,
+        poll_ms: int = 250,
+    ) -> CommerceAuthState:
+        """Wait briefly for the SPA to render one complete auth signature."""
+        deadline = time.monotonic() + max(0, timeout_ms) / 1000
+        while True:
+            state = self.detect_commerce_auth_state()
+            if state is not CommerceAuthState.UNKNOWN:
+                return state
+            if time.monotonic() >= deadline:
+                return state
+            self.page.wait_for_timeout(max(50, poll_ms))
+
+    def page_requires_login(self) -> bool:
+        """Compatibility helper for callers that only need the login gate."""
+        return self.detect_commerce_auth_state() is CommerceAuthState.LOGIN_GATE
+
     def has_active_login(self) -> bool:
         if not self.has_login_cookie():
             return False
@@ -193,7 +337,18 @@ class BrowserSession:
         if not isinstance(token, str) or not token:
             return False
         self.set_auth_cookie(token)
-        return True
+        try:
+            # Always render the protected page again after changing the browser
+            # cookie.  A 200 refresh response is not proof of page access: the
+            # SPA may still show the explicit login card.
+            self.reload_current_page()
+            self.page.wait_for_timeout(500)
+        except Exception:
+            return False
+        return (
+            self.wait_for_commerce_auth_state()
+            is CommerceAuthState.AUTHENTICATED_FORM
+        )
 
     def ensure_authenticated(
         self,
@@ -290,10 +445,7 @@ class BrowserSession:
         return self.generate_recaptcha_solution(action).token
 
     def generate_recaptcha_solution(self, action: str) -> RecaptchaSolution:
-        if self.settings.captcha_solver_mode == "2captcha" or (
-            self.settings.captcha_solver_mode == "2captcha_manual"
-            and self.has_external_recaptcha_fallback
-        ):
+        if self.settings.captcha_solver_mode in {"2captcha", "capsolver"}:
             return self.generate_external_recaptcha_solution(action)
         self._ensure_recaptcha_ready()
         token = self.page.evaluate(
@@ -313,11 +465,18 @@ class BrowserSession:
 
     @property
     def has_external_recaptcha_fallback(self) -> bool:
-        if self.settings.captcha_solver_mode == "2captcha_fallback":
+        if self.settings.captcha_solver_mode in {
+            "2captcha_fallback",
+            "capsolver_fallback",
+        }:
             return True
-        if self.settings.captcha_solver_mode != "2captcha_manual":
+        if self.settings.captcha_solver_mode not in {
+            "2captcha_manual",
+            "capsolver_manual",
+        }:
             return False
-        return self._captcha_budget().manual_armed(
+        budget = self._captcha_budget()
+        return budget.automatic_enabled() or budget.manual_armed(
             account_id=self.settings.account_id or "unassigned"
         )
 
@@ -325,11 +484,63 @@ class BrowserSession:
         return self.generate_external_recaptcha_solution(action).token
 
     def generate_external_recaptcha_solution(self, action: str) -> RecaptchaSolution:
-        api_key = self.settings.two_captcha_api_key
+        provider = self.settings.external_captcha_provider
+        try:
+            return self._generate_external_recaptcha_solution_with_provider(
+                action,
+                provider=provider,
+            )
+        except SafetyStopException as exc:
+            if not (
+                provider == "capsolver"
+                and self.has_secondary_external_recaptcha_fallback
+                and isinstance(exc.__cause__, (CapSolverError, ValueError))
+            ):
+                raise
+            logger.warning(
+                "CapSolver failed before portal submission; trying one bounded 2Captcha fallback"
+            )
+            return self.generate_secondary_external_recaptcha_solution(action)
+
+    @property
+    def has_secondary_external_recaptcha_fallback(self) -> bool:
+        """Whether a CapSolver attempt may fall back once to configured 2Captcha."""
+
+        return (
+            self.settings.external_captcha_provider == "capsolver"
+            and bool(self.settings.two_captcha_api_key)
+        )
+
+    def generate_secondary_external_recaptcha_solution(
+        self,
+        action: str,
+    ) -> RecaptchaSolution:
+        if not self.has_secondary_external_recaptcha_fallback:
+            raise SafetyStopException(
+                StopReason.CAPTCHA_SOLVER,
+                "No secondary external CAPTCHA provider is configured.",
+                context="recaptcha solver",
+            )
+        return self._generate_external_recaptcha_solution_with_provider(
+            action,
+            provider="2captcha",
+        )
+
+    def _generate_external_recaptcha_solution_with_provider(
+        self,
+        action: str,
+        *,
+        provider: str | None,
+    ) -> RecaptchaSolution:
+        api_key = (
+            self.settings.capsolver_api_key
+            if provider == "capsolver"
+            else self.settings.two_captcha_api_key
+        )
         if not api_key:
             raise SafetyStopException(
                 StopReason.CAPTCHA_SOLVER,
-                "2Captcha is enabled but its API key is not configured.",
+                "The external CAPTCHA provider is enabled but its API key is not configured.",
                 context="recaptcha solver",
             )
         page_url = (
@@ -337,18 +548,45 @@ class BrowserSession:
             if action == "login"
             else self.settings.commerce_url
         )
-        client = TwoCaptchaClient(
-            api_key,
-            timeout_seconds=self.settings.two_captcha_timeout_seconds,
-            poll_seconds=self.settings.two_captcha_poll_seconds,
-        )
+        user_agent: str | None = None
+        if provider == "capsolver":
+            if not self.settings.proxy_url:
+                raise SafetyStopException(
+                    StopReason.CAPTCHA_SOLVER,
+                    "CapSolver proxy-bound mode requires the account proxy.",
+                    context="recaptcha solver",
+                )
+            evaluated_user_agent = self.page.evaluate("() => navigator.userAgent")
+            if not isinstance(evaluated_user_agent, str) or not evaluated_user_agent:
+                raise SafetyStopException(
+                    StopReason.CAPTCHA_SOLVER,
+                    "CapSolver could not read the active browser user agent.",
+                    context="recaptcha solver",
+                )
+            user_agent = evaluated_user_agent
+            client: TwoCaptchaClient | CapSolverClient = CapSolverClient(
+                api_key,
+                timeout_seconds=self.settings.capsolver_timeout_seconds,
+                poll_seconds=self.settings.capsolver_poll_seconds,
+            )
+        else:
+            client = TwoCaptchaClient(
+                api_key,
+                timeout_seconds=self.settings.two_captcha_timeout_seconds,
+                poll_seconds=self.settings.two_captcha_poll_seconds,
+            )
         budget = self._captcha_budget()
         try:
             reservation = budget.reserve(
                 account_id=self.settings.account_id or "unassigned",
                 action=action,
+                provider=provider or "unknown",
                 require_manual_authorization=(
-                    self.settings.captcha_solver_mode == "2captcha_manual"
+                    self.settings.captcha_solver_mode in {
+                        "2captcha_manual",
+                        "capsolver_manual",
+                    }
+                    and not budget.automatic_enabled()
                 ),
             )
         except CaptchaBudgetError as exc:
@@ -359,45 +597,71 @@ class BrowserSession:
             ) from exc
         started = time.monotonic()
         try:
-            task = {
+            task: dict[str, object] = {
                 "website_url": page_url,
                 "website_key": self.settings.recaptcha_sitekey,
                 "page_action": action,
                 "min_score": self.settings.two_captcha_min_score,
             }
+            if provider == "capsolver":
+                task.update(
+                    {
+                        "proxy": self.settings.proxy_url or "",
+                        "user_agent": user_agent or "",
+                    }
+                )
             if hasattr(client, "solve_recaptcha_v3_enterprise_result"):
                 result = client.solve_recaptcha_v3_enterprise_result(**task)
             else:  # Compatibility for injected clients implementing the public token API.
-                result = TwoCaptchaResult(client.solve_recaptcha_v3_enterprise(**task))
-        except TwoCaptchaError as exc:
+                token = client.solve_recaptcha_v3_enterprise(**task)
+                result = (
+                    CapSolverResult(token)
+                    if provider == "capsolver"
+                    else TwoCaptchaResult(token)
+                )
+            if provider == "capsolver" and isinstance(result, CapSolverResult):
+                self._apply_capsolver_browser_identity(result)
+        except (TwoCaptchaError, CapSolverError, ValueError) as exc:
+            code = exc.code if isinstance(exc, (TwoCaptchaError, CapSolverError)) else "INVALID_TASK_DATA"
+            secondary_available = (
+                provider == "capsolver"
+                and self.has_secondary_external_recaptcha_fallback
+            )
             disable_external = exc.code in {
                 "ERROR_ZERO_BALANCE",
                 "ERROR_WRONG_USER_KEY",
                 "ERROR_KEY_DOES_NOT_EXIST",
-            }
+                "ERROR_KEY_DENIED_ACCESS",
+            } if isinstance(exc, (TwoCaptchaError, CapSolverError)) else False
             budget.finish(
                 reservation,
                 status="failed",
-                error_code=exc.code,
+                error_code=code,
                 latency_seconds=time.monotonic() - started,
-                open_circuit=exc.code in {
-                    "NETWORK_ERROR",
-                    "TIMEOUT",
-                    "ERROR_NO_SLOT_AVAILABLE",
-                    "ERROR_ZERO_BALANCE",
-                    "ERROR_WRONG_USER_KEY",
-                }
-                or exc.code.startswith("HTTP_"),
-                disable_external=disable_external,
+                open_circuit=(
+                    not secondary_available
+                    and (
+                        code in {
+                            "NETWORK_ERROR",
+                            "TIMEOUT",
+                            "ERROR_NO_SLOT_AVAILABLE",
+                            "ERROR_ZERO_BALANCE",
+                            "ERROR_WRONG_USER_KEY",
+                            "ERROR_KEY_DENIED_ACCESS",
+                        }
+                        or code.startswith("HTTP_")
+                    )
+                ),
+                disable_external=disable_external and not secondary_available,
             )
             reason = (
                 StopReason.CAPTCHA_REJECTED
-                if exc.code == "ERROR_CAPTCHA_UNSOLVABLE"
+                if code == "ERROR_CAPTCHA_UNSOLVABLE"
                 else StopReason.CAPTCHA_SOLVER
             )
             raise SafetyStopException(
                 reason,
-                f"2Captcha solver stopped with {exc.code}.",
+                f"External CAPTCHA solver stopped with {code}.",
                 context="recaptcha solver",
             ) from exc
         budget.finish(
@@ -406,13 +670,41 @@ class BrowserSession:
             cost_usd=result.cost_usd,
             latency_seconds=time.monotonic() - started,
         )
-        logger.info("Generated reCAPTCHA token with 2Captcha for action=%s", action)
+        logger.info("Generated reCAPTCHA token with %s for action=%s", provider, action)
         return RecaptchaSolution(
             token=result.token,
-            source="2captcha",
+            source=provider or "external",
             attempt_id=reservation.attempt_id,
             provider_task_id=result.task_id,
         )
+
+    def _apply_capsolver_browser_identity(self, result: CapSolverResult) -> None:
+        """Align submission identity with the proxy-bound token worker."""
+        if not result.user_agent:
+            return
+        page = self.page
+        if self._capsolver_cdp is not None:
+            try:
+                self._capsolver_cdp.detach()
+            except Exception:
+                pass
+        cdp = page.context.new_cdp_session(page)
+        self._capsolver_cdp = cdp
+        cdp.send("Network.enable")
+        cdp.send(
+            "Network.setUserAgentOverride",
+            {"userAgent": result.user_agent},
+        )
+        if result.sec_ch_ua:
+            cdp.send(
+                "Network.setExtraHTTPHeaders",
+                {"headers": {"sec-ch-ua": result.sec_ch_ua}},
+            )
+        applied = page.evaluate("() => navigator.userAgent")
+        if applied != result.user_agent:
+            cdp.detach()
+            self._capsolver_cdp = None
+            raise CapSolverError("USER_AGENT_OVERRIDE_FAILED")
 
     def record_external_recaptcha_outcome(
         self,
@@ -421,13 +713,33 @@ class BrowserSession:
         status: str,
         error_code: str | None = None,
     ) -> None:
-        if solution.source != "2captcha" or not solution.attempt_id:
+        if solution.source not in {"2captcha", "capsolver"} or not solution.attempt_id:
             return
         self._captcha_budget().record_portal_outcome(
             solution.attempt_id,
             status=status,
             error_code=error_code,
         )
+        if (
+            solution.source != "2captcha"
+            or not solution.provider_task_id
+            or status not in {"accepted", "rejected"}
+        ):
+            return
+        client = TwoCaptchaClient(
+            self.settings.two_captcha_api_key or "",
+            timeout_seconds=self.settings.two_captcha_timeout_seconds,
+            poll_seconds=self.settings.two_captcha_poll_seconds,
+        )
+        try:
+            task_id = int(solution.provider_task_id)
+            if status == "accepted":
+                client.report_correct(task_id)
+            else:
+                client.report_incorrect(task_id)
+        except (TwoCaptchaError, ValueError, TypeError) as exc:
+            code = exc.code if isinstance(exc, TwoCaptchaError) else "INVALID_TASK_ID"
+            logger.warning("Could not report sanitized 2Captcha feedback (%s)", code)
 
     def _captcha_budget(self) -> CaptchaBudgetStore:
         return CaptchaBudgetStore(
@@ -460,30 +772,70 @@ class BrowserSession:
                     if exc.reason == StopReason.CAPTCHA_REJECTED
                     else "indeterminate"
                 ),
-                error_code=exc.reason.value,
+                error_code=sanitized_portal_outcome(
+                    exc.reason, response.status, response.body_text
+                ),
             )
             if (
                 exc.reason != StopReason.CAPTCHA_REJECTED
-                or solution.source == "2captcha"
+                or solution.source in {"2captcha", "capsolver"}
                 or not self.has_external_recaptcha_fallback
             ):
                 raise
-            logger.info("Retrying rejected login CAPTCHA once with 2Captcha")
+            logger.info("Retrying rejected login CAPTCHA once with the external solver")
             solution = self.generate_external_recaptcha_solution("login")
             response = self._fetch_login(username, password, solution.token)
             try:
                 self._check_login_response(response)
             except SafetyStopException as external_exc:
-                self.record_external_recaptcha_outcome(
-                    solution,
-                    status=(
-                        "rejected"
-                        if external_exc.reason == StopReason.CAPTCHA_REJECTED
-                        else "indeterminate"
-                    ),
-                    error_code=external_exc.reason.value,
+                may_try_secondary = (
+                    external_exc.reason == StopReason.CAPTCHA_REJECTED
+                    and solution.source == "capsolver"
+                    and self.has_secondary_external_recaptcha_fallback
                 )
-                raise
+                if not may_try_secondary:
+                    self.record_external_recaptcha_outcome(
+                        solution,
+                        status=(
+                            "rejected"
+                            if external_exc.reason == StopReason.CAPTCHA_REJECTED
+                            else "indeterminate"
+                        ),
+                        error_code=sanitized_portal_outcome(
+                            external_exc.reason, response.status, response.body_text
+                        ),
+                    )
+                    raise
+                logger.info(
+                    "Retrying explicitly rejected CapSolver login token once with 2Captcha"
+                )
+                rejected_solution = solution
+                try:
+                    solution = self.generate_secondary_external_recaptcha_solution("login")
+                finally:
+                    self.record_external_recaptcha_outcome(
+                        rejected_solution,
+                        status="rejected",
+                        error_code=sanitized_portal_outcome(
+                            external_exc.reason, response.status, response.body_text
+                        ),
+                    )
+                response = self._fetch_login(username, password, solution.token)
+                try:
+                    self._check_login_response(response)
+                except SafetyStopException as secondary_exc:
+                    self.record_external_recaptcha_outcome(
+                        solution,
+                        status=(
+                            "rejected"
+                            if secondary_exc.reason == StopReason.CAPTCHA_REJECTED
+                            else "indeterminate"
+                        ),
+                        error_code=sanitized_portal_outcome(
+                            secondary_exc.reason, response.status, response.body_text
+                        ),
+                    )
+                    raise
             self.record_external_recaptcha_outcome(solution, status="accepted")
             return
         self.record_external_recaptcha_outcome(solution, status="accepted")
@@ -548,7 +900,13 @@ class BrowserSession:
             response.headers,
             response.body_text,
         )
-        if reason in {StopReason.CAPTCHA_REJECTED, StopReason.WAF_CHALLENGE}:
+        if reason in {
+            StopReason.CAPTCHA_REJECTED,
+            StopReason.DAILY_LIMIT,
+            StopReason.RATE_LIMIT,
+            StopReason.TEMPORARY_UNAVAILABLE,
+            StopReason.WAF_CHALLENGE,
+        }:
             raise SafetyStopException(
                 reason,
                 f"CBRS login stopped: {reason.value}.",
@@ -558,7 +916,10 @@ class BrowserSession:
         if response.status == 200:
             return
         if response.status in {400, 401, 422}:
-            raise CredentialsRejectedError("CBRS rejected the configured account credentials.")
+            raise CredentialsRejectedError(
+                status=response.status,
+                response_code=sanitized_portal_response_code(response.body_text),
+            )
         detail = f"CBRS login returned unexpected HTTP {response.status}."
         raise RuntimeError(detail)
 
@@ -653,12 +1014,17 @@ class BrowserSession:
 
     def close(self) -> None:
         try:
+            if self._capsolver_cdp is not None:
+                try:
+                    self._capsolver_cdp.detach()
+                finally:
+                    self._capsolver_cdp = None
             if self._context is not None:
                 self._context.close()
                 self._context = None
         finally:
             if self._playwright is not None:
-                self._playwright.stop()
+                _release_sync_playwright(self._playwright)
                 self._playwright = None
 
     def __enter__(self) -> BrowserSession:

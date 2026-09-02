@@ -140,6 +140,103 @@ def test_pool_account_proxy_url_env_resolves_to_account_settings(
     assert runtime_settings.proxy_url == "http://user:pass@example.test:33335"
 
 
+def test_pool_account_proxy_provider_defaults_and_validates(tmp_path: Path) -> None:
+    from cbrs.account_pool import load_account_pool_config
+
+    settings = load_settings({"CBRS_PROFILE_DIR": ".cbrs/chrome-profile"}, root=tmp_path)
+    config_path = tmp_path / "pool.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {"id": "generic", "proxy_brand": "Proxy-Cheap"},
+                    {"id": "dedicated", "proxy_provider": "2captcha_dedicated_isp"},
+                    {"id": "sticky", "proxy_provider": "2captcha_residential_sticky"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_account_pool_config(settings, path=config_path)
+
+    assert loaded.accounts[0].proxy_provider == "generic_static"
+    assert loaded.accounts[0].proxy_brand == "Proxy-Cheap"
+    assert loaded.accounts[1].proxy_provider == "2captcha_dedicated_isp"
+    assert loaded.accounts[2].proxy_provider == "2captcha_residential_sticky"
+
+    config_path.write_text(
+        json.dumps({"accounts": [{"id": "bad", "proxy_provider": "rotating_residential"}]}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="proxy_provider"):
+        load_account_pool_config(settings, path=config_path)
+
+
+def test_dataimpulse_account_composes_proxy_from_common_secret_and_safe_port(
+    tmp_path: Path,
+) -> None:
+    from cbrs.account_pool import account_settings, load_account_pool_config
+
+    settings = load_settings(
+        {
+            "DATAIMPULSE_PROXY_LOGIN": "proxy-login",
+            "DATAIMPULSE_PROXY_PASSWORD": "proxy-password",
+            "DATAIMPULSE_COUNTRY": "cl",
+            "DATAIMPULSE_STICKY_TTL_MINUTES": "120",
+        },
+        root=tmp_path,
+    )
+    config_path = tmp_path / "pool.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "id": "a1",
+                        "proxy_provider": "dataimpulse_residential_sticky",
+                        "proxy_brand": "DataImpulse",
+                        "dataimpulse_port": 10000,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_account_pool_config(settings, path=config_path)
+    runtime = account_settings(settings, config.accounts[0])
+
+    assert runtime.proxy_url is not None
+    assert "gw.dataimpulse.com:10000" in runtime.proxy_url
+    assert "cr.cl%3Bsessttl.120" in runtime.proxy_url
+
+
+def test_dataimpulse_account_rejects_ambiguous_full_proxy_url(tmp_path: Path) -> None:
+    from cbrs.account_pool import load_account_pool_config
+
+    settings = load_settings({}, root=tmp_path)
+    config_path = tmp_path / "pool.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "id": "a1",
+                        "proxy_provider": "dataimpulse_residential_sticky",
+                        "dataimpulse_port": 10000,
+                        "proxy_url_env": "A1_PROXY_URL",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="not proxy_url_env"):
+        load_account_pool_config(settings, path=config_path)
+
+
 def test_pool_account_supports_only_secret_references_and_per_account_quota(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -798,6 +895,44 @@ def test_pool_waits_when_daily_capacity_is_exhausted(tmp_path: Path) -> None:
     assert status["alert"]["title"] == "Pool diario agotado"
 
 
+def test_dashboard_status_releases_an_expired_timed_pause_without_worker(
+    tmp_path: Path,
+) -> None:
+    from cbrs.account_pool import (
+        AccountPoolStore,
+        dashboard_status,
+        load_account_pool_config,
+    )
+
+    settings = load_settings(
+        {"CBRS_PROFILE_DIR": ".cbrs/chrome-profile", "CBRS_OUTPUT_DIR": "outputs"},
+        root=tmp_path,
+    )
+    config = load_account_pool_config(settings)
+    store = AccountPoolStore(tmp_path / ".cbrs" / "pool" / "pool.sqlite3")
+    store.create_run(run_id="live", dry_run=False, config=config, dashboard_url=None)
+    store.pause_account(
+        "live",
+        "ejecutivo_1",
+        reason="temporary_unavailable",
+        cooldown_seconds=1,
+    )
+    with store._connect() as db:
+        db.execute(
+            """
+            UPDATE accounts SET resume_at = '2000-01-01T00:00:00+00:00'
+            WHERE run_id = 'live' AND account_id = 'ejecutivo_1'
+            """
+        )
+
+    status = dashboard_status(store, config=config)
+    accounts = {account["account_id"]: account for account in status["accounts"]}
+
+    assert accounts["ejecutivo_1"]["status"] == "available"
+    assert accounts["ejecutivo_1"]["paused_reason"] is None
+    assert accounts["ejecutivo_1"]["resume_at"] is None
+
+
 def test_pool_dashboard_api_and_html_are_sanitized(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -849,6 +984,7 @@ def test_pool_dashboard_api_and_html_are_sanitized(
                             "username": "operator.name@example.test",
                             "password": "test-password-not-returned",
                             "proxy_url": "http://proxy-user:proxy-password@proxy.example.test:8080",
+                            "proxy_provider": "2captcha_residential_sticky",
                             "daily_quota": 20,
                         }
                     ]
@@ -866,6 +1002,23 @@ def test_pool_dashboard_api_and_html_are_sanitized(
     assert "Pool de Consultas CBRS" in html
     assert "Consultas disponibles hoy" in html
     assert "account.username_prefix || account.label" in html
+    assert 'class="account-route"' in html
+    assert "IP / host proxy" in html
+    assert "Marca / servicio" in html
+    assert "País de salida" in html
+    assert "account.proxy_endpoint" in html
+    assert "IP de salida · ID seguro" not in html
+    assert "Ruta validada" in html
+    assert "Cuenta autenticada" in html
+    assert "Formulario protegido confirmado" in html
+    assert "Evidencia DOM" in html
+    assert "Formulario protegido visible" in html
+    assert "Login API aceptado" in html
+    assert "Última consulta protegida" in html
+    assert "LOGUEADA · BÚSQUEDA BLOQUEADA" in html
+    assert "NO LOGUEADA" in html
+    assert "Chrome detenido" in html
+    assert "Cupo: ${escapeHtml(eligibilityLabel)}" in html
     assert payload["accounts"][0]["label"] == "operator.name"
     assert "job-account-icon" in html
     assert "const initial" in html
@@ -889,6 +1042,13 @@ def test_pool_dashboard_api_and_html_are_sanitized(
     assert "renderCaptchaAttempts" in html
     assert "captcha_attempts" in html
     assert 'class="jobs-table captcha-attempts-table"' in html
+    assert "Servicio CAPTCHA" in html
+    assert 'class="captcha-provider ${provider.css}"' in html
+    assert 'label: "CapSolver"' in html
+    assert 'label: "2Captcha"' in html
+    assert 'class="captcha-action" tabindex="0" title="${escapeHtml(attempt.action || "-")}"' in html
+    assert "text-overflow: ellipsis" in html
+    assert "Pasa el cursor sobre una acción" in html
     assert ".jobs-table thead th { position: static;" in html
     assert "restore probado" in html
     assert "recovery-spinner" in html
@@ -935,6 +1095,10 @@ def test_pool_dashboard_api_and_html_are_sanitized(
         (settings.profile_dir.parent / "control" / "account-configuration.json").read_text()
     )
     assert request_payload["accounts"][0]["id"] == "ejecutivo_1"
+    assert (
+        request_payload["accounts"][0]["proxy_provider"]
+        == "2captcha_residential_sticky"
+    )
     assert "test-password-not-returned" not in json.dumps(account_payload)
 
 

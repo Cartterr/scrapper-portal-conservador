@@ -31,7 +31,7 @@ class CaptchaBudgetStore:
         *,
         daily_limit: int,
         circuit_seconds: float,
-        rejection_cooldown_seconds: float = 21_600.0,
+        rejection_cooldown_seconds: float = 300.0,
     ) -> None:
         self.path = Path(path)
         self.daily_limit = int(daily_limit)
@@ -45,6 +45,7 @@ class CaptchaBudgetStore:
         *,
         account_id: str,
         action: str,
+        provider: str = "2captcha",
         require_manual_authorization: bool = False,
     ) -> CaptchaReservation:
         now = _utc_now()
@@ -73,7 +74,8 @@ class CaptchaBudgetStore:
             if require_manual_authorization:
                 authorization = db.execute(
                     """
-                    SELECT remaining, expires_at FROM captcha_manual_authorizations
+                    SELECT remaining, expires_at, event_id
+                    FROM captcha_manual_authorizations
                     WHERE account_id = ?
                     """,
                     (account_id,),
@@ -84,6 +86,16 @@ class CaptchaBudgetStore:
                     or not authorization["expires_at"]
                     or str(authorization["expires_at"]) <= now
                 ):
+                    if authorization and authorization["event_id"]:
+                        db.execute(
+                            """
+                            UPDATE captcha_authorization_events
+                            SET status = 'expired', reason = 'authorization_expired',
+                                finished_at = ?
+                            WHERE event_id = ? AND status = 'armed'
+                            """,
+                            (now, authorization["event_id"]),
+                        )
                     db.execute(
                         "DELETE FROM captcha_manual_authorizations WHERE account_id = ?",
                         (account_id,),
@@ -98,24 +110,36 @@ class CaptchaBudgetStore:
             if used >= self.daily_limit:
                 raise CaptchaBudgetError("DAILY_LIMIT")
             if require_manual_authorization:
+                event_id = str(authorization["event_id"] or "")
                 db.execute(
                     "DELETE FROM captcha_manual_authorizations WHERE account_id = ?",
                     (account_id,),
                 )
+                if event_id:
+                    db.execute(
+                        """
+                        UPDATE captcha_authorization_events
+                        SET status = 'consumed', reason = 'paid_task_reserved',
+                            finished_at = ?
+                        WHERE event_id = ? AND status = 'armed'
+                        """,
+                        (now, event_id),
+                    )
             attempt_id = f"captcha-{secrets.token_hex(8)}"
             db.execute(
                 """
                 INSERT INTO captcha_attempts(
-                    attempt_id, quota_date, account_id, action, status, started_at
-                ) VALUES (?, ?, ?, ?, 'reserved', ?)
+                    attempt_id, quota_date, account_id, action, provider, status, started_at
+                ) VALUES (?, ?, ?, ?, ?, 'reserved', ?)
                 """,
-                (attempt_id, quota_date, account_id, action[:80], now),
+                (attempt_id, quota_date, account_id, action[:80], provider[:40], now),
             )
         return CaptchaReservation(attempt_id, quota_date)
 
-    def arm_manual(self, *, account_id: str) -> None:
+    def arm_manual(self, *, account_id: str) -> str:
         now = _utc_now()
         quota_date = datetime.now(LOCAL_TZ).date().isoformat()
+        event_id = f"authorization-{secrets.token_hex(8)}"
         expires_at = (
             datetime.now(timezone.utc) + timedelta(minutes=15)
         ).isoformat(timespec="seconds")
@@ -148,17 +172,98 @@ class CaptchaBudgetStore:
             )
             if used >= self.daily_limit:
                 raise CaptchaBudgetError("DAILY_LIMIT")
+            existing = db.execute(
+                """
+                SELECT event_id FROM captcha_manual_authorizations
+                WHERE account_id = ?
+                """,
+                (account_id,),
+            ).fetchone()
+            if existing and existing["event_id"]:
+                db.execute(
+                    """
+                    UPDATE captcha_authorization_events
+                    SET status = 'replaced', reason = 'new_authorization_issued',
+                        finished_at = ?
+                    WHERE event_id = ? AND status = 'armed'
+                    """,
+                    (now, existing["event_id"]),
+                )
+            db.execute(
+                """
+                INSERT INTO captcha_authorization_events(
+                    event_id, account_id, status, armed_at, expires_at
+                ) VALUES (?, ?, 'armed', ?, ?)
+                """,
+                (event_id, account_id, now, expires_at),
+            )
             db.execute(
                 """
                 INSERT INTO captcha_manual_authorizations(
-                    account_id, remaining, armed_at, expires_at
-                ) VALUES (?, 1, ?, ?)
+                    account_id, remaining, armed_at, expires_at, event_id
+                ) VALUES (?, 1, ?, ?, ?)
                 ON CONFLICT(account_id) DO UPDATE SET
                     remaining = 1,
                     armed_at = excluded.armed_at,
-                    expires_at = excluded.expires_at
+                    expires_at = excluded.expires_at,
+                    event_id = excluded.event_id
                 """,
-                (account_id, now, expires_at),
+                (account_id, now, expires_at, event_id),
+            )
+        return event_id
+
+    def finish_manual_authorization(
+        self,
+        *,
+        account_id: str,
+        status: str,
+        reason: str,
+    ) -> None:
+        if status not in {"not_required", "cancelled", "expired"}:
+            raise ValueError("Invalid manual CAPTCHA authorization outcome.")
+        now = _utc_now()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            authorization = db.execute(
+                """
+                SELECT armed_at, expires_at, event_id
+                FROM captcha_manual_authorizations WHERE account_id = ?
+                """,
+                (account_id,),
+            ).fetchone()
+            if not authorization:
+                return
+            event_id = str(authorization["event_id"] or "")
+            if event_id:
+                db.execute(
+                    """
+                    UPDATE captcha_authorization_events
+                    SET status = ?, reason = ?, finished_at = ?
+                    WHERE event_id = ?
+                    """,
+                    (status, reason[:80], now, event_id),
+                )
+            else:
+                db.execute(
+                    """
+                    INSERT INTO captcha_authorization_events(
+                        event_id, account_id, status, reason,
+                        armed_at, finished_at, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"authorization-{secrets.token_hex(8)}",
+                        account_id,
+                        status,
+                        reason[:80],
+                        authorization["armed_at"],
+                        now,
+                        authorization["expires_at"],
+                    ),
+                )
+            db.execute(
+                "DELETE FROM captcha_manual_authorizations WHERE account_id = ?",
+                (account_id,),
             )
 
     def manual_armed(self, *, account_id: str) -> bool:
@@ -171,6 +276,82 @@ class CaptchaBudgetStore:
                 (account_id, _utc_now()),
             ).fetchone()
         return bool(row and int(row["remaining"]) > 0)
+
+    def automatic_enabled(self) -> bool:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT automatic_enabled FROM captcha_preferences WHERE singleton = 1"
+            ).fetchone()
+        return bool(row and int(row["automatic_enabled"]))
+
+    def set_automatic_enabled(self, enabled: bool) -> bool:
+        now = _utc_now()
+        with self._connect() as db:
+            db.execute(
+                """
+                INSERT INTO captcha_preferences(singleton, automatic_enabled, updated_at)
+                VALUES (1, ?, ?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    automatic_enabled = excluded.automatic_enabled,
+                    updated_at = excluded.updated_at
+                """,
+                (1 if enabled else 0, now),
+            )
+        return bool(enabled)
+
+    def record_diagnostic_attempt(
+        self,
+        *,
+        account_id: str,
+        action: str,
+        provider: str = "2captcha",
+        status: str,
+        error_code: str | None = None,
+        cost_usd: float | None = None,
+        latency_seconds: float | None = None,
+        portal_status: str = "not_submitted",
+        portal_error_code: str | None = None,
+    ) -> str:
+        """Persist a sanitized paid-solver probe run outside the worker flow."""
+        if status not in {"succeeded", "failed"}:
+            raise ValueError("Invalid diagnostic CAPTCHA attempt status.")
+        if portal_status not in {
+            "accepted",
+            "rejected",
+            "indeterminate",
+            "not_submitted",
+        }:
+            raise ValueError("Invalid diagnostic CAPTCHA portal outcome.")
+        now = _utc_now()
+        quota_date = datetime.now(LOCAL_TZ).date().isoformat()
+        attempt_id = f"captcha-diagnostic-{secrets.token_hex(8)}"
+        with self._connect() as db:
+            db.execute(
+                """
+                INSERT INTO captcha_attempts(
+                    attempt_id, quota_date, account_id, action, provider, status,
+                    error_code, cost_usd, latency_seconds, started_at, finished_at,
+                    portal_status, portal_error_code, portal_finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    quota_date,
+                    account_id[:80],
+                    action[:80],
+                    provider[:40],
+                    status,
+                    error_code[:80] if error_code else None,
+                    cost_usd,
+                    latency_seconds,
+                    now,
+                    now,
+                    portal_status,
+                    portal_error_code[:80] if portal_error_code else None,
+                    now,
+                ),
+            )
+        return attempt_id
 
     def finish(
         self,
@@ -306,6 +487,7 @@ class CaptchaBudgetStore:
             "circuit_reason": str(circuit["reason"]) if circuit else None,
             "external_fallback_disabled": bool(circuit["disabled"]) if circuit else False,
             "manual_authorizations_armed": armed,
+            "automatic_enabled": self.automatic_enabled(),
         }
 
     def recent_attempts(self, *, limit: int = 50) -> list[dict[str, object]]:
@@ -314,7 +496,7 @@ class CaptchaBudgetStore:
         with self._connect() as db:
             rows = db.execute(
                 """
-                SELECT account_id, action, status, error_code, cost_usd,
+                SELECT account_id, action, provider, status, error_code, cost_usd,
                        latency_seconds, started_at, finished_at,
                        portal_status, portal_error_code, portal_finished_at,
                        paid_retry_blocked_until
@@ -325,6 +507,47 @@ class CaptchaBudgetStore:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def recent_activity(self, *, limit: int = 50) -> list[dict[str, object]]:
+        """Return paid tasks and manual authorizations as one sanitized timeline."""
+        limit = max(1, min(int(limit), 100))
+        activity = [
+            {"kind": "solve", **attempt}
+            for attempt in self.recent_attempts(limit=limit)
+        ]
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT account_id, status, reason, armed_at, finished_at, expires_at
+                FROM captcha_authorization_events
+                ORDER BY armed_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        for row in rows:
+            status = str(row["status"])
+            activity.append(
+                {
+                    "kind": "authorization",
+                    "provider": "external",
+                    "account_id": row["account_id"],
+                    "action": "manual_authorization",
+                    "status": status,
+                    "error_code": row["reason"],
+                    "cost_usd": None,
+                    "latency_seconds": None,
+                    "started_at": row["armed_at"],
+                    "finished_at": row["finished_at"],
+                    "portal_status": "not_required" if status == "not_required" else None,
+                    "portal_error_code": row["reason"],
+                    "portal_finished_at": row["finished_at"],
+                    "paid_retry_blocked_until": None,
+                    "authorization_expires_at": row["expires_at"],
+                }
+            )
+        activity.sort(key=lambda item: str(item.get("started_at") or ""), reverse=True)
+        return activity[:limit]
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=30)
@@ -341,6 +564,7 @@ class CaptchaBudgetStore:
                     quota_date TEXT NOT NULL,
                     account_id TEXT NOT NULL,
                     action TEXT NOT NULL,
+                    provider TEXT NOT NULL DEFAULT '2captcha',
                     status TEXT NOT NULL,
                     error_code TEXT,
                     cost_usd REAL,
@@ -365,7 +589,22 @@ class CaptchaBudgetStore:
                     account_id TEXT PRIMARY KEY,
                     remaining INTEGER NOT NULL CHECK(remaining BETWEEN 0 AND 1),
                     armed_at TEXT NOT NULL,
+                    expires_at TEXT,
+                    event_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS captcha_authorization_events (
+                    event_id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason TEXT,
+                    armed_at TEXT NOT NULL,
+                    finished_at TEXT,
                     expires_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS captcha_preferences (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    automatic_enabled INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
                 );
                 """
             )
@@ -387,18 +626,29 @@ class CaptchaBudgetStore:
                 db.execute(
                     "ALTER TABLE captcha_manual_authorizations ADD COLUMN expires_at TEXT"
                 )
+            if "event_id" not in authorization_columns:
+                db.execute(
+                    "ALTER TABLE captcha_manual_authorizations ADD COLUMN event_id TEXT"
+                )
             attempt_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(captcha_attempts)").fetchall()
             }
             for name in (
+                "provider",
                 "portal_status",
                 "portal_error_code",
                 "portal_finished_at",
                 "paid_retry_blocked_until",
             ):
                 if name not in attempt_columns:
-                    db.execute(f"ALTER TABLE captcha_attempts ADD COLUMN {name} TEXT")
+                    if name == "provider":
+                        db.execute(
+                            "ALTER TABLE captcha_attempts ADD COLUMN provider "
+                            "TEXT NOT NULL DEFAULT '2captcha'"
+                        )
+                    else:
+                        db.execute(f"ALTER TABLE captcha_attempts ADD COLUMN {name} TEXT")
 
 
 def _utc_now() -> str:

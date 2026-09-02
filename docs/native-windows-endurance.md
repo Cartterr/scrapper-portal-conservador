@@ -5,22 +5,28 @@ Python y restic nativos. No usa WSL, Docker ni máquinas virtuales.
 
 ## Límites y distribución
 
-- Cuentas CBRS: tres, cada una con su perfil y un proxy Proxy-Cheap Chile static
-  residential IPv4 distinto.
+- Validación finita: tres cuentas, cada una con su perfil y una ruta DataImpulse
+  residential sticky de Chile distinta, limitada a 120 minutos.
 - Selección: round-robin durable compartido por jobs production y endurance.
-- CAPTCHA: token Enterprise v3 del navegador primero. Un rechazo pausa la cuenta;
-  solo el operador puede autorizar un solve pagado `RecaptchaV3TaskProxyless` de
-  un solo uso para el siguiente intento.
-- Fallback pagado: máximo global 10 intentos/día; circuito 15 minutos ante
+- CAPTCHA: token Enterprise v3 del navegador primero. El control grande
+  **🤖 2CAPTCHA AUTOMÁTICO** permite al operador autorizar fallback pagado
+  `RecaptchaV3TaskProxyless` después de un rechazo real; desactivado exige una
+  autorización individual.
+- Fallback pagado: máximo global 60 intentos/día; circuito 15 minutos ante
   red, timeout, capacidad, autenticación o saldo cero.
 - Endurance: una sola solicitud outstanding, prioridad baja, 10 minutos después
   de terminar; jamás recupera intervalos perdidos.
-- Cupo: 15 jobs endurance por cuenta/día y reserva de cinco de las 20 consultas
-  para production. `quota_exhaustion_test_mode` solo se habilita manualmente en
-  una aceptación aislada.
+- Cupo: 20 jobs combinados por cuenta/día y 60 en total. Producción y endurance
+  comparten ese mismo límite, sin una reserva artificial que detenga antes la
+  prueba larga.
 
-El fixture inicial es `foja=9441`, `numero=4580`, `year=1980`. El plan se instala
-deshabilitado porque primero deben provisionarse y aprobarse los tres egresos.
+El fixture inicial es `foja=9441`, `numero=4580`, `year=1980`, con
+`sample_pages=3`. Endurance publica un PDF claramente marcado
+`test-sample-max3p`; nunca descarga las 44 páginas del tomo durante una prueba.
+Esto reduce tiempo y tráfico proxy. El número de páginas no aumenta por sí solo
+el costo de 2Captcha: el solve se asocia a la acción protegida, no a cada imagen.
+El plan se instala deshabilitado porque primero deben provisionarse y aprobarse
+los tres egresos.
 
 ## Instalación
 
@@ -47,8 +53,11 @@ C:\ProgramData\CBRS\cbrs.env
 C:\ProgramData\CBRS\restic-password
 ```
 
-Provisionar manualmente tres endpoints Proxy-Cheap. Después de configurar las
-cuentas y proxies, ejecutar un primer backup desde el entorno protegido.
+Comprar tráfico residencial DataImpulse tras confirmación financiera y
+provisionar tres puertos sticky Chile de 120 minutos. Después de configurar las cuentas y proxies,
+ejecutar un primer backup desde el entorno protegido. Para operación larga, el
+worker renueva un egreso vencido únicamente después de los gates completos y
+archiva el baseline saneado anterior.
 
 Ingresar las tres credenciales CBRS directamente en el prompt local. Las
 contraseñas no se muestran ni se incluyen en la línea de comandos:
@@ -71,8 +80,9 @@ contraseñas no se muestran ni se incluyen en la línea de comandos:
 ```
 
 Readiness exige Chrome/restic/tareas, layout `G:` + `E:`, ACL restringida,
-transporte browser-only, tres URLs distintas, tres hashes de egreso aprobados,
-país `CL`, saldo 2Captcha positivo, backup exitoso y ausencia de lease stale.
+transporte browser-only, credenciales proxy comunes protegidas, tres puertos
+sticky distintos, tres hashes de egreso aprobados, país `CL`, saldo del solver
+configurado, backup exitoso y ausencia de lease stale.
 La consulta de saldo no crea una tarea CAPTCHA.
 
 Tras aprobar los baselines, habilitar `enabled` en
@@ -138,8 +148,20 @@ no catch-up, transporte de PDF por navegador y bind loopback permanecen
 bloqueados como protecciones del sistema.
 
 Para recuperación manual: pausar endurance, detener el worker, esperar que el
-perfil quede liberado y abrir solamente la cuenta afectada en modo headed. El
-egreso nuevo nunca se autoaprueba.
+perfil quede liberado y abrir solamente la cuenta afectada en modo headed. Un
+egreso residencial nuevo solo se adopta automáticamente si proveedor, tráfico,
+Chile, CBRS, reCAPTCHA y unicidad pasan; los demás proveedores son manuales.
+
+La recuperación completa, la relación obligatoria cuenta/perfil/proxy y la
+diferencia entre una cuenta elegible y un navegador realmente autenticado se
+documentan en
+[`persistent-account-session-recovery.md`](persistent-account-session-recovery.md).
+No se debe diagnosticar una cuenta desde el perfil o proxy de otra, ni cerrar
+Chrome al terminar cada PDF. El worker actual mantiene un contexto por cuenta
+durante su vida mediante `_PersistentAccountBrowsers`.
+
+La configuración, recuperación y rotación DataImpulse se documentan en
+[`dataimpulse-cbrs-operations.md`](dataimpulse-cbrs-operations.md).
 
 ```powershell
 .\deploy\windows\Open-CbrsNativeRecovery.ps1 `

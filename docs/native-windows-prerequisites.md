@@ -13,8 +13,8 @@
 
 - Tres cuentas CBRS nominales autorizadas, cada una con cuota diaria 20.
 - Autorización escrita para repetir el fixture `9441 / 4580 / 1980`.
-- Tres Proxy-Cheap Chile static residential IPv4 distintos, comprados y
-  provisionados manualmente.
+- 1 GB de tráfico residential 2Captcha y tres sesiones sticky de Chile de 120
+  minutos, distintas y provisionadas manualmente.
 - Una cuenta 2Captcha con saldo para reCAPTCHA v3 Enterprise y autorización para
   un máximo global de 10 solves diarios.
 - Reserva production: cinco slots por cuenta; endurance: máximo 15 por cuenta.

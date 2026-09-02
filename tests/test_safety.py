@@ -14,10 +14,10 @@ def test_classifies_daily_limit() -> None:
     assert reason == StopReason.DAILY_LIMIT
 
 
-def test_classifies_captcha_rejection() -> None:
+def test_classifies_generic_retry_code_as_temporary_unavailable() -> None:
     reason = classify_response(400, {}, {"code": "intente-mas-tarde"})
 
-    assert reason == StopReason.CAPTCHA_REJECTED
+    assert reason == StopReason.TEMPORARY_UNAVAILABLE
 
 
 def test_classifies_temporary_unavailable_message() -> None:

@@ -7,14 +7,15 @@
       "input": {
         "foja": 9441,
         "numero": 4580,
-        "year": 1980
+        "year": 1980,
+        "sample_pages": 3
       }
     }
   ],
-  "cooldown_seconds": 600,
+  "cooldown_seconds": 300,
   "max_outstanding_jobs": 1,
-  "jobs_per_account_per_day": 15,
-  "production_reserve_per_account": 5,
+  "jobs_per_account_per_day": 20,
+  "production_reserve_per_account": 0,
   "no_catch_up": true,
   "quota_exhaustion_test_mode": false
 }

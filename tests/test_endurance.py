@@ -83,7 +83,7 @@ def test_endurance_cooldown_does_not_catch_up(tmp_path):
     assert len([job for job in store.list_jobs() if job["source"] == "endurance"]) == 2
 
 
-def test_endurance_allocation_stops_at_fifteen_but_production_reserve_remains(tmp_path):
+def test_endurance_and_production_share_the_full_daily_account_quota(tmp_path):
     path = tmp_path / "pool.sqlite3"
     pool_store = AccountPoolStore(path)
     store = JobStore(path)
@@ -133,7 +133,7 @@ def test_endurance_allocation_stops_at_fifteen_but_production_reserve_remains(tm
         run_id="r1", config=config, quota_date=quota_date, source="production"
     )
 
-    assert endurance_account.account_id == "a2"
+    assert endurance_account.account_id == "a1"
     assert production_account.account_id == "a1"
 
 
@@ -214,6 +214,18 @@ def test_manual_captcha_authorization_is_one_shot_and_cannot_accumulate(tmp_path
         store.reserve(
             account_id="a1", action="search", require_manual_authorization=True
         )
+    store.arm_manual(account_id="a1")
+    store.arm_manual(account_id="a1")
+    assert store.status()["manual_authorizations_armed"] == 1
+    reservation = store.reserve(
+        account_id="a1", action="search", require_manual_authorization=True
+    )
+    store.finish(reservation, status="succeeded")
+    assert store.manual_armed(account_id="a1") is False
+    with pytest.raises(CaptchaBudgetError, match="MANUAL_AUTH_REQUIRED"):
+        store.reserve(
+            account_id="a1", action="search", require_manual_authorization=True
+        )
 
 
 def test_manual_captcha_authorization_expires(tmp_path):
@@ -233,15 +245,55 @@ def test_manual_captcha_authorization_expires(tmp_path):
         store.reserve(
             account_id="a1", action="search", require_manual_authorization=True
         )
-    store.arm_manual(account_id="a1")
-    store.arm_manual(account_id="a1")
-    assert store.status()["manual_authorizations_armed"] == 1
-    reservation = store.reserve(
-        account_id="a1", action="search", require_manual_authorization=True
+
+
+def test_manual_authorization_activity_records_not_required_without_paid_attempt(tmp_path):
+    store = CaptchaBudgetStore(
+        tmp_path / "captcha.sqlite3", daily_limit=10, circuit_seconds=900
     )
-    store.finish(reservation, status="succeeded")
+    store.arm_manual(account_id="a1")
+    store.finish_manual_authorization(
+        account_id="a1",
+        status="not_required",
+        reason="no_waiting_captcha_job",
+    )
+
+    activity = store.recent_activity(limit=5)
+    assert activity[0]["kind"] == "authorization"
+    assert activity[0]["status"] == "not_required"
+    assert activity[0]["portal_status"] == "not_required"
+    assert activity[0]["error_code"] == "no_waiting_captcha_job"
+    assert store.recent_attempts() == []
+    assert store.status()["attempts"] == 0
     assert store.manual_armed(account_id="a1") is False
-    with pytest.raises(CaptchaBudgetError, match="MANUAL_AUTH_REQUIRED"):
-        store.reserve(
-            account_id="a1", action="search", require_manual_authorization=True
-        )
+
+
+def test_manual_authorization_activity_is_consumed_when_paid_task_is_reserved(tmp_path):
+    store = CaptchaBudgetStore(
+        tmp_path / "captcha.sqlite3", daily_limit=10, circuit_seconds=900
+    )
+    store.arm_manual(account_id="a1")
+    store.reserve(
+        account_id="a1",
+        action="indice_com_texto",
+        require_manual_authorization=True,
+    )
+
+    authorization = next(
+        item for item in store.recent_activity() if item["kind"] == "authorization"
+    )
+    assert authorization["status"] == "consumed"
+    assert authorization["error_code"] == "paid_task_reserved"
+
+
+def test_automatic_captcha_preference_is_persistent_and_sanitized(tmp_path):
+    path = tmp_path / "captcha.sqlite3"
+    store = CaptchaBudgetStore(path, daily_limit=10, circuit_seconds=900)
+    assert store.automatic_enabled() is False
+
+    assert store.set_automatic_enabled(True) is True
+    reloaded = CaptchaBudgetStore(path, daily_limit=10, circuit_seconds=900)
+    assert reloaded.automatic_enabled() is True
+    assert reloaded.status()["automatic_enabled"] is True
+    assert reloaded.set_automatic_enabled(False) is False
+    assert reloaded.automatic_enabled() is False

@@ -136,6 +136,27 @@ def response_preview(body: Any, *, limit: int = 500) -> str:
     return text
 
 
+def sanitized_portal_response_code(body: Any) -> str | None:
+    """Return only a short, non-secret portal code suitable for diagnostics."""
+    data = body if isinstance(body, Mapping) else _try_json(_body_to_text(body))
+    if not isinstance(data, Mapping):
+        return None
+    raw = str(data.get("code") or "").strip().lower()
+    if not raw:
+        return None
+    normalized = re.sub(r"[^a-z0-9_.-]+", "_", raw).strip("_")
+    return normalized[:80] or None
+
+
+def sanitized_portal_outcome(error: StopReason, status: int, body: Any) -> str:
+    """Describe a stopped portal submission without persisting response bodies."""
+    parts = [error.value, f"http_{int(status)}"]
+    response_code = sanitized_portal_response_code(body)
+    if response_code:
+        parts.append(response_code)
+    return ":".join(parts)[:160]
+
+
 def classify_response(
     status: int,
     headers: Mapping[str, str] | None,
@@ -153,7 +174,10 @@ def classify_response(
         if code == "err-limite":
             return StopReason.DAILY_LIMIT
         if code == "intente-mas-tarde":
-            return StopReason.CAPTCHA_REJECTED
+            # CBRS uses this generic refresh-and-retry response for temporary
+            # portal/security conditions. It is not evidence that reCAPTCHA
+            # rejected the submitted token.
+            return StopReason.TEMPORARY_UNAVAILABLE
         message = str(data.get("msg", "")).lower()
         if any(marker in message for marker in CAPTCHA_MARKERS):
             return StopReason.CAPTCHA_REJECTED
