@@ -73,6 +73,8 @@ WORKER_STALE_SECONDS = 120
 JOB_LEASE_SECONDS = 180
 EXTERNAL_OUTAGE_BACKOFF_KEY = "external_outage_backoff"
 EXTERNAL_OUTAGE_REASON = "temporary_unavailable_all_accounts"
+DATAIMPULSE_ROTATION_REQUEST_KEY = "dataimpulse_rotation_request"
+DATAIMPULSE_ROTATION_RESULT_KEY = "dataimpulse_rotation_result"
 # `temporary_unavailable` is CBRS's generic retry response, not proof of a
 # CAPTCHA failure.  Once every account returns it, however, repeating the same
 # protected request every two minutes only amplifies a route- or portal-wide
@@ -122,6 +124,7 @@ class _ManagedAccountScraper:
     unknown_checks: int = 0
     last_reauth_at: float = 0.0
     last_restart_at: float = 0.0
+    reauth_required: bool = False
 
 
 class _PersistentAccountBrowsers:
@@ -226,7 +229,10 @@ class _PersistentAccountBrowsers:
                     browser.reload_current_page()
                     state = browser.wait_for_commerce_auth_state()
                     entry.unknown_checks = 0
-                if state is CommerceAuthState.LOGIN_GATE:
+                should_reauthenticate = state is CommerceAuthState.LOGIN_GATE or (
+                    state is CommerceAuthState.UNKNOWN and entry.reauth_required
+                )
+                if should_reauthenticate:
                     if now - entry.last_reauth_at < settings.browser_reauth_backoff_seconds:
                         continue
                     entry.last_reauth_at = now
@@ -294,6 +300,8 @@ class _PersistentAccountBrowsers:
             if _looks_like_connection_failure(exc):
                 self.discard(account_id, status="browser_context_failed")
             else:
+                entry.reauth_required = True
+                entry.last_reauth_at = time.monotonic()
                 self.store.set_account_browser_state(
                     account_id,
                     live=True,
@@ -305,6 +313,7 @@ class _PersistentAccountBrowsers:
                 )
             raise
 
+        entry.reauth_required = False
         self.store.set_account_browser_state(
             account_id,
             live=True,
@@ -1866,6 +1875,109 @@ class JobStore:
         with self.connect() as db:
             db.execute("DELETE FROM job_control WHERE key = ?", (key,))
 
+    def request_dataimpulse_rotation(self, account_id: str, *, reason: str) -> dict[str, Any]:
+        """Queue one sanitized rotation request for the active worker owner."""
+        request_id = f"rotation-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(3)}"
+        payload = {
+            "request_id": request_id,
+            "account_id": str(account_id),
+            "reason": redact_text(reason),
+            "status": "pending",
+            "requested_at": utc_now(),
+        }
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute(
+                "SELECT value FROM job_control WHERE key = ?",
+                (DATAIMPULSE_ROTATION_REQUEST_KEY,),
+            ).fetchone()
+            if existing:
+                raise RuntimeError("A DataImpulse rotation request is already pending.")
+            db.execute(
+                "INSERT INTO job_control(key, value, updated_at) VALUES (?, ?, ?)",
+                (DATAIMPULSE_ROTATION_REQUEST_KEY, stable_json(payload), utc_now()),
+            )
+        return payload
+
+    def claim_dataimpulse_rotation_request(self, owner: str) -> dict[str, Any] | None:
+        """Claim a pending request, or reclaim one abandoned by a stale worker."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT value, updated_at FROM job_control WHERE key = ?",
+                (DATAIMPULSE_ROTATION_REQUEST_KEY,),
+            ).fetchone()
+            if not row:
+                return None
+            try:
+                payload = json.loads(str(row["value"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                db.execute(
+                    "DELETE FROM job_control WHERE key = ?",
+                    (DATAIMPULSE_ROTATION_REQUEST_KEY,),
+                )
+                return None
+            status = str(payload.get("status") or "pending")
+            if status == "running" and seconds_since(str(row["updated_at"])) < WORKER_STALE_SECONDS:
+                return None
+            if status not in {"pending", "running"}:
+                return None
+            payload.update({"status": "running", "worker_owner": owner, "started_at": utc_now()})
+            db.execute(
+                "UPDATE job_control SET value = ?, updated_at = ? WHERE key = ?",
+                (stable_json(payload), utc_now(), DATAIMPULSE_ROTATION_REQUEST_KEY),
+            )
+            return payload
+
+    def finish_dataimpulse_rotation_request(
+        self,
+        request_id: str,
+        *,
+        ok: bool,
+        result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        payload = {
+            "request_id": str(request_id),
+            "ok": bool(ok),
+            "status": "completed" if ok else "failed",
+            "completed_at": utc_now(),
+            **dict(result),
+        }
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """
+                INSERT INTO job_control(key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (DATAIMPULSE_ROTATION_RESULT_KEY, stable_json(payload), utc_now()),
+            )
+            row = db.execute(
+                "SELECT value FROM job_control WHERE key = ?",
+                (DATAIMPULSE_ROTATION_REQUEST_KEY,),
+            ).fetchone()
+            if row:
+                try:
+                    current = json.loads(str(row["value"]))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    current = {}
+                if str(current.get("request_id") or "") == str(request_id):
+                    db.execute(
+                        "DELETE FROM job_control WHERE key = ?",
+                        (DATAIMPULSE_ROTATION_REQUEST_KEY,),
+                    )
+        return payload
+
+    def dataimpulse_rotation_result(self) -> dict[str, Any] | None:
+        row = self.get_control(DATAIMPULSE_ROTATION_RESULT_KEY)
+        if not row:
+            return None
+        try:
+            return json.loads(str(row["value"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
     def set_global_cooldown(
         self,
         reason: str,
@@ -2365,6 +2477,17 @@ def run_job_worker(
                         final_status = "cooldown"
                         break
                     continue
+            _process_requested_dataimpulse_rotation(
+                settings=settings,
+                config=config,
+                store=store,
+                pool_store=pool_store,
+                run_id=run_id,
+                browser_pool=browser_pool,
+                worker_id=worker_id,
+                preflight_runner=preflight_runner,
+                proxy_health_runner=proxy_health_runner,
+            )
             endurance.maybe_enqueue()
             job = store.claim_next(worker_id)
             if job is None:
@@ -3263,6 +3386,88 @@ def _rotate_dataimpulse_route(
             },
         )
         return False
+
+
+def _process_requested_dataimpulse_rotation(
+    *,
+    settings: Settings,
+    config: PoolConfig,
+    store: JobStore,
+    pool_store: AccountPoolStore,
+    run_id: str,
+    browser_pool: _PersistentAccountBrowsers,
+    worker_id: str,
+    preflight_runner: Callable[..., Any],
+    proxy_health_runner: Callable[..., Any],
+) -> bool:
+    """Run an explicitly requested rotation inside the exclusive browser owner."""
+    request = store.claim_dataimpulse_rotation_request(worker_id)
+    if not request:
+        return False
+    request_id = str(request.get("request_id") or "")
+    account_id = str(request.get("account_id") or "")
+    account = next(
+        (candidate for candidate in config.accounts if candidate.account_id == account_id),
+        None,
+    )
+    if not account or not account.enabled or not _is_dataimpulse_account(account):
+        store.finish_dataimpulse_rotation_request(
+            request_id,
+            ok=False,
+            result={"account_id": account_id, "reason": "invalid_dataimpulse_account"},
+        )
+        return True
+    before = store.ensure_dataimpulse_route(account.account_id, int(account.dataimpulse_port or 0))
+    ok = _rotate_dataimpulse_route(
+        account,
+        settings,
+        store,
+        pool_store,
+        run_id,
+        browser_pool,
+        preflight_runner,
+        proxy_health_runner,
+        reason=str(request.get("reason") or "operator_requested_recovery"),
+    )
+    after = store.dataimpulse_route(account.account_id) or before
+    failure_reason = None
+    if not ok:
+        latest = next(
+            (
+                event
+                for event in store.recent_events(limit=10)
+                if event.get("account_id") == account.account_id
+                and event.get("event")
+                in {"dataimpulse_route_promoted_auth_failed", "dataimpulse_rotation_failed"}
+            ),
+            None,
+        )
+        if latest:
+            try:
+                failure_reason = json.loads(str(latest.get("data_json") or "{}")).get(
+                    "reason"
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                failure_reason = "rotation_failed"
+    store.finish_dataimpulse_rotation_request(
+        request_id,
+        ok=ok,
+        result={
+            "account_id": account.account_id,
+            "previous_port": int(before["active_port"]),
+            "active_port": int(after["active_port"]),
+            "generation": int(after.get("generation") or 0),
+            "route_status": str(after.get("status") or "unknown"),
+            **({"reason": failure_reason or "rotation_failed"} if not ok else {}),
+        },
+    )
+    store.add_event(
+        "dataimpulse_rotation_request_completed",
+        account_id=account.account_id,
+        level="info" if ok else "error",
+        data={"request_id": request_id, "ok": ok},
+    )
+    return True
 
 
 def _handle_account_safety_stop(

@@ -57,6 +57,28 @@ function New-CbrsHiddenTaskAction {
         -WorkingDirectory $WorkingDirectory
 }
 
+function Stop-CbrsWorkerProcesses {
+    $repoPattern = [regex]::Escape([IO.Path]::GetFullPath($RepoRoot))
+    $deadline = (Get-Date).AddSeconds(20)
+    do {
+        $workers = @(
+            Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+                Where-Object {
+                    $_.CommandLine -match $repoPattern -and
+                    $_.CommandLine -match '(?i)-m\s+cbrs\s+--headless\s+jobs\s+worker'
+                }
+        )
+        if (-not $workers) { return }
+        $parentIds = @($workers | ForEach-Object { [int]$_.ParentProcessId })
+        $leaves = @($workers | Where-Object { [int]$_.ProcessId -notin $parentIds })
+        foreach ($worker in $leaves) {
+            Stop-Process -Id ([int]$worker.ProcessId) -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+    throw 'Verified CBRS worker process tree did not stop after startup rollback.'
+}
+
 $legacyTaskNames = @('CBRS Worker', 'CBRS Dashboard', 'CBRS Daily Backup', 'CBRS Runtime Watchdog')
 $userTaskNames = @('CBRS User Worker', 'CBRS User Dashboard', 'CBRS User Daily Backup', 'CBRS User Runtime Watchdog')
 $taskNames = $legacyTaskNames
@@ -152,6 +174,7 @@ try {
 
     $browserDeadline = [DateTimeOffset]::UtcNow.AddMinutes(3)
     $browserRuntimeReady = $false
+    $browserRecoveryMode = $false
     do {
         Start-Sleep -Seconds 3
         try {
@@ -169,19 +192,42 @@ try {
                 $authenticated -eq $expected -and
                 $protectedForms -eq $expected
             )
+            $workerOwned = @(
+                $status.accounts | Where-Object worker_active
+            ).Count
+            $browserRecoveryMode = (
+                $expected -eq 3 -and
+                $live -ge 1 -and
+                $workerOwned -eq $expected
+            )
         } catch {
             $browserRuntimeReady = $false
         }
     } until ($browserRuntimeReady -or [DateTimeOffset]::UtcNow -ge $browserDeadline)
-    if (-not $browserRuntimeReady) {
+    if (-not $browserRuntimeReady -and -not $browserRecoveryMode) {
         throw 'Three Chrome contexts did not prove their protected forms in time.'
     }
 
-    & $python $runner $EnvFile -- $python -m cbrs readiness --target windows --require-active-runtime --env-file $EnvFile --config 'G:\CBRS\account-pool.json' --json-report $operationalReadiness
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Operational readiness failed after startup.'
+    if ($browserRuntimeReady) {
+        & $python $runner $EnvFile -- $python -m cbrs readiness --target windows --require-active-runtime --env-file $EnvFile --config 'G:\CBRS\account-pool.json' --json-report $operationalReadiness
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Operational readiness failed after startup.'
+        }
+        Write-Host 'CBRS native endurance runtime started and verified. Dashboard: http://127.0.0.1:8765'
+    } else {
+        $recoveryReport = [ordered]@{
+            status = 'recovering_authentication'
+            checked_at = [DateTimeOffset]::UtcNow.ToString('o')
+            browser_expected_count = $expected
+            browser_live_count = $live
+            browser_authenticated_count = $authenticated
+            browser_auth_states = @($status.accounts | ForEach-Object { [string]$_.browser_auth_state })
+            worker_contexts_retained = ($live -eq $expected)
+        }
+        $recoveryReport | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $operationalReadiness -Encoding utf8
+        Write-Warning 'CBRS is temporarily unavailable; three worker-owned Chrome contexts remain live and will retry authentication with bounded backoff.'
+        Write-Host 'CBRS native runtime started in authentication-recovery mode. Dashboard: http://127.0.0.1:8765'
     }
-    Write-Host 'CBRS native endurance runtime started and verified. Dashboard: http://127.0.0.1:8765'
 } catch {
     foreach ($name in $startedByThisRun) {
         Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
@@ -191,5 +237,7 @@ try {
             Disable-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue | Out-Null
         }
     }
+    Stop-CbrsWorkerProcesses
+    & $python $runner $EnvFile -- $python -c "from cbrs.jobs import WORKER_LEASE_NAME, default_job_store; s=default_job_store(); lease=s.lease(); s.release_lease(WORKER_LEASE_NAME, str(lease['owner'])) if lease else None"
     throw
 }

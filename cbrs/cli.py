@@ -827,6 +827,48 @@ def cmd_jobs(args: argparse.Namespace) -> int:
     )
     endurance = EnduranceController(store, endurance_plan, pool_config)
 
+    if args.jobs_command == "proxy-rotate":
+        if not args.acknowledge_authorized_live_traffic:
+            print(
+                "Refusing live proxy rotation without --acknowledge-authorized-live-traffic.",
+                file=sys.stderr,
+            )
+            return 2
+        account = _pool_account_by_id(pool_config, args.account)
+        if account.proxy_provider != "dataimpulse_residential_sticky":
+            print("The selected account is not a DataImpulse sticky route.", file=sys.stderr)
+            return 2
+        if not store.active_lease():
+            print("The worker lease must be active so it owns browser recovery.", file=sys.stderr)
+            return 2
+        try:
+            request = store.request_dataimpulse_rotation(
+                account.account_id,
+                reason=args.reason,
+            )
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        deadline = time.monotonic() + max(1.0, float(args.wait_seconds))
+        while time.monotonic() < deadline:
+            result = store.dataimpulse_rotation_result()
+            if result and result.get("request_id") == request["request_id"]:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return 0 if result.get("ok") else 1
+            time.sleep(1)
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "status": "pending",
+                    "request_id": request["request_id"],
+                    "account_id": account.account_id,
+                },
+                indent=2,
+            )
+        )
+        return 1
+
     if args.jobs_command == "enqueue":
         kind = "text" if args.text is not None else "fna"
         input_data = (
@@ -1476,6 +1518,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Clear only expired worker state and requeue abandoned jobs",
     )
     jobs_recover.add_argument("--config", default=None, help=argparse.SUPPRESS)
+    jobs_proxy_rotate = jobs_subparsers.add_parser(
+        "proxy-rotate",
+        help="Request one worker-owned DataImpulse route rotation",
+    )
+    jobs_proxy_rotate.add_argument("--account", required=True)
+    jobs_proxy_rotate.add_argument(
+        "--reason",
+        default="controlled_e2e_recovery",
+        help="Sanitized operational reason",
+    )
+    jobs_proxy_rotate.add_argument("--wait-seconds", type=float, default=240.0)
+    jobs_proxy_rotate.add_argument(
+        "--acknowledge-authorized-live-traffic",
+        action="store_true",
+    )
+    jobs_proxy_rotate.add_argument("--config", default=None, help=argparse.SUPPRESS)
     jobs_captcha = jobs_subparsers.add_parser(
         "captcha", help="Inspect or manually authorize one paid CAPTCHA solve"
     )

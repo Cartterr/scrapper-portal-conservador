@@ -98,6 +98,12 @@ ejecuta un segundo gate con `--require-active-runtime` y revierte las tareas que
 El reporte post-arranque se guarda en
 `G:\CBRS\readiness\operational.json`.
 
+Si las tres ventanas headless y el lease están sanos pero CBRS devuelve una
+indisponibilidad temporal durante login, el arranque conserva los tres contextos
+en modo `recovering_authentication`. El reconciliador reintenta con backoff; el
+reporte no cambia a operativo ni muestra una cuenta autenticada hasta detectar
+el formulario protegido completo.
+
 Para auditar el runtime ya iniciado sin cambiar estado:
 
 ```powershell
@@ -131,6 +137,7 @@ terminar y registra sólo estado saneado en
 .\.venv\Scripts\python.exe -m cbrs jobs endurance pause
 .\.venv\Scripts\python.exe -m cbrs jobs endurance resume
 .\.venv\Scripts\python.exe -m cbrs jobs endurance run-once
+.\.venv\Scripts\python.exe -m cbrs jobs proxy-rotate --account ejecutivo_2 --acknowledge-authorized-live-traffic
 .\.venv\Scripts\python.exe -m cbrs jobs captcha status
 .\.venv\Scripts\python.exe -m cbrs jobs captcha arm --account ejecutivo_1
 .\deploy\windows\Stop-CbrsNative.ps1

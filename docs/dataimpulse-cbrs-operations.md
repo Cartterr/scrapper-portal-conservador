@@ -104,6 +104,27 @@ fallido conserva el puerto, baseline y Chrome anteriores. El límite es una
 promoción por cinco minutos y tres por hora por cuenta; después queda
   `proxy_recovery_exhausted`.
 
+Para una prueba controlada o recuperación operativa, la solicitud debe enviarse
+al worker que ya posee el lease y los tres contextos. El comando no contiene ni
+imprime credenciales y solo reinicia el contexto de la cuenta indicada:
+
+```powershell
+.\.venv\Scripts\python.exe deploy\run_with_env.py C:\ProgramData\CBRS\cbrs.env -- `
+  .\.venv\Scripts\python.exe -m cbrs jobs proxy-rotate `
+  --account ejecutivo_2 --reason controlled_e2e_recovery `
+  --acknowledge-authorized-live-traffic
+```
+
+La respuesta exitosa debe mostrar un puerto nuevo, una generación incrementada
+y estado `active`. Después se confirma `authenticated_form` y que los procesos
+padre de las otras dos cuentas no cambiaron.
+
+Si CBRS responde `temporary_unavailable` durante la reautenticación posterior a
+la promoción, el comando devuelve fallo aunque la ruta nueva ya esté activa. El
+contexto queda fail-closed y el reconciliador vuelve a intentar la autenticación
+con el piso configurado de 60 segundos; nunca se muestra como autenticado hasta
+que reaparece el formulario protegido completo.
+
 ## Dashboard y diagnóstico
 
 La cabecera debe separar `3/3 Chrome live` de `3/3 protected forms

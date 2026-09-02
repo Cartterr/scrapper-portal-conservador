@@ -93,6 +93,23 @@ def test_soak_stop_parser() -> None:
     assert args.soak_command == "stop"
 
 
+def test_jobs_proxy_rotate_requires_explicit_account_and_acknowledgement() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "jobs",
+            "proxy-rotate",
+            "--account",
+            "ejecutivo_2",
+            "--acknowledge-authorized-live-traffic",
+        ]
+    )
+
+    assert args.jobs_command == "proxy-rotate"
+    assert args.account == "ejecutivo_2"
+    assert args.acknowledge_authorized_live_traffic is True
+
+
 def test_pool_init_parser_targets_one_account() -> None:
     parser = build_parser()
     args = parser.parse_args(["pool", "init", "--account", "ejecutivo_1", "--timeout", "600"])

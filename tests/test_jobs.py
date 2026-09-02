@@ -21,6 +21,7 @@ from cbrs.account_pool import (
 )
 from cbrs.account_pool_dashboard import start_pool_dashboard
 from cbrs.backup import backup_health, run_backup, verify_backup_restore
+from cbrs.browser_session import CommerceAuthState
 from cbrs.captcha_budget import CaptchaBudgetStore
 from cbrs.config import load_settings
 from cbrs.jobs import (
@@ -170,6 +171,63 @@ def test_persistent_browser_pool_promotes_only_protected_form_evidence(
     assert check["browser_live"] == 1
     assert check["browser_authenticated"] == 1
     assert check["browser_status"] == "authenticated_form_visible"
+    assert check["browser_auth_state"] == "authenticated_form"
+
+
+def test_persistent_browser_pool_retries_failed_auth_from_unknown_state(
+    tmp_path: Path,
+) -> None:
+    class UnknownBrowser:
+        def __init__(self) -> None:
+            self.page = SimpleNamespace(is_closed=lambda: False)
+            self.reloads = 0
+
+        def detect_commerce_auth_state(self):
+            return CommerceAuthState.UNKNOWN
+
+        def reload_current_page(self):
+            self.reloads += 1
+
+        def wait_for_commerce_auth_state(self):
+            return CommerceAuthState.UNKNOWN
+
+    class RecoveringScraper:
+        def __init__(self) -> None:
+            self.browser = UnknownBrowser()
+            self.forced = 0
+
+        def ensure_authenticated(self, username, password, *, force=False):
+            assert username and password
+            self.forced += int(force)
+            return "refreshed"
+
+    settings = replace(_settings(tmp_path), browser_reauth_backoff_seconds=0)
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    pool = _PersistentAccountBrowsers(
+        scraper_factory=FakeScraper,
+        headless=True,
+        store=store,
+        worker_id="worker-test",
+    )
+    scraper = RecoveringScraper()
+    pool._known_accounts["a1"] = (settings, "user", "password")
+    pool._entries["a1"] = _ManagedAccountScraper(
+        manager=scraper,
+        scraper=scraper,
+        settings=settings,
+        username="user",
+        password="password",
+        unknown_checks=1,
+        reauth_required=True,
+    )
+
+    pool.reconcile()
+
+    assert scraper.browser.reloads == 1
+    assert scraper.forced == 1
+    assert pool._entries["a1"].reauth_required is False
+    check = store.account_check("a1")
+    assert check["browser_authenticated"] == 1
     assert check["browser_auth_state"] == "authenticated_form"
 
 
@@ -447,6 +505,48 @@ def test_dataimpulse_route_rotation_is_durable_unique_and_two_phase(tmp_path):
         10002,
         10003,
     }
+
+
+def test_worker_owned_dataimpulse_rotation_request_is_durable_and_sanitized(tmp_path):
+    store = JobStore(tmp_path / "pool.sqlite3")
+
+    request = store.request_dataimpulse_rotation(
+        "a2",
+        reason="controlled acceptance recovery",
+    )
+    claimed = store.claim_dataimpulse_rotation_request("worker-1")
+
+    assert claimed is not None
+    assert claimed["request_id"] == request["request_id"]
+    assert claimed["account_id"] == "a2"
+    assert claimed["status"] == "running"
+    assert claimed["worker_owner"] == "worker-1"
+    assert store.claim_dataimpulse_rotation_request("worker-2") is None
+
+    result = store.finish_dataimpulse_rotation_request(
+        request["request_id"],
+        ok=True,
+        result={
+            "account_id": "a2",
+            "previous_port": 10001,
+            "active_port": 10003,
+            "generation": 1,
+            "route_status": "active",
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["active_port"] == 10003
+    assert store.get_control("dataimpulse_rotation_request") is None
+    assert store.dataimpulse_rotation_result() == result
+
+
+def test_dataimpulse_rotation_request_rejects_parallel_request(tmp_path):
+    store = JobStore(tmp_path / "pool.sqlite3")
+    store.request_dataimpulse_rotation("a1", reason="first")
+
+    with pytest.raises(RuntimeError, match="already pending"):
+        store.request_dataimpulse_rotation("a2", reason="second")
 
 
 def test_dataimpulse_rotation_rate_limit_fails_closed(tmp_path):
