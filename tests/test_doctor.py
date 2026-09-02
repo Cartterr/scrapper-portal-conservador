@@ -69,6 +69,10 @@ def test_doctor_fails_for_headed_linux_without_display(
         {
             "CBRS_BROWSER_EXECUTABLE_PATH": str(browser),
             "CBRS_EGRESS_MODE": "client_office",
+            # This test exercises the headed-only display requirement. Keep
+            # the mode explicit so changing the production default cannot
+            # silently change what the test covers.
+            "CBRS_HEADLESS": "0",
         },
         root=tmp_path,
     )

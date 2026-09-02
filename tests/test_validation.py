@@ -37,7 +37,7 @@ def test_validation_report_does_not_store_query_value(tmp_path: Path) -> None:
     assert report["query_value_saved"] is False
     assert "query" not in report
     assert report["browser_backend"] == "chrome"
-    assert report["browser_headless"] is False
+    assert report["browser_headless"] is True
     assert report["browser_window_mode"] == "normal"
     assert report["profile_hash"]
     assert report["expected_egress_country"] == "CL"
