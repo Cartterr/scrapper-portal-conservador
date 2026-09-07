@@ -3,6 +3,23 @@ from __future__ import annotations
 from cbrs import jobs as core
 from .runtime_updates import runtime_module
 
+
+def finish_for_review(store, job_id, reason):
+    """End only this job, retaining ambiguous receipts and live operations."""
+    with store.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        if db.execute('SELECT 1 FROM leases WHERE lease_name=? AND expires_at>=?',
+                      ('browser_operation:' + job_id, core.utc_now())).fetchone():
+            return False
+        changed = db.execute("""UPDATE jobs SET status='failed',error_code=?,
+            error_message='Review required; search will not be replayed',finished_at=?,updated_at=?,
+            current_account_id=NULL,worker_owner=NULL,lease_expires_at=NULL
+            WHERE job_id=? AND status IN ('running','waiting_capacity','queued')""",
+            (reason,core.utc_now(),core.utc_now(),job_id)).rowcount
+        if changed:
+            store._add_event_db(db,job_id,'job_requires_review',{'reason':reason,'replayed':False})
+    return bool(changed)
+
 def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobStore, pool_store: AccountPoolStore, run_id: str, browser_pool: _PersistentAccountBrowsers, preflight_runner: Callable[..., Any], proxy_health_runner: Callable[..., Any], endurance_plan: Any | None=None) -> str:
     target_account_id = str(job.input.get('target_account_id') or '') if job.source == 'captcha_validation' else ''
     excluded: set[str] = {account.account_id for account in config.accounts if account.account_id != target_account_id} if target_account_id else set()
@@ -14,9 +31,17 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
         quota_policy = runtime_module('form_search')
         if not checkpoint['saved']:
             excluded.update(a.account_id for a in config.accounts
-                            if (quota_policy.quota_hold(store.path, a.account_id) or {}).get('blocked'))
+                if (lambda w: w['used'] + w['reserved'] >= config.quota_for(a))(
+                    quota_policy.account_window(store.path,a.account_id)))
+        # Portal quota holds exclude all job operations for that account,
+        # including document work. Saved receipts remain available after expiry.
+        excluded.update(a.account_id for a in config.accounts
+                        if (quota_policy.quota_hold(store.path, a.account_id) or {}).get('blocked'))
         if checkpoint['incomplete_receipt'] or checkpoint['uncertain']:
-            store.set_waiting(job.job_id, 'waiting_capacity', reason='search_outcome_unknown' if checkpoint['uncertain'] else 'search_receipt_incomplete')
+            reason = 'search_outcome_unknown' if checkpoint['uncertain'] else 'search_receipt_incomplete'
+            if finish_for_review(store, job.job_id, reason):
+                return 'failed'
+            store.set_waiting(job.job_id, 'waiting_capacity', reason=reason)
             return 'waiting_capacity'
         if checkpoint['saved']:
             if checkpoint['result_count'] == 0:
@@ -27,6 +52,10 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
             excluded.update((account.account_id for account in config.accounts if account.account_id != checkpoint['account_id']))
         account = store.select_account(run_id=run_id, config=config, quota_date=quota_date, excluded=excluded, source=job.source, require_search_capacity=not checkpoint['saved'], source_quota_by_account=endurance_plan.source_quota(config) if job.source == 'endurance' and endurance_plan is not None else None)
         if account is None:
+            if checkpoint['saved'] and finish_for_review(store, job.job_id, 'document_retrieval_deferred'):
+                # Do not monopolize the one endurance slot while its original
+                # account cannot retrieve documents. Keep its accepted receipt.
+                return 'failed'
             if target_account_id:
                 target_state = next((str(row['status']) for row in pool_store.accounts(run_id) if str(row['account_id']) == target_account_id), 'paused')
                 status = 'waiting_captcha' if target_state == core.CAPTCHA_PENDING_STATUS else 'waiting_capacity'
@@ -144,6 +173,8 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
             safe_error = core._redact_known_values(str(exc), username, password)
             if attempt_id and (not store.search_checkpoint(job.job_id)['saved']):
                 store.finish_attempt(attempt_id, status='failed', safety_stop='search_outcome_unknown', error=safe_error)
+                if finish_for_review(store, job.job_id, 'search_outcome_unknown'):
+                    return 'failed'
                 store.set_waiting(job.job_id, 'waiting_capacity', reason='search_outcome_unknown')
                 return 'waiting_capacity'
             if attempt_id:

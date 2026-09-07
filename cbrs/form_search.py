@@ -9,6 +9,46 @@ from .error_evidence import notify_browser_error
 from .safety import SafetyStopException, StopReason, ensure_safe_response
 
 
+def account_window_db(db, account_id, *, now=None):
+    """Fixed 24h windows anchored by accepted searches, reconstructed from receipts.
+
+    Calendar dates remain historical reporting fields, never reset instructions.
+    UTC arithmetic makes windows exactly 24 hours across DST and restarts.
+    """
+    now = now or datetime.now(timezone.utc)
+    rows = db.execute('''SELECT COALESCE(a.finished_at,a.started_at),j.source
+        FROM job_attempts a JOIN jobs j ON j.job_id=a.job_id
+        WHERE a.account_id=? AND a.quota_consumed=1
+          AND a.status IN ('search_completed','completed')
+        ORDER BY julianday(COALESCE(a.finished_at,a.started_at)),a.rowid''', (account_id,)).fetchall()
+    start = end = None
+    used = 0
+    sources = {}
+    for stamp, source in rows:
+        accepted = datetime.fromisoformat(stamp)
+        if accepted.tzinfo is None:
+            accepted = accepted.replace(tzinfo=timezone.utc)
+        if accepted > now:
+            continue
+        if end is None or accepted >= end:
+            start, end = accepted, accepted + timedelta(hours=24)
+            used, sources = 0, {}
+        used += 1
+        sources[source] = sources.get(source, 0) + 1
+    if end is not None and now >= end:
+        start = end = None
+        used, sources = 0, {}
+    reserved = db.execute("SELECT COUNT(*) FROM job_attempts WHERE account_id=? AND quota_consumed=1 AND status='running'", (account_id,)).fetchone()[0]
+    return {'used':used,'reserved':reserved,'source_used':sources,
+            'started_at':start.isoformat() if start else None,
+            'resets_at':end.isoformat() if end else None,'policy':'first_success_24h'}
+
+
+def account_window(path, account_id, *, now=None):
+    with sqlite3.connect(path, timeout=30) as db:
+        return account_window_db(db, account_id, now=now)
+
+
 @contextmanager
 def quota_db(path):
     db = sqlite3.connect(path, timeout=30)

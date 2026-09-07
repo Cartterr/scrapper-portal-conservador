@@ -1035,6 +1035,7 @@ class BrowserSession:
                 f"CBRS login stopped: {reason.value}.",
                 status=response.status,
                 context="auth login",
+                response_code=sanitized_portal_response_code(response.body_text),
             )
         if response.status == 200:
             return

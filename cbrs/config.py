@@ -48,12 +48,24 @@ DEFAULT_CAPSOLVER_TIMEOUT_SECONDS = 120.0
 DEFAULT_CAPSOLVER_POLL_SECONDS = 3.0
 DEFAULT_PROXY_RECHECK_SECONDS = 300.0
 DEFAULT_BROWSER_HEALTHCHECK_SECONDS = 30.0
-DEFAULT_BROWSER_REAUTH_BACKOFF_SECONDS = 60.0
+DEFAULT_BROWSER_REAUTH_BACKOFF_SECONDS = 30.0
 DEFAULT_BROWSER_PREVIEW_INTERVAL_SECONDS = 5.0
 DEFAULT_BROWSER_PREVIEW_MAX_AGE_SECONDS = 60.0
-DEFAULT_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS = 300.0
-DEFAULT_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR = 3
+# Post-promotion pause only. A failed candidate is retried after the much
+# shorter candidate retry delay; it never waits for this cooldown.
+DEFAULT_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS = 60.0
+# Candidate reservations per account per fixed hourly window (the retry
+# allowance). Every candidate counts, whether it fails connectivity, is
+# rejected at login, or is promoted.
+DEFAULT_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR = 30
+DEFAULT_DATAIMPULSE_CANDIDATE_RETRY_SECONDS = 10.0
+DEFAULT_DATAIMPULSE_CANDIDATES_PER_RECOVERY = 3
+# Query-scope failures still fail over to another account first.
 DEFAULT_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD = 2
+# A visibly rejected login on an explicitly scoped account recovers at once.
+DEFAULT_DATAIMPULSE_LOGIN_RECOVERY_THRESHOLD = 1
+DEFAULT_DATAIMPULSE_CANARY_PER_HOUR = 6
+DEFAULT_DATAIMPULSE_CANARY_SPACING_SECONDS = 60.0
 ALLOWED_EGRESS_MODES = frozenset(
     {
         "client_vpn",
@@ -95,7 +107,12 @@ class Settings:
     dataimpulse_proxy_scheme: str
     dataimpulse_rotation_cooldown_seconds: float
     dataimpulse_max_rotations_per_hour: int
+    dataimpulse_candidate_retry_seconds: float
+    dataimpulse_candidates_per_recovery: int
     dataimpulse_temp_unavailable_threshold: int
+    dataimpulse_login_recovery_threshold: int
+    dataimpulse_canary_per_hour: int
+    dataimpulse_canary_spacing_seconds: float
     browser_healthcheck_seconds: float
     browser_reauth_backoff_seconds: float
     browser_preview_interval_seconds: float
@@ -332,20 +349,50 @@ def load_settings(
         env.get("CBRS_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS"),
         default=DEFAULT_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS,
     )
-    if dataimpulse_rotation_cooldown < 60:
-        raise ValueError("CBRS_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS must be at least 60")
+    if dataimpulse_rotation_cooldown < 0:
+        raise ValueError("CBRS_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS must not be negative")
     dataimpulse_max_rotations = _int(
         env.get("CBRS_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR"),
         default=DEFAULT_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR,
     )
     if dataimpulse_max_rotations < 1:
         raise ValueError("CBRS_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR must be positive")
+    dataimpulse_candidate_retry = _float(
+        env.get("CBRS_DATAIMPULSE_CANDIDATE_RETRY_SECONDS"),
+        default=DEFAULT_DATAIMPULSE_CANDIDATE_RETRY_SECONDS,
+    )
+    if dataimpulse_candidate_retry < 0:
+        raise ValueError("CBRS_DATAIMPULSE_CANDIDATE_RETRY_SECONDS must not be negative")
+    dataimpulse_candidates_per_recovery = _int(
+        env.get("CBRS_DATAIMPULSE_CANDIDATES_PER_RECOVERY"),
+        default=DEFAULT_DATAIMPULSE_CANDIDATES_PER_RECOVERY,
+    )
+    if dataimpulse_candidates_per_recovery < 1:
+        raise ValueError("CBRS_DATAIMPULSE_CANDIDATES_PER_RECOVERY must be positive")
     dataimpulse_temporary_threshold = _int(
         env.get("CBRS_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD"),
         default=DEFAULT_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD,
     )
-    if dataimpulse_temporary_threshold < 2:
-        raise ValueError("CBRS_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD must be at least 2")
+    if dataimpulse_temporary_threshold < 1:
+        raise ValueError("CBRS_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD must be positive")
+    dataimpulse_login_threshold = _int(
+        env.get("CBRS_DATAIMPULSE_LOGIN_RECOVERY_THRESHOLD"),
+        default=DEFAULT_DATAIMPULSE_LOGIN_RECOVERY_THRESHOLD,
+    )
+    if dataimpulse_login_threshold < 1:
+        raise ValueError("CBRS_DATAIMPULSE_LOGIN_RECOVERY_THRESHOLD must be positive")
+    dataimpulse_canary_per_hour = _int(
+        env.get("CBRS_DATAIMPULSE_CANARY_PER_HOUR"),
+        default=DEFAULT_DATAIMPULSE_CANARY_PER_HOUR,
+    )
+    if dataimpulse_canary_per_hour < 1:
+        raise ValueError("CBRS_DATAIMPULSE_CANARY_PER_HOUR must be positive")
+    dataimpulse_canary_spacing = _float(
+        env.get("CBRS_DATAIMPULSE_CANARY_SPACING_SECONDS"),
+        default=DEFAULT_DATAIMPULSE_CANARY_SPACING_SECONDS,
+    )
+    if dataimpulse_canary_spacing < 0:
+        raise ValueError("CBRS_DATAIMPULSE_CANARY_SPACING_SECONDS must not be negative")
     browser_healthcheck_seconds = _float(
         env.get("CBRS_BROWSER_HEALTHCHECK_SECONDS"),
         default=DEFAULT_BROWSER_HEALTHCHECK_SECONDS,
@@ -356,8 +403,8 @@ def load_settings(
         env.get("CBRS_BROWSER_REAUTH_BACKOFF_SECONDS"),
         default=DEFAULT_BROWSER_REAUTH_BACKOFF_SECONDS,
     )
-    if browser_reauth_backoff_seconds < 30:
-        raise ValueError("CBRS_BROWSER_REAUTH_BACKOFF_SECONDS must be at least 30")
+    if browser_reauth_backoff_seconds < 10:
+        raise ValueError("CBRS_BROWSER_REAUTH_BACKOFF_SECONDS must be at least 10")
     browser_preview_interval_seconds = _float(
         env.get("CBRS_BROWSER_PREVIEW_INTERVAL_SECONDS"),
         default=DEFAULT_BROWSER_PREVIEW_INTERVAL_SECONDS,
@@ -425,7 +472,12 @@ def load_settings(
         dataimpulse_proxy_scheme=dataimpulse_proxy_scheme,
         dataimpulse_rotation_cooldown_seconds=dataimpulse_rotation_cooldown,
         dataimpulse_max_rotations_per_hour=dataimpulse_max_rotations,
+        dataimpulse_candidate_retry_seconds=dataimpulse_candidate_retry,
+        dataimpulse_candidates_per_recovery=dataimpulse_candidates_per_recovery,
         dataimpulse_temp_unavailable_threshold=dataimpulse_temporary_threshold,
+        dataimpulse_login_recovery_threshold=dataimpulse_login_threshold,
+        dataimpulse_canary_per_hour=dataimpulse_canary_per_hour,
+        dataimpulse_canary_spacing_seconds=dataimpulse_canary_spacing,
         browser_healthcheck_seconds=browser_healthcheck_seconds,
         browser_reauth_backoff_seconds=browser_reauth_backoff_seconds,
         browser_preview_interval_seconds=browser_preview_interval_seconds,

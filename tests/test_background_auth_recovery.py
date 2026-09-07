@@ -11,9 +11,16 @@ from cbrs.config import load_settings
 from cbrs.safety import SafetyStopException, StopReason
 
 
-def setup_runtime(tmp_path, monkeypatch):
-    settings = replace(load_settings({}, root=tmp_path),
-                       browser_healthcheck_seconds=0, browser_reauth_backoff_seconds=0)
+def setup_runtime(tmp_path, monkeypatch, **overrides):
+    # Pin the historical two-failure login threshold for the flow tests below;
+    # the default (recover on the first visible rejection) has its own test.
+    settings = replace(load_settings({}, root=tmp_path), **{
+        "browser_healthcheck_seconds": 0, "browser_reauth_backoff_seconds": 0,
+        "dataimpulse_login_recovery_threshold": 2,
+        "dataimpulse_candidate_retry_seconds": 0, **overrides})
+    sleeps = []
+    monkeypatch.setattr(jobs, "_recovery_sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(jobs, "_recovery_sleeps_for_test", sleeps, raising=False)
     config = PoolConfig(accounts=tuple(
         PoolAccount(f"a{i}", f"Account {i}", username_env=f"TEST_USER_{i}",
                     password_env=f"TEST_PASSWORD_{i}",
@@ -82,12 +89,100 @@ def test_startup_and_idle_rejections_share_recovery_without_touching_healthy_con
     assert rotated == ["a2", "a3"]
     assert pool._entries["a1"] is healthy
     assert healthy.scraper.calls == 1
-    assert store.account_check("a3")["browser_last_auth_error"] == "temporary_unavailable"
+    assert store.account_check("a3")["browser_last_auth_error"] == "login_rejected"
     assert store.account_check("a3")["browser_last_auth_http_status"] == 400
     assert store.account_check("a3")["browser_authenticated_at"] is None
     # Passive DOM publication must retain the precise failure.
     pool.refresh_page_auth_states()
-    assert store.account_check("a3")["browser_last_auth_error"] == "temporary_unavailable"
+    assert store.account_check("a3")["browser_last_auth_error"] == "login_rejected"
+
+
+def test_first_visible_login_rejection_starts_recovery_by_default(tmp_path, monkeypatch):
+    default_threshold = load_settings({}, root=tmp_path).dataimpulse_login_recovery_threshold
+    assert default_threshold == 1
+    settings, config, store, pool_store, pool = setup_runtime(
+        tmp_path, monkeypatch, dataimpulse_login_recovery_threshold=default_threshold)
+    rotated = []
+    monkeypatch.setattr(jobs, "_rotate_dataimpulse_route",
+                        lambda account, *a, **k: rotated.append(account.account_id) or False)
+    jobs._run_startup_gates(settings, config, store, pool_store, "test-run",
+                            lambda: None, lambda: None, pool)
+    assert rotated == ["a2", "a3"]
+    evaluated = [json.loads(e["data_json"]) for e in store.recent_events(limit=20)
+                 if e["event"] == "dataimpulse_recovery_evaluated"]
+    assert evaluated and all(item["threshold"] == 1 for item in evaluated)
+    assert all(item["auth_code"] == "login_rejected" for item in evaluated)
+    assert pool._entries["a1"].authenticated_once
+
+
+def test_auth_failure_code_separates_login_contexts_from_generic_reason():
+    from cbrs.browser_session import CredentialsRejectedError
+
+    login = SafetyStopException(StopReason.TEMPORARY_UNAVAILABLE, "x", status=400, context="auth login")
+    page = SafetyStopException(StopReason.TEMPORARY_UNAVAILABLE, "x", context="auth navigation")
+    other = SafetyStopException(StopReason.TEMPORARY_UNAVAILABLE, "x", context="search")
+    captcha = SafetyStopException(StopReason.CAPTCHA_REJECTED, "x", context="auth login")
+    assert jobs._auth_failure_code(login) == "login_rejected"
+    assert jobs._auth_failure_code(page) == "login_page_rejected"
+    assert jobs._auth_failure_code(other) == "temporary_unavailable"
+    assert jobs._auth_failure_code(captcha) == "captcha_rejected"
+    assert jobs._auth_failure_code(CredentialsRejectedError(status=400, response_code="x")) == "credentials_invalid"
+    assert jobs._auth_failure_code(RuntimeError("boom")) == "authentication_failed"
+
+
+def test_failed_login_recovery_pause_follows_the_route_deadline(tmp_path, monkeypatch):
+    settings, config, store, pool_store, pool = setup_runtime(
+        tmp_path, monkeypatch, dataimpulse_login_recovery_threshold=1,
+        dataimpulse_candidate_retry_seconds=10)
+    store.set_account_browser_state("a1", live=True, authenticated=True, headless=True,
+                                    owner="test-worker", status="authenticated",
+                                    auth_state="authenticated_form")
+    exc = SafetyStopException(StopReason.TEMPORARY_UNAVAILABLE, "rejected", status=400,
+                              context="auth login", response_code="intente-mas-tarde")
+    handle = lambda: jobs._handle_account_safety_stop(
+        exc, job_id=None, account=config.accounts[1], store=store, pool_store=pool_store,
+        run_id="test-run", config=config, settings=settings, browser_pool=pool,
+        preflight_runner=None, proxy_health_runner=None)
+    state = lambda: {r["account_id"]: r for r in pool_store.accounts("test-run")}["a2"]
+
+    # Candidates were tried and rejected: wait the retry delay, not two minutes.
+    def tried_and_failed(*args, **kwargs):
+        store.begin_dataimpulse_rotation("a2", initial_port=10002, reason="t", port_min=10000,
+                                         port_max=20000, cooldown_seconds=0, max_rotations_per_hour=30)
+        store.finish_dataimpulse_rotation("a2", promoted=False,
+                                          error_code="candidate_login_rejected", retry_seconds=10)
+        return False
+    monkeypatch.setattr(jobs, "_rotate_dataimpulse_route", tried_and_failed)
+    assert handle() == "retry_account"
+    paused = state()
+    assert paused["paused_reason"] == "temporary_unavailable"
+    wait = (datetime.fromisoformat(paused["resume_at"]) - datetime.now(timezone.utc)).total_seconds()
+    assert 0 <= wait <= 11
+
+    # Allowance exhausted: the account waits exactly until the window boundary.
+    def exhausted(*args, **kwargs):
+        with store.connect() as db:
+            db.execute("UPDATE account_proxy_routes SET rotation_count = 30, cooldown_until = NULL")
+        blocked = store.begin_dataimpulse_rotation("a2", initial_port=10002, reason="t", port_min=10000,
+                                                   port_max=20000, cooldown_seconds=0, max_rotations_per_hour=30)
+        assert blocked["reason"] == "retry_allowance_exhausted"
+        return False
+    monkeypatch.setattr(jobs, "_rotate_dataimpulse_route", exhausted)
+    handle()
+    paused = state()
+    route = store.dataimpulse_route("a2")
+    assert paused["paused_reason"] == "retry_allowance_exhausted"
+    assert paused["resume_at"] == route["cooldown_until"]
+    assert route["status"] == "retry_allowance_exhausted"
+
+    # Nothing was tried (protected session, external owner...): generic pause stays.
+    pool_store.mark_account_available("test-run", "a2")
+    with store.connect() as db:
+        db.execute("UPDATE account_proxy_routes SET status='active', cooldown_until=NULL, rotation_count=0")
+    monkeypatch.setattr(jobs, "_rotate_dataimpulse_route", lambda *a, **k: False)
+    handle()
+    wait = (datetime.fromisoformat(state()["resume_at"]) - datetime.now(timezone.utc)).total_seconds()
+    assert 100 <= wait <= 120
 
 
 def test_form_evidence_requires_current_owner_and_is_only_used_for_login(tmp_path, monkeypatch):
@@ -223,8 +318,10 @@ def test_continuous_worker_retains_contexts_after_scheduler_error_until_stop(tmp
     assert len(closed) == 3, store.recent_events(limit=10)
 
 
-def candidate_runtime(tmp_path, monkeypatch, *, accepted=True, persistence_error=False, same_exit=False):
-    settings, config, store, pool_store, pool = setup_runtime(tmp_path, monkeypatch)
+def candidate_runtime(tmp_path, monkeypatch, *, accepted=True, persistence_error=False, same_exit=False,
+                      gate_results=None, login_results=None, retry_seconds=0):
+    settings, config, store, pool_store, pool = setup_runtime(
+        tmp_path, monkeypatch, dataimpulse_candidate_retry_seconds=retry_seconds)
     old = pool.scraper_factory()
     pool._entries["a2"] = jobs._ManagedAccountScraper(manager=old, scraper=old, settings=settings)
     healthy = pool.scraper_factory()
@@ -240,8 +337,10 @@ def candidate_runtime(tmp_path, monkeypatch, *, accepted=True, persistence_error
 
         def ensure_authenticated(self, *args, **kwargs):
             self.calls += 1
-            if not accepted:
-                raise SafetyStopException(StopReason.TEMPORARY_UNAVAILABLE, "rejected", status=400)
+            ok = login_results.pop(0) if login_results else accepted
+            if not ok:
+                raise SafetyStopException(StopReason.TEMPORARY_UNAVAILABLE, "rejected", status=400,
+                                          context="auth login", response_code="intente-mas-tarde")
             self.state = CommerceAuthState.AUTHENTICATED_FORM
 
         def close(self):
@@ -256,8 +355,18 @@ def candidate_runtime(tmp_path, monkeypatch, *, accepted=True, persistence_error
         baselines.append(kwargs["egress_hash"])
 
     monkeypatch.setattr("cbrs.preflight.replace_egress_baseline", replace_baseline)
-    gate = lambda *a, **k: SimpleNamespace(ok=True, report={
-        "egress_hash": "old-exit-hash" if same_exit else "new-exit-hash", "egress_country": "CL"})
+    gate_calls = []
+
+    def gate(*a, **k):
+        if gate_results:
+            spec = gate_results.pop(0)
+            gate_calls.append(spec)
+            if spec == "down":
+                return SimpleNamespace(ok=False, report={"errors": ["proxy unreachable"]})
+            return SimpleNamespace(ok=True, report={"egress_hash": spec, "egress_country": "CL"})
+        return SimpleNamespace(ok=True, report={
+            "egress_hash": "old-exit-hash" if same_exit else "new-exit-hash", "egress_country": "CL"})
+
     result = jobs._rotate_dataimpulse_route(config.accounts[1], settings, store, pool_store,
                                           "test-run", pool, gate, gate, reason="mobile_login_canary")
     return result, pool, store, old, healthy, probes, closed, baselines
@@ -289,6 +398,77 @@ def test_rejected_candidate_closes_only_disposable_probe_and_preserves_routes(tm
     assert store.candidate_exit_rejected("a2", "new-exit-hash")
 
 
+def test_recovery_moves_to_the_next_port_after_a_login_rejection_and_adopts_it(tmp_path, monkeypatch):
+    # preflight + proxy health share the gate: two gate calls per candidate.
+    ok, pool, store, old, healthy, probes, closed, baselines = candidate_runtime(
+        tmp_path, monkeypatch, retry_seconds=5,
+        gate_results=["exit-1", "exit-1", "exit-2", "exit-2"], login_results=[False, True])
+    assert ok
+    assert len(probes) == 2
+    assert closed == [probes[0]]  # only the rejected disposable probe
+    assert pool._entries["a2"].scraper is probes[1]
+    assert pool._entries["a1"].scraper is healthy
+    assert baselines == ["exit-2"]
+    assert jobs._recovery_sleeps_for_test == [5.0]  # portal rejection waits the retry delay
+    ledger = store.recent_candidate_attempts("a2")
+    assert [row["outcome"] for row in ledger] == ["promoted", "candidate_login_rejected"]
+    assert (ledger[1]["http_status"], ledger[1]["response_code"]) == (400, "intente-mas-tarde")
+    assert ledger[0]["sticky_port"] != ledger[1]["sticky_port"]
+    route = store.dataimpulse_route("a2")
+    assert route["status"] == "active" and route["rotation_count"] == 2
+
+
+def test_transport_failure_moves_to_the_next_port_without_waiting(tmp_path, monkeypatch):
+    ok, pool, store, old, healthy, probes, closed, baselines = candidate_runtime(
+        tmp_path, monkeypatch, retry_seconds=5, gate_results=["down", "exit-2", "exit-2"])
+    assert ok
+    assert len(probes) == 1 and closed == []
+    assert jobs._recovery_sleeps_for_test == []
+    assert [row["outcome"] for row in store.recent_candidate_attempts("a2")] == [
+        "promoted", "candidate_connectivity_failed"]
+    failed = [json.loads(e["data_json"]) for e in store.recent_events(limit=20)
+              if e["event"] == "dataimpulse_rotation_failed"]
+    assert failed and failed[0]["reason"] == "candidate_connectivity_failed"
+    assert failed[0]["candidate_attempt"] == 1 and failed[0]["candidate_attempts_allowed"] == 3
+
+
+def test_recovery_call_is_bounded_by_candidates_per_recovery(tmp_path, monkeypatch):
+    ok, pool, store, old, healthy, probes, closed, baselines = candidate_runtime(
+        tmp_path, monkeypatch, accepted=False,
+        gate_results=["e1", "e1", "e2", "e2", "e3", "e3", "e4", "e4"])
+    assert not ok
+    assert len(probes) == 3 and closed == probes
+    assert pool._entries["a2"].scraper is old
+    route = store.dataimpulse_route("a2")
+    assert route["rotation_count"] == 3
+    assert route["status"] == "candidate_failed"
+    assert route["cooldown_until"] is None  # retry delay 0: eligible at once
+    assert [row["outcome"] for row in store.recent_candidate_attempts("a2")] == [
+        "candidate_login_rejected"] * 3
+
+
+def test_exhausted_allowance_pauses_the_account_until_the_window_boundary(tmp_path, monkeypatch):
+    settings, config, store, pool_store, pool = setup_runtime(tmp_path, monkeypatch)
+    started = (datetime.now(timezone.utc) - timedelta(minutes=50)).replace(microsecond=0).isoformat()
+    with store.connect() as db:
+        db.execute("UPDATE account_proxy_routes SET rotation_count = ?, rotation_window_started_at = ? "
+                   "WHERE account_id = 'a2'", (settings.dataimpulse_max_rotations_per_hour, started))
+    gate = lambda *a, **k: (_ for _ in ()).throw(AssertionError("Must not probe"))
+    assert not jobs._rotate_dataimpulse_route(config.accounts[1], settings, store, pool_store,
+                                              "test-run", pool, gate, gate, reason="test")
+    route = store.dataimpulse_route("a2")
+    expected = (datetime.fromisoformat(started) + timedelta(hours=1)).isoformat()
+    assert route["status"] == "retry_allowance_exhausted"
+    assert route["cooldown_until"] == expected
+    account = {r["account_id"]: r for r in pool_store.accounts("test-run")}["a2"]
+    assert (account["status"], account["paused_reason"], account["resume_at"]) == (
+        "paused", "retry_allowance_exhausted", expected)
+    skipped = [json.loads(e["data_json"]) for e in store.recent_events(limit=10)
+               if e["event"] == "dataimpulse_rotation_skipped"]
+    assert skipped[0]["next_eligible_at"] == expected
+    assert skipped[0]["window_limit"] == settings.dataimpulse_max_rotations_per_hour
+
+
 def test_new_port_with_same_exit_does_not_attempt_login(tmp_path, monkeypatch):
     ok, pool, store, old, healthy, probes, closed, baselines = candidate_runtime(tmp_path, monkeypatch, same_exit=True)
     assert not ok
@@ -309,13 +489,16 @@ def test_proven_candidate_survives_persistence_error_and_blocks_further_rotation
 
 def test_mobile_canary_budget_is_pool_wide_durable_and_bounded(tmp_path):
     store = jobs.JobStore(tmp_path / "pool.sqlite3")
+    budget = dict(max_per_hour=3, spacing_seconds=300)
     for _ in range(3):
-        assert store.reserve_mobile_login_canary()
-        assert not jobs.JobStore(store.path).reserve_mobile_login_canary()
+        assert store.reserve_mobile_login_canary(**budget)
+        assert not jobs.JobStore(store.path).reserve_mobile_login_canary(**budget)
         state = json.loads(store.get_control("mobile_login_canary")["value"])
         state["last_attempt"] = (datetime.now(timezone.utc) - timedelta(seconds=301)).isoformat()
         store.set_control("mobile_login_canary", json.dumps(state))
-    assert not store.reserve_mobile_login_canary()
+    assert not store.reserve_mobile_login_canary(**budget)
+    defaults = load_settings({}, root=tmp_path)
+    assert (defaults.dataimpulse_canary_per_hour, defaults.dataimpulse_canary_spacing_seconds) == (6, 60.0)
 
 
 def test_failed_exit_history_is_durable_and_expires(tmp_path):

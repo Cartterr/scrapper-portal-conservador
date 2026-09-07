@@ -1,11 +1,24 @@
 # Portal quota holds and visible search errors
 
+## Local capacity: first-success 24-hour windows
+
+Local service capacity uses per-account fixed 24-hour windows, reconstructed
+from durable accepted-search receipts. The first acceptance starts the window;
+later successes in that window do not move its expiry. After expiry the next
+acceptance starts a new window. Midnight has no effect. Arithmetic is UTC, display
+is Chile local time, and in-flight quota reservations reduce admission capacity.
+PDF completion is not a second search. Failed attempts do not count as successes.
+Calendar usage records are retained for historical reporting, not admission.
+This is the service's configured policy, not a claim about CBRS reset semantics.
+Portal exhaustion holds continue to override local available capacity separately.
+
 The portal's visible daily-limit message overrides local remaining-credit
 estimates. A `portal_quota_holds` row in the durable pool SQLite database holds
 that account's searches across midnight, service maintenance and PC restarts.
 It does not change accepted-search counters, browser authentication, profiles,
-proxy settings or Chrome ownership. Saved search receipts may still proceed to
-document/PDF work without repeating the search.
+proxy settings or Chrome ownership. Held accounts are excluded from all job
+operations until their deadline. Saved search receipts remain intact so document
+work can resume later without repeating the search.
 
 Open, visible HeadlessUI dialogs are identified by their heading, message and
 Close button, not their generated numeric IDs. A generic refresh message allows
@@ -25,6 +38,18 @@ before another probe. A successful result clears the hold.
 Manual portal usage is not necessarily represented in the local counter. Do not
 fabricate 20 successful searches just because the portal reports exhaustion.
 User-reported limits must retain `user_reported_portal_limit` evidence provenance.
+
+An unknown search outcome ends only that job as `failed` with its original
+`search_outcome_unknown` / `search_receipt_incomplete` code. The overview labels
+this as review required, not no capacity. Evidence stays intact; no success or
+PDF is fabricated and the query is not replayed. An active browser-operation
+lease prevents premature finalization. Endurance can enqueue the next fixture
+after its normal cooldown. A saved successful search instead resumes document
+work under its original account without another search or quota charge.
+If that account is unavailable after retrieval failure, finalize the endurance
+slot with `document_retrieval_deferred`; keep the receipt/items for later review
+and document-only recovery. Never count this as a finished PDF. This prevents
+one document failure from starving other eligible accounts.
 
 Implementation is in reloadable form_search/runtime_logic/runtime_observation
 modules. Publish validated compatible releases at operation boundaries, preserving

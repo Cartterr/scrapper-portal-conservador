@@ -28,10 +28,13 @@ class SafetyStopException(RuntimeError):
         *,
         status: int | None = None,
         context: str | None = None,
+        response_code: str | None = None,
     ) -> None:
         self.reason = reason
         self.status = status
         self.context = context
+        # Sanitized portal code (for example ``intente-mas-tarde``); never a body.
+        self.response_code = response_code
         super().__init__(message)
 
 

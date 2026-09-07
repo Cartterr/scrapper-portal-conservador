@@ -1,5 +1,70 @@
 # Operación CBRS con DataImpulse
 
+## Configuración de producción vigente (07-09-2026)
+
+Esta sección prevalece sobre los ejemplos históricos inferiores. El despliegue
+actual usa **Mobile Proxy / Plan 2**, Chrome normal visible en Windows nativo y
+un browser-owner independiente. No usar credenciales de Residential Plan 1 ni
+del dashboard como sustituto, ni cambiar automáticamente a residencial.
+
+1. Abrir el producto **Mobile Proxy / Plan 2** en DataImpulse y actualizar la
+   página antes de copiar sus credenciales proxy. Verificar consumo en ese plan.
+2. Guardar login/password solo en el archivo protegido y el `.env` local ignorado
+   por Git; mantener ambos en paridad. Nunca ponerlos en este documento.
+3. Usar esta configuración explícita para reproducir el despliegue actual:
+
+```dotenv
+CBRS_EGRESS_MODE=mobile_sticky
+CBRS_EXPECTED_EGRESS_COUNTRY=CL
+CBRS_HEADLESS=0
+CBRS_WINDOW_MODE=normal
+DATAIMPULSE_PROXY_HOST=gw.dataimpulse.com
+DATAIMPULSE_PROXY_SCHEME=http
+DATAIMPULSE_COUNTRY=cl
+DATAIMPULSE_ASN=
+DATAIMPULSE_STICKY_TTL_MINUTES=120
+DATAIMPULSE_STICKY_PORT_MIN=10000
+DATAIMPULSE_STICKY_PORT_MAX=20000
+CBRS_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS=300
+CBRS_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR=3
+CBRS_DATAIMPULSE_CANDIDATE_RETRY_SECONDS=300
+CBRS_DATAIMPULSE_CANDIDATES_PER_RECOVERY=1
+CBRS_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD=2
+CBRS_DATAIMPULSE_LOGIN_RECOVERY_THRESHOLD=2
+CBRS_DATAIMPULSE_CANARY_PER_HOUR=3
+CBRS_DATAIMPULSE_CANARY_SPACING_SECONDS=300
+CBRS_BROWSER_REAUTH_BACKOFF_SECONDS=60
+```
+
+El código compone los parámetros de usuario `__cr.cl;sessttl.120`; no duplicar
+el sufijo manualmente. Los defaults de los templates pueden diferir: los valores
+explícitos anteriores documentan el runtime, no una garantía de aceptación.
+
+Asignaciones sticky observadas: `ejecutivo_1:10002`, `ejecutivo_2:10403`,
+`ejecutivo_3:12264`. Conservar las asignaciones durables actuales; esta lista es
+una referencia fechada, no un mandato de sobrescribir rutas vivas. Cada cuenta
+debe tener su propio perfil y puerto. El puerto/TTL no garantizan una IP eterna:
+una expiración o desconexión del proveedor puede cambiar el egreso.
+
+Para nuevas instalaciones seguir primero
+[el runbook del propietario independiente](independent-browser-owner.md);
+activar `CBRS_BROWSER_OWNER_MODE=external` solo tras verificar la migración,
+lease y PIDs del owner. Nunca activarlo encima de un worker acoplado vivo.
+
+Validar país CL, salud proxy y formulario protegido autenticado por cuenta;
+después validar una búsqueda aceptada y el PDF local por separado. Una ruta
+sana o un login aceptado no prueban que todas las consultas funcionarán.
+Conservar las sesiones autenticadas durante mantenimiento, cooldown y cupo
+agotado. El cooldown de `temporary_unavailable` es 120 s, independiente de la
+recuperación proxy y de la ventana local de cupo de 24 h. El overview muestra
+su deadline real con un contador por segundo.
+
+El soporte también propuso HTTPS 823, SOCKS5 824 y host `74.81.81.81`; no son
+el baseline sticky actualmente validado y no deben reemplazarlo automáticamente.
+ASN se deja vacío salvo validación específica; el soporte indicó doble consumo
+al segmentar ASN. Mobile mejoró los resultados observados, pero no garantiza
+fiabilidad indefinida ni elimina errores funcionales del portal.
+
 > **Preservación obligatoria (06-09-2026):** conservar todo contexto Chrome de
 > producción existente hasta reboot/apagado del PC o detención explícita de TODO
 > el servicio. No reiniciar workers para cargar fixes. No rotar/promover una ruta
@@ -127,11 +192,13 @@ Las tareas deshabilitadas por el operador permanecen deshabilitadas.
 - Una cuenta que ya mostró un formulario protegido queda excluida de rotación,
   aunque después cambie a `unknown`.
 
-Cuando ninguna cuenta proxy ha tenido éxito reciente, dos rechazos de **login**
-HTTP 400 permiten una prueba Mobile acotada después de respetar el cooldown
-global: máximo tres candidatos por hora para todo el pool y cinco minutos entre
-ellos. Este presupuesto es durable y adicional al límite por cuenta. No aplica
-a CAPTCHA/WAF explícito, credenciales inválidas ni errores terminales del proveedor.
+Cuando ninguna cuenta proxy ha tenido éxito reciente, un rechazo de **login**
+HTTP 400 (`CBRS_DATAIMPULSE_LOGIN_RECOVERY_THRESHOLD`, por defecto 1) permite
+una prueba Mobile acotada después de respetar el cooldown global:
+`CBRS_DATAIMPULSE_CANARY_PER_HOUR` candidatos por hora para todo el pool (por
+defecto 6) separados por `CBRS_DATAIMPULSE_CANARY_SPACING_SECONDS` (60 s). Este
+presupuesto es durable y adicional al límite por cuenta. No aplica a CAPTCHA/WAF
+explícito, credenciales inválidas ni errores terminales del proveedor.
 Un resultado fallido conserva el backoff global; no demuestra un ban ni lo elude
 mediante un bucle de IPs. El evento `dataimpulse_recovery_evaluated` indica si
 se reservó esta prueba mediante `mobile_canary_reserved`.
@@ -156,9 +223,13 @@ configurado; no cambia a GoLogin, Dolphin, SOCKS5 ni un ASN sin validación prop
 
 No toda falla de CBRS implica cambiar de IP:
 
-- el primer `temporary_unavailable` hace failover a otra cuenta;
-- se considera rotación tras dos ocurrencias de la misma cuenta en diez minutos
-  solo si otra cuenta tuvo éxito reciente;
+- en una **consulta**, el primer `temporary_unavailable` hace failover a otra
+  cuenta; se considera rotación tras `CBRS_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD`
+  ocurrencias (2) de la misma cuenta en diez minutos, solo si otra cuenta tuvo
+  éxito reciente;
+- en un **login** visiblemente rechazado de una cuenta con alcance explícito de
+  reemplazo, la recuperación empieza tras `CBRS_DATAIMPULSE_LOGIN_RECOVERY_THRESHOLD`
+  rechazos (1), si otra cuenta viva muestra el formulario protegido;
 - si fallan todas las cuentas se conserva el backoff global `300/900/3600`;
 - `500`, `502 NO_HOST_CONNECTION`, `503 NO_RAY`, reset o probe fallido se
   reintentan una vez y luego permiten recuperación de ruta;
@@ -177,9 +248,41 @@ egreso y una autenticación real que renderice `authenticated_form`. La prueba
 usa un perfil limpio `chrome-profile-route-<generación>-port-<puerto>`; un puerto rechazado
 queda registrado para que el siguiente intento no vuelva al mismo peer. Solo
 entonces se promueve el puerto, se archiva y reemplaza el baseline saneado y se
-selecciona el candidato vivo sin cerrar el contexto anterior. Los otros dos contextos permanecen vivos. El límite es una
-promoción por cinco minutos y tres por hora por cuenta; después queda
-  `proxy_recovery_exhausted`.
+selecciona el candidato vivo sin cerrar el contexto anterior. Los otros dos
+contextos permanecen vivos.
+
+Ritmo y presupuesto de la recuperación (valores por defecto):
+
+- Una llamada de recuperación prueba hasta `CBRS_DATAIMPULSE_CANDIDATES_PER_RECOVERY`
+  (3) puertos seguidos. Un fallo de transporte (preflight, salud del proxy,
+  salida repetida) pasa al siguiente puerto de inmediato; un rechazo de login del
+  portal espera `CBRS_DATAIMPULSE_CANDIDATE_RETRY_SECONDS` (10 s).
+- `CBRS_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR` (30) es el **cupo de reintentos**
+  por cuenta en una ventana fija de una hora. Cuenta cada candidato reservado,
+  falle o no. Al agotarse, la ruta queda `retry_allowance_exhausted` y la cuenta
+  se pausa hasta el **cierre de esa ventana** (`rotation_window_started_at` +
+  1 h), no una hora completa desde el último intento. Ese estado describe
+  nuestro presupuesto, no tráfico agotado del proveedor ni prueba de que todos
+  los proxies fallaron. `proxy_recovery_exhausted` es el nombre heredado.
+- `CBRS_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS` (60) se aplica **solo después de
+  una promoción**; un candidato fallido nunca espera ese cooldown.
+- Tras una recuperación de login fallida con presupuesto disponible, la pausa de
+  la cuenta se alinea con la ruta (el retardo de reintento), en lugar de la
+  pausa genérica de dos minutos. El reconciliador vuelve a intentar tras
+  `CBRS_BROWSER_REAUTH_BACKOFF_SECONDS` (30).
+
+Cada candidato queda en el libro `proxy_candidate_attempts` con su clase de
+fallo, HTTP y código saneado del portal (`intente-mas-tarde`), separando el
+rechazo de login del portal de los fallos de transporte del proxy:
+`candidate_connectivity_failed`, `candidate_exit_reused`,
+`candidate_login_rejected`, `candidate_form_unconfirmed`,
+`candidate_launch_failed`, `candidate_provider_terminal`,
+`candidate_credentials_rejected`, `candidate_proven_unpersisted`, `promoted`.
+El overview muestra el último fallo, los intentos usados de la ventana, el
+próximo intento elegible y los últimos candidatos. El error de login del
+navegador también se publica con más precisión: `login_rejected` (envío
+rechazado), `login_page_rejected` (página de login rechazada) y
+`temporary_unavailable` (rechazo temporal de consulta o diálogo genérico).
 
 Para una prueba controlada o recuperación operativa, la solicitud debe enviarse
 al worker que ya posee el lease y los tres contextos. El comando no contiene ni

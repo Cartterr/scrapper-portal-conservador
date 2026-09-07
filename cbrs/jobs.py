@@ -81,6 +81,27 @@ JOB_LEASE_SECONDS = 180
 EXTERNAL_OUTAGE_BACKOFF_KEY = "external_outage_backoff"
 EXTERNAL_OUTAGE_REASON = "temporary_unavailable_all_accounts"
 DATAIMPULSE_ROTATION_REQUEST_KEY = "dataimpulse_rotation_request"
+# Fixed hourly retry-allowance window for candidate reservations per account.
+ROTATION_WINDOW_SECONDS = 3600.0
+# Route status when the per-account candidate allowance for the current window
+# is used up. It describes OUR retry budget, not provider traffic nor proof that
+# every available proxy failed. ``proxy_recovery_exhausted`` is the legacy name.
+RETRY_ALLOWANCE_EXHAUSTED = "retry_allowance_exhausted"
+# Candidate outcomes (durable, sanitized). Transport failures are kept apart
+# from portal login rejections so they can be paced and labelled differently.
+CANDIDATE_PROMOTED = "promoted"
+CANDIDATE_CONNECTIVITY_FAILED = "candidate_connectivity_failed"
+CANDIDATE_EXIT_REUSED = "candidate_exit_reused"
+CANDIDATE_LOGIN_REJECTED = "candidate_login_rejected"
+CANDIDATE_FORM_UNCONFIRMED = "candidate_form_unconfirmed"
+CANDIDATE_LAUNCH_FAILED = "candidate_launch_failed"
+CANDIDATE_PROVIDER_TERMINAL = "candidate_provider_terminal"
+CANDIDATE_CREDENTIALS_REJECTED = "candidate_credentials_rejected"
+CANDIDATE_PROVEN_UNPERSISTED = "candidate_proven_unpersisted"
+# Browser auth error codes published to the overview (more specific than the
+# shared ``temporary_unavailable`` stop reason they derive from).
+AUTH_LOGIN_REJECTED = "login_rejected"
+AUTH_LOGIN_PAGE_REJECTED = "login_page_rejected"
 DATAIMPULSE_ROTATION_RESULT_KEY = "dataimpulse_rotation_result"
 # `temporary_unavailable` is CBRS's generic retry response, not proof of a
 # CAPTCHA failure.  Once every account returns it, however, repeating the same
@@ -388,9 +409,7 @@ class _PersistentAccountBrowsers:
                     engine=_browser_engine(entry.settings),
                     status="authentication_unconfirmed",
                     auth_state=CommerceAuthState.UNKNOWN.value,
-                    auth_error=(exc.reason.value if isinstance(exc, SafetyStopException)
-                                else "credentials_invalid" if isinstance(exc, CredentialsRejectedError)
-                                else "authentication_failed"),
+                    auth_error=_auth_failure_code(exc),
                     auth_http_status=getattr(exc, "status", None),
                 )
             raise
@@ -756,6 +775,21 @@ class JobStore:
                     failed_at TEXT NOT NULL,
                     PRIMARY KEY(account_id, egress_hash)
                 );
+
+                CREATE TABLE IF NOT EXISTS proxy_candidate_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    sticky_port INTEGER,
+                    egress_route_id TEXT,
+                    outcome TEXT NOT NULL,
+                    http_status INTEGER,
+                    response_code TEXT,
+                    reason TEXT,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_proxy_candidate_attempts_account
+                    ON proxy_candidate_attempts(account_id, finished_at);
 
                 CREATE TABLE IF NOT EXISTS endurance_state (
                     name TEXT PRIMARY KEY,
@@ -1519,17 +1553,8 @@ class JobStore:
                 if require_search_capacity and used >= quota:
                     continue
                 if require_search_capacity and source_quota_by_account and account.account_id in source_quota_by_account:
-                    source_used = int(
-                        db.execute(
-                            """
-                            SELECT COUNT(*) FROM job_attempts a
-                            JOIN jobs j ON j.job_id = a.job_id
-                            WHERE a.account_id = ? AND a.quota_date = ?
-                              AND a.quota_consumed = 1 AND j.source = ?
-                            """,
-                            (account.account_id, quota_date, source),
-                        ).fetchone()[0]
-                    )
+                    from .form_search import account_window_db
+                    source_used = account_window_db(db,account.account_id)['source_used'].get(source,0)
                     if source_used >= int(source_quota_by_account[account.account_id]):
                         continue
                 candidates[account.account_id] = account
@@ -1998,30 +2023,41 @@ class JobStore:
             state = dict(row)
             cooldown_until = str(state.get("cooldown_until") or "")
             if cooldown_until and cooldown_until > now:
-                return {**state, "ok": False, "reason": "rotation_cooldown"}
+                return {
+                    **state,
+                    "ok": False,
+                    "reason": "rotation_cooldown",
+                    "next_eligible_at": cooldown_until,
+                }
             window_started = str(state.get("rotation_window_started_at") or "")
-            if not window_started or seconds_since(window_started) >= 3600:
+            if not window_started or seconds_since(window_started) >= ROTATION_WINDOW_SECONDS:
                 window_started = now
                 rotation_count = 0
             else:
                 rotation_count = int(state.get("rotation_count") or 0)
             if rotation_count >= max_rotations_per_hour:
-                cooldown = (now_dt + timedelta(seconds=3600)).replace(
-                    microsecond=0
-                ).isoformat()
+                # The allowance resets at the window boundary, not one full
+                # hour after whichever attempt happened to notice exhaustion.
+                next_eligible = (
+                    datetime.fromisoformat(window_started.replace("Z", "+00:00"))
+                    + timedelta(seconds=ROTATION_WINDOW_SECONDS)
+                ).replace(microsecond=0).isoformat()
                 db.execute(
                     """
                     UPDATE account_proxy_routes
-                    SET status = 'proxy_recovery_exhausted', cooldown_until = ?,
-                        updated_at = ? WHERE account_id = ?
+                    SET status = ?, cooldown_until = ?, updated_at = ?
+                    WHERE account_id = ?
                     """,
-                    (cooldown, now, account_id),
+                    (RETRY_ALLOWANCE_EXHAUSTED, next_eligible, now, account_id),
                 )
                 return {
                     **state,
                     "ok": False,
-                    "reason": "proxy_recovery_exhausted",
-                    "cooldown_until": cooldown,
+                    "reason": RETRY_ALLOWANCE_EXHAUSTED,
+                    "cooldown_until": next_eligible,
+                    "next_eligible_at": next_eligible,
+                    "rotation_count": rotation_count,
+                    "rotation_window_started_at": window_started,
                 }
             used_ports = {
                 int(value)
@@ -2055,6 +2091,9 @@ class JobStore:
                     int(state["active_port"]), used_ports=used_ports,
                     minimum=port_min, maximum=port_max,
                 )
+            # ``cooldown_seconds`` here is only the minimum spacing before the
+            # next candidate. A promotion applies its own, longer cooldown in
+            # finish_dataimpulse_rotation; a failed candidate never waits for it.
             cooldown = (now_dt + timedelta(seconds=cooldown_seconds)).replace(
                 microsecond=0
             ).isoformat()
@@ -2083,6 +2122,8 @@ class JobStore:
                 "pending_port": candidate,
                 "cooldown_until": cooldown,
                 "rotation_count": rotation_count + 1,
+                "rotation_window_started_at": window_started,
+                "rotation_limit": int(max_rotations_per_hour),
             }
 
     def finish_dataimpulse_rotation(
@@ -2091,6 +2132,8 @@ class JobStore:
         *,
         promoted: bool,
         error_code: str | None = None,
+        cooldown_seconds: float | None = None,
+        retry_seconds: float | None = None,
     ) -> dict[str, Any]:
         now = utc_now()
         with self.connect() as db:
@@ -2104,18 +2147,25 @@ class JobStore:
             if promoted and row["pending_port"] is None:
                 raise RuntimeError("DataImpulse rotation has no pending port")
             if promoted:
+                cooldown = (
+                    (datetime.now(timezone.utc) + timedelta(seconds=float(cooldown_seconds)))
+                    .replace(microsecond=0).isoformat()
+                    if cooldown_seconds is not None and cooldown_seconds > 0
+                    else None
+                )
                 db.execute(
                     """
                     UPDATE account_proxy_routes
                     SET active_port = pending_port, pending_port = NULL,
                         generation = generation + 1, status = 'active',
                         last_error_code = NULL, last_rotated_at = ?,
+                        cooldown_until = COALESCE(?, cooldown_until),
                         temporary_window_started_at = NULL,
                         temporary_failure_count = 0, rejected_ports_json = '[]',
                         updated_at = ?
                     WHERE account_id = ?
                     """,
-                    (now, now, account_id),
+                    (now, cooldown, now, account_id),
                 )
             else:
                 try:
@@ -2130,16 +2180,26 @@ class JobStore:
                 if row["pending_port"] is not None:
                     rejected_ports.append(int(row["pending_port"]))
                 rejected_ports = list(dict.fromkeys(rejected_ports))[-100:]
+                # A failed candidate only waits the short retry delay (portal
+                # rejections) or nothing at all (transport failures).
+                retry_until = (
+                    (datetime.now(timezone.utc) + timedelta(seconds=float(retry_seconds)))
+                    .replace(microsecond=0).isoformat()
+                    if retry_seconds is not None and retry_seconds > 0
+                    else None
+                )
                 db.execute(
                     """
                     UPDATE account_proxy_routes
                     SET pending_port = NULL, status = 'candidate_failed',
-                        last_error_code = ?, rejected_ports_json = ?, updated_at = ?
+                        last_error_code = ?, rejected_ports_json = ?,
+                        cooldown_until = ?, updated_at = ?
                     WHERE account_id = ?
                     """,
                     (
                         redact_text(error_code or "candidate_failed"),
                         json.dumps(rejected_ports, separators=(",", ":")),
+                        retry_until,
                         now,
                         account_id,
                     ),
@@ -2150,6 +2210,27 @@ class JobStore:
             ).fetchone()
             assert updated is not None
             return dict(updated)
+
+    def set_dataimpulse_route_retry(
+        self, account_id: str, *, retry_seconds: float
+    ) -> dict[str, Any] | None:
+        """Stamp the next eligible attempt for a route whose candidate failed."""
+        retry_until = (
+            datetime.now(timezone.utc) + timedelta(seconds=max(0.0, float(retry_seconds)))
+        ).replace(microsecond=0).isoformat()
+        with self.connect() as db:
+            db.execute(
+                """
+                UPDATE account_proxy_routes
+                SET cooldown_until = ?, updated_at = ?
+                WHERE account_id = ? AND status = 'candidate_failed'
+                """,
+                (retry_until, utc_now(), account_id),
+            )
+            row = db.execute(
+                "SELECT * FROM account_proxy_routes WHERE account_id = ?", (account_id,)
+            ).fetchone()
+        return dict(row) if row else None
 
     def record_dataimpulse_temporary_failure(
         self, account_id: str, *, initial_port: int
@@ -2203,21 +2284,91 @@ class JobStore:
                 (account_id, egress_hash, utc_now()),
             )
 
-    def reserve_mobile_login_canary(self) -> bool:
-        """At most three pool-wide probes/hour, separated by five minutes."""
+    def record_candidate_attempt(
+        self,
+        account_id: str,
+        *,
+        sticky_port: int | None,
+        egress_hash: str | None,
+        outcome: str,
+        http_status: int | None = None,
+        response_code: str | None = None,
+        reason: str | None = None,
+        started_at: str,
+    ) -> None:
+        """Persist one candidate attempt with its sanitized failure reason.
+
+        ``outcome`` separates portal login rejections from proxy-transport
+        failures so the overview can show what actually happened instead of a
+        single generic label. Bodies, credentials and raw exits are never stored.
+        """
+        route_id = (
+            f"ip-{hashlib.sha256(str(egress_hash).encode('utf-8')).hexdigest()[:10]}"
+            if egress_hash else None
+        )
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO proxy_candidate_attempts(
+                    account_id, sticky_port, egress_route_id, outcome, http_status,
+                    response_code, reason, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_id,
+                    int(sticky_port) if sticky_port is not None else None,
+                    route_id,
+                    redact_text(outcome)[:80],
+                    int(http_status) if http_status is not None else None,
+                    redact_text(response_code)[:80] if response_code else None,
+                    redact_text(reason)[:160] if reason else None,
+                    started_at,
+                    utc_now(),
+                ),
+            )
+            db.execute(
+                """
+                DELETE FROM proxy_candidate_attempts
+                WHERE account_id = ? AND id NOT IN (
+                    SELECT id FROM proxy_candidate_attempts WHERE account_id = ?
+                    ORDER BY id DESC LIMIT 200
+                )
+                """,
+                (account_id, account_id),
+            )
+
+    def recent_candidate_attempts(
+        self, account_id: str, *, limit: int = 8
+    ) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT sticky_port, egress_route_id, outcome, http_status,
+                       response_code, reason, started_at, finished_at
+                FROM proxy_candidate_attempts WHERE account_id = ?
+                ORDER BY id DESC LIMIT ?
+                """,
+                (account_id, int(limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def reserve_mobile_login_canary(
+        self, *, max_per_hour: int = 6, spacing_seconds: float = 60.0
+    ) -> bool:
+        """Bounded pool-wide login probes when no proxy account works."""
         now = utc_now()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM job_control WHERE key = 'mobile_login_canary'").fetchone()
             state = json.loads(row["value"]) if row else {}
             last = state.get("last_attempt")
-            if last and seconds_since(last) < 300:
+            if last and seconds_since(last) < float(spacing_seconds):
                 return False
             started = state.get("window_started")
             count = int(state.get("count", 0))
-            if not started or seconds_since(started) >= 3600:
+            if not started or seconds_since(started) >= ROTATION_WINDOW_SECONDS:
                 started, count = now, 0
-            if count >= 3:
+            if count >= int(max_per_hour):
                 return False
             payload = stable_json({"window_started": started, "last_attempt": now, "count": count + 1})
             db.execute(
@@ -2619,31 +2770,9 @@ class JobStore:
 
     @staticmethod
     def _account_usage_db(db: sqlite3.Connection, account_id: str, quota_date: str) -> int:
-        row = db.execute(
-            """
-            SELECT COALESCE((
-                SELECT used FROM account_daily_usage
-                WHERE account_id = ? AND quota_date = ?
-            ), 0) + COALESCE((
-                SELECT COUNT(*) FROM cycles c
-                JOIN runs r ON r.run_id = c.run_id
-                WHERE c.account_id = ? AND c.quota_date = ? AND r.dry_run = 0
-            ), 0) + COALESCE((
-                SELECT COUNT(*) FROM job_attempts
-                WHERE account_id = ? AND quota_date = ?
-                  AND quota_consumed = 1 AND status = 'running'
-            ), 0) AS used
-            """,
-            (
-                account_id,
-                quota_date,
-                account_id,
-                quota_date,
-                account_id,
-                quota_date,
-            ),
-        ).fetchone()
-        return int(row["used"] or 0)
+        from .form_search import account_window_db
+        window = account_window_db(db, account_id)
+        return window['used'] + window['reserved']
 
 
 def default_job_store(settings: Settings = SETTINGS) -> JobStore:
@@ -3081,7 +3210,9 @@ def _wire_browser_auth_recovery(
                   else "authentication_failed")
         store.add_event(
             "background_auth_failed", account_id=account_id, level="warning",
-            data={"reason": reason, "http_status": getattr(exc, "status", None)},
+            data={"reason": reason, "auth_code": _auth_failure_code(exc),
+                  "http_status": getattr(exc, "status", None),
+                  "response_code": getattr(exc, "response_code", None)},
         )
         if isinstance(exc, SafetyStopException):
             _handle_account_safety_stop(
@@ -3420,6 +3551,42 @@ def _egress_baseline_status(preflight: Any) -> str:
     return ""
 
 
+class _CandidateRejected(Exception):
+    """One candidate failed; carries the sanitized outcome for the ledger."""
+
+    def __init__(
+        self,
+        outcome: str,
+        reason: str,
+        *,
+        http_status: int | None = None,
+        response_code: str | None = None,
+        terminal: bool = False,
+    ) -> None:
+        self.outcome = outcome
+        self.reason = reason
+        self.http_status = http_status
+        self.response_code = response_code
+        self.terminal = terminal
+        super().__init__(reason)
+
+
+# Outcomes after which trying another port cannot help in this recovery call.
+TERMINAL_CANDIDATE_OUTCOMES = frozenset({
+    CANDIDATE_PROVIDER_TERMINAL,
+    CANDIDATE_CREDENTIALS_REJECTED,
+    CANDIDATE_PROVEN_UNPERSISTED,
+})
+# Portal-side rejections: wait the candidate retry delay before the next port.
+# Transport-side failures move to the next port immediately.
+PORTAL_CANDIDATE_OUTCOMES = frozenset({
+    CANDIDATE_LOGIN_REJECTED,
+    CANDIDATE_FORM_UNCONFIRMED,
+})
+
+_recovery_sleep = time.sleep
+
+
 def _rotate_dataimpulse_route(
     account: PoolAccount,
     settings: Settings,
@@ -3433,7 +3600,16 @@ def _rotate_dataimpulse_route(
     reason: str,
     _owner_execution: bool = False,
 ) -> bool:
-    """Validate then promote one new sticky port for one account only."""
+    """Try new sticky ports for ONE account until one is proven and adopted.
+
+    Up to ``dataimpulse_candidates_per_recovery`` candidates run back to back.
+    A transport failure (preflight, proxy health, reused exit) moves straight
+    to the next port; a portal login rejection waits
+    ``dataimpulse_candidate_retry_seconds`` first. The loop ends at the first
+    promotion, at a terminal outcome, when the hourly retry allowance is used
+    up, or when a stop request / global cooldown appears. Every attempt is
+    written to the candidate ledger with its own failure class.
+    """
     if os.environ.get("CBRS_BROWSER_OWNER_MODE") == "external" and not _owner_execution:
         entry = browser_pool._entries.get(account.account_id)
         if entry is None or not getattr(getattr(entry.scraper, "browser", None), "is_remote", False):
@@ -3455,40 +3631,87 @@ def _rotate_dataimpulse_route(
             data={"reason": "authenticated_browser_preserved_until_service_stop"},
         )
         return False
+    attempts = max(1, int(getattr(settings, "dataimpulse_candidates_per_recovery", 1) or 1))
+    retry_delay = max(0.0, float(getattr(settings, "dataimpulse_candidate_retry_seconds", 0.0) or 0.0))
+    outcome = ""
+    for index in range(attempts):
+        if index:
+            if pool_store.stop_requested() or store.global_cooldown():
+                break
+        outcome = _try_dataimpulse_candidate(
+            account, settings, store, pool_store, run_id, browser_pool,
+            preflight_runner, proxy_health_runner,
+            reason=reason, attempt_index=index + 1, attempts=attempts,
+        )
+        if outcome == CANDIDATE_PROMOTED:
+            return True
+        if outcome in TERMINAL_CANDIDATE_OUTCOMES or outcome.startswith("blocked:"):
+            break
+        if index + 1 < attempts and outcome in PORTAL_CANDIDATE_OUTCOMES and retry_delay > 0:
+            _recovery_sleep(retry_delay)
+    if outcome in PORTAL_CANDIDATE_OUTCOMES and retry_delay > 0:
+        # Pacing inside this call is the sleep above; the durable stamp is the
+        # deadline for the NEXT recovery call (published as next eligible).
+        store.set_dataimpulse_route_retry(account.account_id, retry_seconds=retry_delay)
+    return False
+
+
+def _try_dataimpulse_candidate(
+    account: PoolAccount,
+    settings: Settings,
+    store: JobStore,
+    pool_store: AccountPoolStore,
+    run_id: str,
+    browser_pool: _PersistentAccountBrowsers,
+    preflight_runner: Callable[..., Any],
+    proxy_health_runner: Callable[..., Any],
+    *,
+    reason: str,
+    attempt_index: int,
+    attempts: int,
+) -> str:
+    """Validate, prove and promote ONE new sticky port; return its outcome."""
     candidate = store.begin_dataimpulse_rotation(
         account.account_id,
         initial_port=account.dataimpulse_port,
         reason=reason,
         port_min=settings.dataimpulse_port_min,
         port_max=settings.dataimpulse_port_max,
-        cooldown_seconds=settings.dataimpulse_rotation_cooldown_seconds,
+        cooldown_seconds=0.0,
         max_rotations_per_hour=settings.dataimpulse_max_rotations_per_hour,
         randomize=True,
     )
     if not candidate.get("ok"):
         blocked_reason = str(candidate.get("reason") or "proxy_rotation_blocked")
-        if blocked_reason == "proxy_recovery_exhausted":
+        next_eligible = candidate.get("next_eligible_at")
+        if blocked_reason == RETRY_ALLOWANCE_EXHAUSTED and next_eligible:
+            # One deadline for the route and the account: the window boundary.
             pool_store.pause_account(
                 run_id,
                 account.account_id,
-                reason=blocked_reason,
-                cooldown_seconds=3600,
+                reason=RETRY_ALLOWANCE_EXHAUSTED,
+                resume_at=str(next_eligible),
             )
         store.add_event(
             "dataimpulse_rotation_skipped",
             account_id=account.account_id,
             level="warning",
-            data={"reason": blocked_reason},
+            data={
+                "reason": blocked_reason,
+                "next_eligible_at": next_eligible,
+                "attempts_in_window": candidate.get("rotation_count"),
+                "window_limit": settings.dataimpulse_max_rotations_per_hour,
+            },
         )
-        return False
+        return f"blocked:{blocked_reason}"
     pending_port = int(candidate["pending_port"])
+    started_at = utc_now()
     promoted = False
     candidate_manager = None
     candidate_scraper = None
     proven_entry = None
     adopted = False
     egress_hash = ""
-    provider_terminal = False
     try:
         candidate_settings = _runtime_account_settings(
             settings,
@@ -3514,85 +3737,93 @@ def _rotate_dataimpulse_route(
         )
         if not preflight.ok:
             details = " ".join(str(value) for value in preflight.report.get("errors", []))
-            provider_terminal = "407" in details or _dataimpulse_failure_kind(RuntimeError(details)) == "provider_terminal"
-            raise SafetyStopException(
-                StopReason.EGRESS_PREFLIGHT,
-                "Candidate DataImpulse route failed preflight.",
-                context="dataimpulse rotation",
+            terminal = "407" in details or _dataimpulse_failure_kind(RuntimeError(details)) == "provider_terminal"
+            raise _CandidateRejected(
+                CANDIDATE_PROVIDER_TERMINAL if terminal else CANDIDATE_CONNECTIVITY_FAILED,
+                StopReason.EGRESS_PREFLIGHT.value, terminal=terminal,
             )
         proxy = proxy_health_runner(candidate_settings, write_report=True)
         if not proxy.ok:
             details = " ".join(str(value) for value in proxy.report.get("errors", []))
-            provider_terminal = "407" in details or _dataimpulse_failure_kind(RuntimeError(details)) == "provider_terminal"
-            raise SafetyStopException(
-                StopReason.PROXY_HEALTH,
-                "Candidate DataImpulse route failed proxy health.",
-                context="dataimpulse rotation",
+            terminal = "407" in details or _dataimpulse_failure_kind(RuntimeError(details)) == "provider_terminal"
+            raise _CandidateRejected(
+                CANDIDATE_PROVIDER_TERMINAL if terminal else CANDIDATE_CONNECTIVITY_FAILED,
+                StopReason.PROXY_HEALTH.value, terminal=terminal,
             )
         egress_hash = str(preflight.report.get("egress_hash") or "")
         if not egress_hash:
-            raise SafetyStopException(
-                StopReason.EGRESS_PREFLIGHT,
-                "Candidate DataImpulse route did not produce an egress identity.",
-                context="dataimpulse rotation",
+            raise _CandidateRejected(
+                CANDIDATE_CONNECTIVITY_FAILED, "no_egress_identity",
             )
         previous_hash = (store.account_check(account.account_id) or {}).get("egress_hash")
         if ((previous_hash and egress_hash == previous_hash)
                 or store.candidate_exit_rejected(account.account_id, egress_hash)):
-            raise SafetyStopException(
-                StopReason.EGRESS_PREFLIGHT,
-                "Candidate reused a previous/rejected exit; no login attempted.",
-                context="dataimpulse rotation",
+            raise _CandidateRejected(
+                CANDIDATE_EXIT_REUSED, "previous_or_rejected_exit",
             )
         owner = store.egress_owner(egress_hash, exclude_account=account.account_id)
         if owner:
-            raise SafetyStopException(
-                StopReason.PROXY_HEALTH,
-                "Candidate DataImpulse route is already assigned to another account.",
-                context="dataimpulse rotation",
+            raise _CandidateRejected(
+                CANDIDATE_EXIT_REUSED, "exit_assigned_to_other_account",
             )
         # Prove the target application's strongest signal before making the
         # route durable.  This standalone context uses the exact profile that
         # the worker will retain after promotion while the current account
         # context remains untouched until the candidate succeeds.
         username, password = account_credentials(account)
-        candidate_manager = browser_pool.scraper_factory(
-            headless=browser_pool.headless,
-            settings=candidate_settings,
-        )
-        candidate_scraper = None
         try:
+            candidate_manager = browser_pool.scraper_factory(
+                headless=browser_pool.headless,
+                settings=candidate_settings,
+            )
             candidate_scraper = (
                 candidate_manager.__enter__()
                 if hasattr(candidate_manager, "__enter__")
                 else candidate_manager
             )
+        except Exception as exc:
+            raise _CandidateRejected(
+                CANDIDATE_LAUNCH_FAILED, _redact_known_values(str(exc), username, password)[:160],
+            ) from exc
+        try:
             candidate_scraper.ensure_authenticated(username, password)
-            candidate_browser = getattr(
-                candidate_scraper, "browser", candidate_scraper
+        except CredentialsRejectedError as exc:
+            raise _CandidateRejected(
+                CANDIDATE_CREDENTIALS_REJECTED, "credentials_invalid",
+                http_status=exc.status, response_code=exc.response_code, terminal=True,
+            ) from exc
+        except SafetyStopException as exc:
+            raise _CandidateRejected(
+                CANDIDATE_LOGIN_REJECTED, exc.reason.value,
+                http_status=exc.status, response_code=exc.response_code,
+            ) from exc
+        except Exception as exc:
+            raise _CandidateRejected(
+                CANDIDATE_CONNECTIVITY_FAILED if _looks_like_connection_failure(exc)
+                else CANDIDATE_FORM_UNCONFIRMED,
+                _redact_known_values(str(exc), username, password)[:160],
+            ) from exc
+        candidate_browser = getattr(
+            candidate_scraper, "browser", candidate_scraper
+        )
+        raw_auth_state = candidate_browser.wait_for_commerce_auth_state()
+        auth_state = (
+            raw_auth_state
+            if isinstance(raw_auth_state, CommerceAuthState)
+            else CommerceAuthState(str(raw_auth_state))
+        )
+        if auth_state is not CommerceAuthState.AUTHENTICATED_FORM:
+            raise _CandidateRejected(
+                CANDIDATE_FORM_UNCONFIRMED, StopReason.AUTH_REQUIRED.value,
             )
-            raw_auth_state = candidate_browser.wait_for_commerce_auth_state()
-            auth_state = (
-                raw_auth_state
-                if isinstance(raw_auth_state, CommerceAuthState)
-                else CommerceAuthState(str(raw_auth_state))
-            )
-            if auth_state is not CommerceAuthState.AUTHENTICATED_FORM:
-                raise SafetyStopException(
-                    StopReason.AUTH_REQUIRED,
-                    "Candidate route did not render the protected commerce form.",
-                    context="dataimpulse rotation",
-                )
-            proven_entry = _ManagedAccountScraper(
-                manager=candidate_manager, scraper=candidate_scraper,
-                settings=candidate_settings, username=username, password=password,
-                authenticated_once=True, last_restart_at=time.monotonic(),
-            )
-            preserve = getattr(candidate_browser, "preserve_for_service_lifetime", None)
-            if callable(preserve):
-                preserve()
-        except Exception:
-            raise
+        proven_entry = _ManagedAccountScraper(
+            manager=candidate_manager, scraper=candidate_scraper,
+            settings=candidate_settings, username=username, password=password,
+            authenticated_once=True, last_restart_at=time.monotonic(),
+        )
+        preserve = getattr(candidate_browser, "preserve_for_service_lifetime", None)
+        if callable(preserve):
+            preserve()
         from .preflight import replace_egress_baseline
 
         replace_egress_baseline(
@@ -3600,7 +3831,10 @@ def _rotate_dataimpulse_route(
             egress_hash=egress_hash,
             egress_country=str(preflight.report.get("egress_country") or ""),
         )
-        route = store.finish_dataimpulse_rotation(account.account_id, promoted=True)
+        route = store.finish_dataimpulse_rotation(
+            account.account_id, promoted=True,
+            cooldown_seconds=settings.dataimpulse_rotation_cooldown_seconds,
+        )
         promoted = True
         store.set_account_check(
             account.account_id,
@@ -3610,12 +3844,18 @@ def _rotate_dataimpulse_route(
         adopted = True
         browser_pool.adopt_authenticated_candidate(account.account_id, proven_entry)
         pool_store.mark_account_available(run_id, account.account_id)
+        store.record_candidate_attempt(
+            account.account_id, sticky_port=pending_port, egress_hash=egress_hash,
+            outcome=CANDIDATE_PROMOTED, started_at=started_at,
+        )
         store.add_event(
             "dataimpulse_route_rotated",
             account_id=account.account_id,
             data={
                 "generation": int(route["generation"]),
                 "sticky_port": int(route["active_port"]),
+                "candidate_attempt": attempt_index,
+                "candidate_attempts_allowed": attempts,
                 "country_validated": True,
                 "portal_reachable": True,
                 "recaptcha_reachable": True,
@@ -3623,26 +3863,43 @@ def _rotate_dataimpulse_route(
                 "authenticated_form": True,
             },
         )
-        return True
+        return CANDIDATE_PROMOTED
     except Exception as exc:
+        if isinstance(exc, _CandidateRejected):
+            outcome, failure_reason = exc.outcome, exc.reason
+            http_status, response_code, terminal = exc.http_status, exc.response_code, exc.terminal
+        elif proven_entry is not None:
+            outcome, failure_reason = CANDIDATE_PROVEN_UNPERSISTED, redact_text(str(exc))[:160]
+            http_status, response_code, terminal = None, None, True
+        else:
+            outcome, failure_reason = (
+                (CANDIDATE_CONNECTIVITY_FAILED, redact_text(str(exc))[:160])
+                if _looks_like_connection_failure(exc)
+                else (CANDIDATE_FORM_UNCONFIRMED, redact_text(str(exc))[:160])
+            )
+            http_status, response_code, terminal = None, None, False
         if proven_entry is None and egress_hash:
             store.record_failed_candidate_exit(account.account_id, egress_hash)
-        if provider_terminal or isinstance(exc, CredentialsRejectedError):
+        if outcome in {CANDIDATE_PROVIDER_TERMINAL, CANDIDATE_CREDENTIALS_REJECTED}:
             pool_store.pause_account(
                 run_id, account.account_id,
-                reason="provider_terminal" if provider_terminal else "credentials_invalid",
+                reason=(
+                    "provider_terminal" if outcome == CANDIDATE_PROVIDER_TERMINAL
+                    else "credentials_invalid"
+                ),
                 cooldown_seconds=None,
             )
         if not promoted:
             store.finish_dataimpulse_rotation(
                 account.account_id,
                 promoted=False,
-                error_code=(
-                    exc.reason.value
-                    if isinstance(exc, SafetyStopException)
-                    else "candidate_failed"
-                ),
+                error_code=outcome,
             )
+        store.record_candidate_attempt(
+            account.account_id, sticky_port=pending_port, egress_hash=egress_hash or None,
+            outcome=outcome, http_status=http_status, response_code=response_code,
+            reason=failure_reason, started_at=started_at,
+        )
         store.add_event(
             (
                 "dataimpulse_route_promoted_auth_failed"
@@ -3652,14 +3909,17 @@ def _rotate_dataimpulse_route(
             account_id=account.account_id,
             level="error",
             data={
-                "reason": (
-                    exc.reason.value
-                    if isinstance(exc, SafetyStopException)
-                    else "candidate_failed"
-                )
+                "reason": outcome,
+                "detail": failure_reason,
+                "http_status": http_status,
+                "response_code": response_code,
+                "sticky_port": pending_port,
+                "candidate_attempt": attempt_index,
+                "candidate_attempts_allowed": attempts,
+                "terminal": terminal,
             },
         )
-        return False
+        return outcome
     finally:
         if proven_entry is not None and not adopted:
             # Even persistence failure cannot authorize closing a proven session.
@@ -3811,33 +4071,46 @@ def _handle_account_safety_stop(
             account.account_id,
             initial_port=account.dataimpulse_port,
         )
+        login_scope = job_id is None
+        # A visibly rejected login recovers after ``login_recovery_threshold``
+        # (default: the first one). Query failures keep failing over to another
+        # account before any route change.
+        threshold = (
+            settings.dataimpulse_login_recovery_threshold
+            if login_scope
+            else settings.dataimpulse_temp_unavailable_threshold
+        )
         recent_success = store.another_account_succeeded_recently(
-            account.account_id, allow_authenticated_form=job_id is None,
+            account.account_id, allow_authenticated_form=login_scope,
         )
         canary = False
-        if (not recent_success and job_id is None
+        if (not recent_success and login_scope
                 and account.proxy_provider == "dataimpulse_mobile_sticky"
                 and exc.status == 400 and exc.context == "auth login"
-                and failures >= settings.dataimpulse_temp_unavailable_threshold
+                and failures >= threshold
                 and not store.global_cooldown()
                 and not browser_pool.has_protected_session(account.account_id)):
-            # The operator confirmed direct-IP logins work. Permit a small
+            # The operator confirmed direct-IP logins work. Permit a bounded
             # Mobile-only sample even when no current proxy account works;
             # this does not bypass the outage wait or establish its cause.
-            canary = store.reserve_mobile_login_canary()
+            canary = store.reserve_mobile_login_canary(
+                max_per_hour=settings.dataimpulse_canary_per_hour,
+                spacing_seconds=settings.dataimpulse_canary_spacing_seconds,
+            )
         store.add_event(
             "dataimpulse_recovery_evaluated", account_id=account.account_id,
             job_id=job_id,
-            data={"reason": exc.reason.value, "failures": failures,
-                  "threshold": settings.dataimpulse_temp_unavailable_threshold,
+            data={"reason": exc.reason.value,
+                  "auth_code": _auth_failure_code(exc),
+                  "http_status": exc.status,
+                  "response_code": getattr(exc, "response_code", None),
+                  "failures": failures,
+                  "threshold": threshold,
                   "other_account_succeeded": recent_success,
                   "mobile_canary_reserved": canary,
-                  "scope": "login" if job_id is None else "query"},
+                  "scope": "login" if login_scope else "query"},
         )
-        if (
-            failures >= settings.dataimpulse_temp_unavailable_threshold
-            and (recent_success or canary)
-        ):
+        if failures >= threshold and (recent_success or canary):
             if _rotate_dataimpulse_route(
                 account,
                 settings,
@@ -3856,6 +4129,11 @@ def _handle_account_safety_stop(
                     data={"trigger": "temporary_unavailable_threshold"},
                 )
                 return "retry_account"
+            if login_scope:
+                _align_login_pause_with_route(
+                    account, settings, store, pool_store, run_id,
+                    reason=exc.reason.value,
+                )
     if (
         exc.reason == StopReason.TEMPORARY_UNAVAILABLE
         and _all_enabled_accounts_temporarily_unavailable(
@@ -3888,6 +4166,44 @@ def _handle_account_safety_stop(
         data={"reason": exc.reason.value},
     )
     return "retry_account"
+
+
+def _align_login_pause_with_route(
+    account: PoolAccount,
+    settings: Settings,
+    store: JobStore,
+    pool_store: AccountPoolStore,
+    run_id: str,
+    *,
+    reason: str,
+) -> None:
+    """After a failed login recovery, pause only as long as the route requires.
+
+    The generic ``temporary_unavailable`` pause exists to avoid re-submitting
+    the same rejected login. Once candidates were actually tried, the next
+    eligible attempt is the route's own deadline: the retry-allowance window
+    boundary when exhausted, otherwise the short candidate retry delay.
+    """
+    route = store.dataimpulse_route(account.account_id) or {}
+    status = str(route.get("status") or "")
+    cooldown_until = str(route.get("cooldown_until") or "")
+    now = utc_now()
+    if status == RETRY_ALLOWANCE_EXHAUSTED and cooldown_until > now:
+        pool_store.pause_account(
+            run_id, account.account_id,
+            reason=RETRY_ALLOWANCE_EXHAUSTED, resume_at=cooldown_until,
+        )
+        return
+    if status != "candidate_failed":
+        return  # nothing was tried (protected session, external owner...)
+    retry_at = (
+        datetime.now(timezone.utc)
+        + timedelta(seconds=max(0.0, float(settings.dataimpulse_candidate_retry_seconds)))
+    ).replace(microsecond=0).isoformat()
+    pool_store.pause_account(
+        run_id, account.account_id, reason=reason,
+        resume_at=max(retry_at, cooldown_until) if cooldown_until else retry_at,
+    )
 
 
 def _all_enabled_accounts_temporarily_unavailable(
@@ -4009,6 +4325,26 @@ def _redact_known_values(text: str, *values: str) -> str:
         if value:
             safe = safe.replace(value, "[REDACTED]")
     return safe
+
+
+def _auth_failure_code(exc: Exception) -> str:
+    """Specific, sanitized code for a failed browser login.
+
+    ``temporary_unavailable`` is CBRS's shared retry reason for a rejected
+    login submission, a rejected login page, a rejected search and a generic
+    error dialog. The overview needs to tell those apart; the recovery policy
+    keeps using ``exc.reason``.
+    """
+    if isinstance(exc, SafetyStopException):
+        if exc.reason == StopReason.TEMPORARY_UNAVAILABLE:
+            if exc.context == "auth login":
+                return AUTH_LOGIN_REJECTED
+            if exc.context == "auth navigation":
+                return AUTH_LOGIN_PAGE_REJECTED
+        return exc.reason.value
+    if isinstance(exc, CredentialsRejectedError):
+        return "credentials_invalid"
+    return "authentication_failed"
 
 
 def _looks_like_connection_failure(exc: Exception) -> bool:

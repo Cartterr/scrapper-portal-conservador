@@ -256,6 +256,7 @@
     .account.portal_quota_exhausted, .account.portal_quota_check_due { border-color: #b7791f; }
     .quota-hold { margin-top: 12px; padding: 12px; border-radius: 12px; background: #fff3cd; color: #664d03; border: 1px solid #d9ad39; display: grid; gap: 6px; font-size: 12px; overflow-wrap: anywhere; }
     .quota-hold strong { font-size: 14px; }
+    .retry-hold { background: #eef2ff; color: #273b80; border-color: #8296db; }
     .account.captcha_pending {
       border-color: var(--captcha);
       background: linear-gradient(135deg, var(--captcha-soft), #fff);
@@ -380,6 +381,14 @@
       cursor: not-allowed;
       opacity: .65;
     }
+    .candidate-log {
+      margin-top: 8px;
+      font-size: 0.85em;
+      color: var(--muted, inherit);
+    }
+    .candidate-log summary { cursor: pointer; }
+    .candidate-log ul { margin: 4px 0 0; padding-left: 16px; }
+    .candidate-log li { margin: 2px 0; }
     .recovery-phase {
       display: flex;
       align-items: center;
@@ -1021,7 +1030,7 @@
         </div>
         <div class="capacity">
           <div class="capacity-row">
-            <span>Consultas disponibles hoy</span>
+            <span>Consultas disponibles · ventanas de 24 h</span>
             <span id="capacityNumber">- / 60</span>
           </div>
           <div class="bar">
@@ -1042,8 +1051,8 @@
     <div id="accounts" class="accounts"></div>
 
     <div class="kpis">
-      <div class="kpi"><div class="kpi-top"><div class="muted">Usadas hoy</div><span class="kpi-icon"><i data-lucide="circle-check-big"></i></span></div><div id="usedToday" class="value">-</div></div>
-      <div class="kpi"><div class="kpi-top"><div class="muted">Restantes hoy</div><span class="kpi-icon ok"><i data-lucide="battery-charging"></i></span></div><div id="remainingToday" class="value">-</div></div>
+      <div class="kpi"><div class="kpi-top"><div class="muted">Usadas · ventanas de 24 h</div><span class="kpi-icon"><i data-lucide="circle-check-big"></i></span></div><div id="usedToday" class="value">-</div></div>
+      <div class="kpi"><div class="kpi-top"><div class="muted">Disponibles · ventanas de 24 h</div><span class="kpi-icon ok"><i data-lucide="battery-charging"></i></span></div><div id="remainingToday" class="value">-</div></div>
       <div class="kpi"><div class="kpi-top"><div class="muted">PDFs generados</div><span class="kpi-icon"><i data-lucide="file-text"></i></span></div><div id="downloads" class="value">-</div></div>
       <div class="kpi"><div class="kpi-top"><div class="muted">Captchas pendientes</div><span class="kpi-icon warn"><i data-lucide="shield-question"></i></span></div><div id="captchaPending" class="value">-</div></div>
       <div class="kpi"><div class="kpi-top"><div class="muted">Solves pagados hoy</div><span class="kpi-icon"><i data-lucide="key-round"></i></span></div><div id="paidCaptcha" class="value">-</div></div>
@@ -1136,7 +1145,31 @@
       stopped: "detenido",
       waiting: "en espera",
       waiting_capacity: "sin capacidad",
-      waiting_captcha: "esperando captcha"
+      waiting_captcha: "esperando captcha",
+      // Recovery route states
+      configured: "configurada",
+      validating: "probando candidato",
+      active: "ruta activa",
+      candidate_failed: "candidato falló",
+      rotation_cooldown: "esperando reintento",
+      retry_allowance_exhausted: "cupo de reintentos agotado",
+      proxy_recovery_exhausted: "cupo de reintentos agotado (legado)",
+      // Candidate outcomes (ledger)
+      promoted: "candidato adoptado",
+      candidate_connectivity_failed: "conectividad del candidato falló",
+      candidate_exit_reused: "salida del candidato repetida",
+      candidate_login_rejected: "login del candidato rechazado",
+      candidate_form_unconfirmed: "formulario del candidato no confirmado",
+      candidate_launch_failed: "no se pudo abrir el candidato",
+      candidate_provider_terminal: "proveedor rechazó el candidato",
+      candidate_credentials_rejected: "credenciales rechazadas",
+      candidate_proven_unpersisted: "candidato autenticado sin persistir",
+      // Browser login errors
+      login_rejected: "login rechazado",
+      login_page_rejected: "página de login rechazada",
+      temporary_unavailable: "rechazo temporal del portal",
+      credentials_invalid: "credenciales inválidas",
+      authentication_failed: "autenticación falló"
     };
     const captchaPhaseLabels = {
       automatic_login: "iniciando sesión automáticamente",
@@ -1446,7 +1479,7 @@
       if (data.status === "waiting_capacity") return "Pool sin capacidad disponible";
       if (data.status === "waiting" && nextSeconds !== null) return `Próxima consulta en ${fmtSeconds(nextSeconds)}`;
       if (data.status === "running") return `Ejecutando con ${pool.next_account_label || "cuenta disponible"}`;
-      return `${pool.remaining_today ?? 0} consultas disponibles hoy`;
+      return `${pool.remaining_today ?? 0} consultas disponibles`;
     }
     function subline(data, nextSeconds) {
       const pool = data.pool || {};
@@ -1459,7 +1492,7 @@
       if (data.status === "waiting_capacity") {
         return "El runner queda vivo, pero no hará más tráfico hasta tener cuentas con cupo.";
       }
-      return `${pool.used_today || 0} usadas de ${pool.daily_quota || 60} consultas teóricas diarias.`;
+      return `${pool.used_today || 0} usadas en ventanas de 24 h por cuenta. No se reinician a medianoche.`;
     }
     function renderAlert(alert) {
       const box = document.getElementById("alert");
@@ -1495,7 +1528,30 @@
         .map(([key, value]) => `<tr><th>${escapeHtml(key)}</th><td>${escapeHtml(value)}</td></tr>`)
         .join("");
     }
+    function quotaCountdownText(deadline) {
+      const seconds = Math.max(0, Math.ceil((new Date(deadline).getTime()-Date.now())/1000));
+      return seconds ? `Espera: ${Math.floor(seconds/3600)} h ${Math.floor(seconds%3600/60)} min ${seconds%60} s` : 'Comprobación pendiente; saldo aún no confirmado';
+    }
+    function retryCountdownText(deadline) {
+      const end = Date.parse(deadline);
+      if (!Number.isFinite(end)) return 'Sin plazo de reintento informado';
+      const seconds = Math.max(0, Math.ceil((end - Date.now()) / 1000));
+      return seconds > 0 ? `Reintento habilitado en: ${fmtSeconds(seconds)}` : 'Plazo cumplido · esperando actualización del servicio';
+    }
     function renderAccounts(accounts) {
+      let pendingEvidence = document.getElementById('pendingSearchEvidence');
+      if (!pendingEvidence) {
+        pendingEvidence = document.createElement('div');
+        pendingEvidence.id = 'pendingSearchEvidence';
+        pendingEvidence.className = 'quota-hold';
+        pendingEvidence.setAttribute('role', 'status');
+        document.getElementById('accounts').before(pendingEvidence);
+      }
+      const uncertainJob = (current?.jobs?.recent || []).find(job =>
+        ['failed','waiting_capacity'].includes(job.status) && ['search_outcome_unknown','search_receipt_incomplete'].includes(job.error_code));
+      pendingEvidence.hidden = !uncertainJob;
+      pendingEvidence.style.display = uncertainJob ? 'grid' : 'none';
+      pendingEvidence.innerHTML = uncertainJob ? `<strong>Trabajo pendiente de revisión: resultado de búsqueda no confirmado</strong><span>El navegador sigue conectado. No se repetirá esta consulta automáticamente para evitar duplicados. Requiere verificar el resultado o descartar el trabajo.</span><a href="/api/jobs/${encodeURIComponent(uncertainJob.job_id)}">Ver evidencia del trabajo</a>` : '';
       document.getElementById("accounts").innerHTML = accounts.map((account, index) => {
         const pct = account.daily_quota ? Math.min(100, (account.used_today / account.daily_quota) * 100) : 0;
         const route = account.egress_shared
@@ -1521,7 +1577,7 @@
               : `${label(latestAttempt.status)} · ${label(latestAttempt.reason)} · ${localTime(latestAttempt.finished_at)}`;
         const note = account.paused_reason
           ? `Motivo: ${account.paused_reason}${retryNote} · ${route}${baseline}`
-          : `${account.remaining_today} restantes hoy · ${route}${baseline}`;
+          : `${account.remaining_today} restantes en su ventana de 24 h · ${route}${baseline}`;
         const routeIsHealthy = account.proxy_health_status === "passed"
           && account.egress_baseline_status === "matched";
         const routeState = routeIsHealthy ? "Ruta validada" : "Ruta sin validar";
@@ -1560,7 +1616,7 @@
             ? "NO CONFIRMADA"
             : `NO · ${browserName} detenido`;
         const browserStateLabel = commerceBlocked
-          ? "LOGUEADA · BÚSQUEDA BLOQUEADA"
+          ? "LOGUEADA · REINTENTO EN ESPERA"
           : account.browser_authenticated
           ? `LOGUEADA · ${authMethod.toUpperCase()}`
           : loginInProgress ? "INICIANDO SESIÓN"
@@ -1591,6 +1647,18 @@
             <span class="browser-preview-expand"><i data-lucide="maximize-2" aria-hidden="true"></i> Ampliar</span>
           </span>
         </button>`;
+        const eligibleSeconds = secondsUntil(account.proxy_next_eligible_at);
+        const nextEligibleLabel = eligibleSeconds === null
+          ? (account.proxy_route_status === "retry_allowance_exhausted" || account.proxy_route_status === "proxy_recovery_exhausted"
+              ? "Al cerrar la ventana horaria"
+              : "Ahora (si las reglas de la cuenta lo permiten)")
+          : `${escapeHtml(localTime(account.proxy_next_eligible_at))} · en ${escapeHtml(fmtSeconds(eligibleSeconds))}`;
+        const recentCandidates = Array.isArray(account.proxy_recent_candidates) ? account.proxy_recent_candidates : [];
+        const candidateLog = recentCandidates.length
+          ? `<details class="candidate-log"><summary>Últimos candidatos (${recentCandidates.length})</summary><ul>${recentCandidates.map((attempt) =>
+              `<li><code>${escapeHtml(String(attempt.sticky_port ?? "-"))}</code> · ${escapeHtml(label(attempt.outcome))}${attempt.http_status ? ` · HTTP ${escapeHtml(String(attempt.http_status))}` : ""}${attempt.response_code ? ` · ${escapeHtml(attempt.response_code)}` : ""}${attempt.egress_route_id ? ` · ${escapeHtml(attempt.egress_route_id)}` : ""} · ${escapeHtml(localTime(attempt.finished_at))}</li>`
+            ).join("")}</ul></details>`
+          : "";
         const routeView = `<div class="account-route" aria-label="Ruta proxy configurada de ${escapeHtml(account.username_prefix || account.label || account.account_id)}">
           <div class="account-route-head">
             <span class="account-route-title">Ruta proxy</span>
@@ -1604,6 +1672,9 @@
             <div><dt>Puerto sticky</dt><dd>${escapeHtml(account.proxy_sticky_port ?? "-")}</dd></div>
             <div><dt>TTL / generación</dt><dd>${account.proxy_sticky_ttl_minutes ? `${escapeHtml(account.proxy_sticky_ttl_minutes)} min` : "-"} · ${escapeHtml(account.proxy_generation ?? 0)}</dd></div>
             <div><dt>Estado de recuperación</dt><dd>${escapeHtml(label(account.proxy_route_status || "not_initialized"))}</dd></div>
+            <div><dt>Último fallo de candidato</dt><dd>${escapeHtml(account.proxy_last_candidate_outcome ? label(account.proxy_last_candidate_outcome) : "-")}</dd></div>
+            <div><dt>Intentos en la ventana</dt><dd>${escapeHtml(String(account.proxy_rotation_count_hour ?? 0))}${account.proxy_rotation_limit_hour ? ` / ${escapeHtml(String(account.proxy_rotation_limit_hour))} por hora` : ""}</dd></div>
+            <div><dt>Próximo intento elegible</dt><dd>${nextEligibleLabel}</dd></div>
             <div><dt>Última rotación</dt><dd>${escapeHtml(localTime(account.proxy_last_rotated_at))}</dd></div>
             <div><dt>Aislamiento</dt><dd>${account.egress_shared ? "Compartida" : "Exclusiva por cuenta"}</dd></div>
             <div><dt>Último control</dt><dd>${escapeHtml(localTime(account.proxy_checked_at))}</dd></div>
@@ -1613,14 +1684,15 @@
             <div><dt>Evidencia DOM</dt><dd><code>${escapeHtml(account.browser_auth_state || "unknown")}</code></dd></div>
             <div><dt>Última comprobación DOM</dt><dd>${escapeHtml(localTime(account.browser_checked_at))}</dd></div>
             <div><dt>Última autenticación confirmada</dt><dd>${escapeHtml(localTime(account.browser_authenticated_at))}</dd></div>
-            <div><dt>Último error de login</dt><dd>${escapeHtml(account.browser_last_auth_error || "-")}${account.browser_last_auth_http_status ? " · HTTP " + escapeHtml(String(account.browser_last_auth_http_status)) : ""}</dd></div>
+            <div><dt>Último error de login</dt><dd>${escapeHtml(account.browser_last_auth_error ? label(account.browser_last_auth_error) : "-")}${account.browser_last_auth_http_status ? " · HTTP " + escapeHtml(String(account.browser_last_auth_http_status)) : ""}</dd></div>
             <div><dt>Última consulta protegida</dt><dd>${escapeHtml(protectedAccess)}</dd></div>
           </dl>
+          ${candidateLog}
         </div>`;
         const phase = account.captcha_phase || "";
         const phaseLabel = captchaPhaseLabels[phase] || "";
         const browserBadge = commerceBlocked
-          ? { label: "LOGUEADA · BÚSQUEDA BLOQUEADA", css: "browser_unconfirmed" }
+          ? { label: "LOGUEADA · REINTENTO EN ESPERA", css: "browser_unconfirmed" }
           : account.browser_authenticated
           ? { label: browserStateLabel, css: "browser_authenticated" }
           : account.browser_status === "login_gate_visible"
@@ -1631,12 +1703,19 @@
               ? { label: `${browserName} no iniciado`, css: "browser_offline" }
               : { label: `${browserName} detenido`, css: "browser_offline" };
         const quotaHold = account.portal_quota;
+        const retryView = account.status === 'paused' && !quotaHold ? `<div class="quota-hold retry-hold" role="status">
+          <strong>Reintento en espera</strong>
+          <span>Motivo: ${escapeHtml(label(account.paused_reason || 'unknown'))}</span>
+          <b data-retry-countdown="${escapeHtml(account.resume_at || '')}">${escapeHtml(retryCountdownText(account.resume_at))}</b>
+          ${account.resume_at ? `<span>Habilitación prevista: ${escapeHtml(localTime(account.resume_at))}</span>` : ''}
+          <small>Es una pausa temporal, no la renovación de cupo. Al vencer, la cuenta vuelve a ser elegible según el estado del servicio y la cola; no garantiza una ejecución inmediata.</small>
+        </div>` : '';
         const eligibilityLabel = quotaHold ? (quotaHold.blocked ? "Agotado en CBRS" : "Pendiente de comprobar") : phaseLabel || label(account.status);
         const quotaView = quotaHold ? `<div class="quota-hold" role="status">
           <strong>Cupo agotado en CBRS</strong>
           <span>Consultas detenidas; navegador y sesión conservados.</span>
           <span>Próxima comprobación estimada: <b>${escapeHtml(new Date(quotaHold.next_check_at).toLocaleString('es-CL', {timeZone:'America/Santiago'}))}</b> (Chile)</span>
-          <b data-quota-countdown="${escapeHtml(quotaHold.next_check_at)}"></b>
+          <b data-quota-countdown="${escapeHtml(quotaHold.next_check_at)}">${escapeHtml(quotaCountdownText(quotaHold.next_check_at))}</b>
           <small>No es una hora de reinicio confirmada por el portal. El saldo solo se confirma tras una consulta aceptada.</small>
           <small>${account.used_today} éxitos registrados localmente; el límite del portal puede incluir otras consultas.</small>
         </div>` : "";
@@ -1672,8 +1751,10 @@
           </div>
           <div class="account-count">${account.used_today}/${account.daily_quota}</div>
           <div class="mini-bar"><span style="width:${pct}%"></span></div>
+          ${account.quota_window?.resets_at ? `<div class="muted" style="margin-top:8px">Ventana local de 24 h · desde ${escapeHtml(localTime(account.quota_window.started_at))}<br>Renovación local: ${escapeHtml(localTime(account.quota_window.resets_at))}<br><b data-quota-countdown="${escapeHtml(account.quota_window.resets_at)}">${escapeHtml(quotaCountdownText(account.quota_window.resets_at))}</b></div>` : '<div class="muted">La ventana de 24 h comienza con la primera búsqueda aceptada.</div>'}
           <div class="muted" style="margin-top:8px">${escapeHtml(note)}</div>
           ${quotaView}
+          ${retryView}
           ${previewView}
           ${routeView}
           ${phaseView}
@@ -1911,7 +1992,7 @@
           <td>${escapeHtml(job.kind)}${job.source === "endurance" ? " · endurance" : ""}</td>
           <td>${account}</td>
           <td>${documentNumber}</td>
-          <td><span class="status ${escapeHtml(job.status)}">${escapeHtml(label(job.status))}</span></td>
+          <td><span class="status ${escapeHtml(job.status)}">${escapeHtml(job.error_code === 'document_retrieval_deferred' ? 'Documento pendiente' : ['search_outcome_unknown','search_receipt_incomplete'].includes(job.error_code) ? 'Revisión requerida' : label(job.status))}</span></td>
           <td>${reason}</td>
           <td>${job.result_count ?? "-"}</td>
           <td>${job.completed_items ?? 0}</td>
@@ -2405,8 +2486,10 @@
     refresh().catch(console.error);
     setInterval(() => {
       document.querySelectorAll('[data-quota-countdown]').forEach(el => {
-        const seconds = Math.max(0, Math.ceil((new Date(el.dataset.quotaCountdown).getTime()-Date.now())/1000));
-        el.textContent = seconds ? `Espera: ${Math.floor(seconds/3600)} h ${Math.floor(seconds%3600/60)} min ${seconds%60} s` : 'Comprobación pendiente; saldo aún no confirmado';
+        el.textContent = quotaCountdownText(el.dataset.quotaCountdown);
+      });
+      document.querySelectorAll('[data-retry-countdown]').forEach(el => {
+        el.textContent = retryCountdownText(el.dataset.retryCountdown);
       });
     }, 1000);
     setInterval(() => refresh().catch(console.error), 2000);

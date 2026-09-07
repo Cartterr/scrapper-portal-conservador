@@ -525,13 +525,21 @@ class AccountPoolStore:
         *,
         reason: str,
         cooldown_seconds: float | None = DEFAULT_SECURITY_COOLDOWN_SECONDS,
+        resume_at: str | None = None,
     ) -> None:
+        """Pause one account.
+
+        ``cooldown_seconds`` is clamped to the security cooldown; ``resume_at``
+        is an explicit ISO timestamp used as-is so the account pause can agree
+        with a durable route deadline (for example a retry-allowance window).
+        """
         now = utc_now()
-        resume_at = (
-            None
-            if reason == "daily_limit" or cooldown_seconds is None
-            else _cooldown_until(cooldown_seconds)
-        )
+        if resume_at is None:
+            resume_at = (
+                None
+                if reason == "daily_limit" or cooldown_seconds is None
+                else _cooldown_until(cooldown_seconds)
+            )
         with self._connect() as db:
             db.execute(
                 """

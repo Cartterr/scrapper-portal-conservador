@@ -68,7 +68,8 @@ def test_search_receipt_is_atomic_and_empty_results_are_final(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("failure", [False, True])
-def test_document_phase_reuses_original_account_at_full_search_quota(tmp_path, monkeypatch, failure):
+@pytest.mark.parametrize("held", [False, True])
+def test_document_phase_reuses_original_account_at_full_search_quota(tmp_path, monkeypatch, failure, held):
     settings, config = _settings(tmp_path), _config(quota=1)
     _credentials(monkeypatch, config)
     store = JobStore(tmp_path / "pool.sqlite3")
@@ -81,8 +82,9 @@ def test_document_phase_reuses_original_account_at_full_search_quota(tmp_path, m
     with store.connect() as db:
         db.execute("UPDATE runs SET finished_at = ?, status = 'stopped' WHERE run_id = 'r'", (utc_now(),))
     retrieved = []
-    from cbrs.form_search import record_quota_hold
-    record_quota_hold(store.path, 'a1')  # Document resume must work even while searches are held.
+    if held:
+        from cbrs.form_search import record_quota_hold
+        record_quota_hold(store.path, 'a1')
 
     class DocumentsOnly(FakeScraper):
         def search_by_text(self, query):
@@ -97,10 +99,12 @@ def test_document_phase_reuses_original_account_at_full_search_quota(tmp_path, m
     run_job_worker(settings=settings, config=config, store=store, pool_store=pool,
                    once=True, scraper_factory=DocumentsOnly, preflight_runner=_gate,
                    proxy_health_runner=_gate)
-    assert retrieved == ["a1"]
+    assert retrieved == ([] if held else ["a1"])
     assert store.search_checkpoint(job["job_id"])["saved"]
     assert store.usage_by_account(_today())["a1"] == 1
-    assert store.get_job(job["job_id"])["status"] == ("waiting_capacity" if failure else "completed")
+    assert store.get_job(job["job_id"])["status"] == ("failed" if failure or held else "completed")
+    if failure or held:
+        assert store.get_job(job["job_id"])["error_code"] == 'document_retrieval_deferred'
 
 
 def test_portal_quota_hold_excludes_search_and_dashboard_credit(tmp_path, monkeypatch):
@@ -759,8 +763,131 @@ def test_dataimpulse_rotation_rate_limit_fails_closed(tmp_path):
     )
 
     assert blocked["ok"] is False
-    assert blocked["reason"] == "proxy_recovery_exhausted"
-    assert store.dataimpulse_route("a1")["status"] == "proxy_recovery_exhausted"
+    assert blocked["reason"] == "retry_allowance_exhausted"
+    assert store.dataimpulse_route("a1")["status"] == "retry_allowance_exhausted"
+
+
+def test_retry_allowance_resets_at_the_window_boundary_not_an_hour_from_now(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    store = JobStore(tmp_path / "pool.sqlite3")
+    store.ensure_dataimpulse_route("a1", 10000)
+    window_started = (
+        datetime.now(timezone.utc) - timedelta(minutes=40)
+    ).replace(microsecond=0)
+    with store.connect() as db:
+        db.execute(
+            """
+            UPDATE account_proxy_routes
+            SET rotation_count = 3, rotation_window_started_at = ?, cooldown_until = NULL
+            WHERE account_id = 'a1'
+            """,
+            (window_started.isoformat(),),
+        )
+
+    blocked = store.begin_dataimpulse_rotation(
+        "a1", initial_port=10000, reason="test", port_min=10000, port_max=20000,
+        cooldown_seconds=0, max_rotations_per_hour=3,
+    )
+
+    expected = (window_started + timedelta(hours=1)).isoformat()
+    assert blocked["reason"] == "retry_allowance_exhausted"
+    assert blocked["next_eligible_at"] == expected
+    assert store.dataimpulse_route("a1")["cooldown_until"] == expected
+    # Roughly twenty minutes, never the sixty the old implementation produced.
+    remaining = (
+        datetime.fromisoformat(expected) - datetime.now(timezone.utc)
+    ).total_seconds()
+    assert 0 < remaining <= 20 * 60 + 5
+
+
+def test_failed_candidate_waits_only_the_retry_delay_and_promotion_sets_cooldown(tmp_path):
+    from datetime import datetime, timezone
+
+    store = JobStore(tmp_path / "pool.sqlite3")
+    store.ensure_dataimpulse_route("a1", 10000)
+    store.begin_dataimpulse_rotation(
+        "a1", initial_port=10000, reason="test", port_min=10000, port_max=20000,
+        cooldown_seconds=0, max_rotations_per_hour=30,
+    )
+    # A transport failure leaves the route immediately eligible again.
+    route = store.finish_dataimpulse_rotation(
+        "a1", promoted=False, error_code="candidate_connectivity_failed", retry_seconds=0,
+    )
+    assert route["cooldown_until"] is None
+    assert route["last_error_code"] == "candidate_connectivity_failed"
+    again = store.begin_dataimpulse_rotation(
+        "a1", initial_port=10000, reason="test", port_min=10000, port_max=20000,
+        cooldown_seconds=0, max_rotations_per_hour=30,
+    )
+    assert again["ok"] is True
+    # A portal login rejection waits the short retry delay, not five minutes.
+    route = store.finish_dataimpulse_rotation(
+        "a1", promoted=False, error_code="candidate_login_rejected", retry_seconds=10,
+    )
+    wait = (
+        datetime.fromisoformat(route["cooldown_until"]) - datetime.now(timezone.utc)
+    ).total_seconds()
+    assert 0 <= wait <= 10
+    with store.connect() as db:
+        db.execute("UPDATE account_proxy_routes SET cooldown_until = NULL")
+    store.begin_dataimpulse_rotation(
+        "a1", initial_port=10000, reason="test", port_min=10000, port_max=20000,
+        cooldown_seconds=0, max_rotations_per_hour=30,
+    )
+    promoted = store.finish_dataimpulse_rotation("a1", promoted=True, cooldown_seconds=60)
+    wait = (
+        datetime.fromisoformat(promoted["cooldown_until"]) - datetime.now(timezone.utc)
+    ).total_seconds()
+    assert 50 <= wait <= 60
+    assert promoted["status"] == "active"
+    assert store.dataimpulse_route("a1")["rotation_count"] == 3
+
+
+def test_candidate_attempt_ledger_is_sanitized_bounded_and_ordered(tmp_path):
+    store = JobStore(tmp_path / "pool.sqlite3")
+    for index in range(205):
+        store.record_candidate_attempt(
+            "a1", sticky_port=10000 + index, egress_hash=f"exit-{index}",
+            outcome="candidate_login_rejected" if index % 2 else "candidate_connectivity_failed",
+            http_status=400 if index % 2 else None,
+            response_code="intente-mas-tarde" if index % 2 else None,
+            reason="token=abc123 detail", started_at=utc_now(),
+        )
+    recent = store.recent_candidate_attempts("a1", limit=3)
+    assert [row["sticky_port"] for row in recent] == [10204, 10203, 10202]
+    assert recent[1]["outcome"] == "candidate_login_rejected"
+    assert recent[1]["http_status"] == 400
+    assert recent[1]["response_code"] == "intente-mas-tarde"
+    assert recent[1]["egress_route_id"].startswith("ip-")
+    assert "exit-" not in json.dumps(recent)
+    assert "abc123" not in json.dumps(recent)
+    with store.connect() as db:
+        total = db.execute(
+            "SELECT COUNT(*) AS n FROM proxy_candidate_attempts WHERE account_id='a1'"
+        ).fetchone()["n"]
+    assert total == 200
+
+
+def test_pause_account_honours_an_explicit_resume_deadline(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    path = tmp_path / "pool.sqlite3"
+    config = PoolConfig(
+        accounts=(PoolAccount("a1", "Account 1"),), daily_quota_per_account=20,
+        interval_minutes=0, dashboard_host="127.0.0.1", dashboard_port=0, targets=(),
+    )
+    pool_store = AccountPoolStore(path)
+    pool_store.create_run(run_id="r1", dry_run=False, config=config, dashboard_url=None)
+    deadline = (
+        datetime.now(timezone.utc) + timedelta(minutes=45)
+    ).replace(microsecond=0).isoformat()
+    pool_store.pause_account("r1", "a1", reason="retry_allowance_exhausted", resume_at=deadline)
+    state = {row["account_id"]: row for row in pool_store.accounts("r1")}["a1"]
+    assert state["status"] == "paused"
+    assert state["paused_reason"] == "retry_allowance_exhausted"
+    assert state["resume_at"] == deadline  # not clamped to the 300 s security cooldown
+    assert pool_store.reactivate_expired_cooldowns("r1") == 0
 
 
 def test_dataimpulse_rotation_skips_a_recently_rejected_candidate(tmp_path):
@@ -1403,7 +1530,8 @@ def test_worker_holds_unknown_search_outcome_after_browser_context_failure(
         proxy_health_runner=_gate,
     )
 
-    assert store.get_job(job["job_id"])["status"] == "waiting_capacity"
+    assert store.get_job(job["job_id"])["status"] == "failed"
+    assert store.get_job(job["job_id"])["error_code"] == "search_outcome_unknown"
     with store.connect() as db:
         accounts = [
             row["account_id"]

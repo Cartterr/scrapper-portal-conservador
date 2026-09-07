@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .account_pool import (
+    utc_now,
     AccountPoolStore,
     PoolConfig,
     account_settings,
@@ -847,14 +848,18 @@ def _with_job_pool_usage(
     payload: dict[str, Any], job_store: "JobStore", config: PoolConfig
 ) -> dict[str, Any]:
     enriched = dict(payload)
-    usage = job_store.usage_by_account(local_today())
+    from .form_search import account_window
     accounts = []
     for account in enriched.get("accounts", []):
         item = dict(account)
-        used = usage.get(str(item.get("account_id")), 0)
+        window = account_window(job_store.path, str(item.get('account_id')))
+        item['quota_window'] = window
+        used = window['used']
         quota = int(item.get("daily_quota") or config.daily_quota_per_account)
         item["used_today"] = used
-        item["remaining_today"] = max(0, quota - used)
+        item["remaining_today"] = max(0, quota - used - window['reserved'])
+        if item.get('status') == 'quota_reached' and used + window['reserved'] < quota:
+            item['status'] = 'available'
         from .form_search import quota_hold
         item['portal_quota'] = quota_hold(job_store.path, str(item.get('account_id')))
         if item['portal_quota']:
@@ -1048,6 +1053,19 @@ def _with_proxy_state(
         item["proxy_last_rotated_at"] = route.get("last_rotated_at")
         item["proxy_rotation_cooldown_until"] = route.get("cooldown_until")
         item["proxy_rotation_count_hour"] = int(route.get("rotation_count") or 0)
+        item["proxy_rotation_limit_hour"] = int(
+            settings.dataimpulse_max_rotations_per_hour
+        )
+        item["proxy_rotation_window_started_at"] = route.get("rotation_window_started_at")
+        # Last candidate failure class (login rejected vs transport failure).
+        item["proxy_last_candidate_outcome"] = route.get("last_error_code")
+        cooldown_until = str(route.get("cooldown_until") or "")
+        item["proxy_next_eligible_at"] = (
+            cooldown_until if cooldown_until and cooldown_until > utc_now() else None
+        )
+        item["proxy_recent_candidates"] = job_store.recent_candidate_attempts(
+            account_id, limit=6
+        )
         item["proxy_sticky_ttl_minutes"] = (
             settings.dataimpulse_sticky_ttl_minutes
             if account

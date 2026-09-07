@@ -1040,7 +1040,7 @@ def test_pool_dashboard_api_and_html_are_sanitized(
 
     serialized = json.dumps(payload)
     assert "Pool de Consultas CBRS" in html
-    assert "Consultas disponibles hoy" in html
+    assert "Consultas disponibles · ventanas de 24 h" in html
     assert "account.username_prefix || account.label" in html
     assert 'class="account-route"' in html
     assert "IP / host proxy" in html
@@ -1055,7 +1055,7 @@ def test_pool_dashboard_api_and_html_are_sanitized(
     assert "Formulario protegido visible" in html
     assert "Login API aceptado" in html
     assert "Última consulta protegida" in html
-    assert "LOGUEADA · BÚSQUEDA BLOQUEADA" in html
+    assert "LOGUEADA · REINTENTO EN ESPERA" in html
     assert "NO LOGUEADA" in html
     assert "GoLogin (Orbita)" in html
     assert "Chrome nativo" in html
