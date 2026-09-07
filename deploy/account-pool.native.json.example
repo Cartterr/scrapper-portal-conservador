@@ -17,8 +17,8 @@
       "enabled": true,
       "username_env": "CBRS_EJECUTIVO_1_USERNAME",
       "password_env": "CBRS_EJECUTIVO_1_PASSWORD",
-      "proxy_provider": "dataimpulse_residential_sticky",
-      "proxy_brand": "DataImpulse",
+      "proxy_provider": "dataimpulse_mobile_sticky",
+      "proxy_brand": "DataImpulse Mobile",
       "dataimpulse_port": 10000,
       "daily_quota": 20
     },
@@ -28,8 +28,8 @@
       "enabled": true,
       "username_env": "CBRS_EJECUTIVO_2_USERNAME",
       "password_env": "CBRS_EJECUTIVO_2_PASSWORD",
-      "proxy_provider": "dataimpulse_residential_sticky",
-      "proxy_brand": "DataImpulse",
+      "proxy_provider": "dataimpulse_mobile_sticky",
+      "proxy_brand": "DataImpulse Mobile",
       "dataimpulse_port": 10001,
       "daily_quota": 20
     },
@@ -39,8 +39,8 @@
       "enabled": true,
       "username_env": "CBRS_EJECUTIVO_3_USERNAME",
       "password_env": "CBRS_EJECUTIVO_3_PASSWORD",
-      "proxy_provider": "dataimpulse_residential_sticky",
-      "proxy_brand": "DataImpulse",
+      "proxy_provider": "dataimpulse_mobile_sticky",
+      "proxy_brand": "DataImpulse Mobile",
       "dataimpulse_port": 10002,
       "daily_quota": 20
     }

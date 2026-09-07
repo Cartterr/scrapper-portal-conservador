@@ -11,7 +11,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from .dataimpulse import DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER
+from .dataimpulse import (
+    DATAIMPULSE_MOBILE_STICKY_PROVIDER,
+    DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER,
+)
 
 GENERIC_STATIC_PROXY_PROVIDER = "generic_static"
 TWO_CAPTCHA_DEDICATED_ISP_PROVIDER = "2captcha_dedicated_isp"
@@ -22,6 +25,7 @@ PROXY_PROVIDERS = frozenset(
         TWO_CAPTCHA_DEDICATED_ISP_PROVIDER,
         TWO_CAPTCHA_RESIDENTIAL_STICKY_PROVIDER,
         DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER,
+        DATAIMPULSE_MOBILE_STICKY_PROVIDER,
     }
 )
 TWO_CAPTCHA_PROXY_ACCOUNT_URL = "https://api.2captcha.com/proxy"
@@ -42,8 +46,10 @@ class ProxyProviderError(RuntimeError):
 def dataimpulse_configuration_health(
     login: str | None,
     password: str | None,
+    *,
+    provider: str = DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER,
 ) -> dict[str, Any]:
-    """Return redacted configuration health for a normal residential plan.
+    """Return redacted configuration health for a DataImpulse proxy plan.
 
     DataImpulse residential routing is controlled by proxy credentials and
     username parameters. It does not require the reseller account API.
@@ -51,7 +57,7 @@ def dataimpulse_configuration_health(
     configured = bool(str(login or "").strip() and str(password or ""))
     return _public_health(
         "configured" if configured else "not_configured",
-        provider=DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER,
+        provider=provider,
         account_active=configured,
         traffic_remaining=configured,
         error_code=None if configured else "PROXY_CREDENTIALS_MISSING",

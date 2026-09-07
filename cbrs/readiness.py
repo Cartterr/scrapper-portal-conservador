@@ -16,6 +16,7 @@ from typing import Any, Mapping, Sequence
 from dotenv import dotenv_values
 
 from .account_pool import load_account_pool_config
+from .browser_runtime import validate_service_browser
 from .config import MIN_SAFE_DELAY_SECONDS, Settings, load_settings
 from .safety import redact_text
 
@@ -30,18 +31,19 @@ REQUIRED_SOURCE_FILES = (
     "PREREQUISITES.txt",
     "INSTALL-CBRS.bat",
     "requirements.txt",
+    "requirements-dev.txt",
     "deploy/configure_runtime.py",
     "deploy/run_with_env.py",
+    "deploy/cbrs-native.env.example",
+    "deploy/account-pool.native.json.example",
     "deploy/windows/Install-CbrsE2E.ps1",
-    "deploy/install-ubuntu.sh",
-    "deploy/install-wsl.sh",
-    "deploy/cbrs.env.example",
-    "deploy/account-pool.json.example",
-    "deploy/cbrs-worker.service",
-    "deploy/cbrs-dashboard.service",
-    "deploy/cbrs-configuration-apply.path",
-    "deploy/cbrs-configuration-apply.service",
-    "deploy/cbrs-backup.timer",
+    "deploy/windows/Install-CbrsNative.ps1",
+    "deploy/windows/Start-CbrsNative.ps1",
+    "deploy/windows/Invoke-CbrsNativeTask.ps1",
+    "deploy/windows/Invoke-CbrsRuntimeWatchdog.ps1",
+    "deploy/windows/Set-CbrsNativeAccountCredentials.ps1",
+    "deploy/windows/Set-CbrsDataImpulseNetwork.ps1",
+    "deploy/windows/Set-CbrsDataImpulseProxySessions.ps1",
 )
 
 
@@ -180,9 +182,13 @@ def build_readiness_report(
             setting_problems.append("headed mode is required for the live soak")
         if settings.expected_egress_country != "CL":
             setting_problems.append("expected egress country must be CL")
-        if settings.egress_mode not in {"dedicated_static_isp", "residential_sticky"}:
+        if settings.egress_mode not in {
+            "dedicated_static_isp",
+            "residential_sticky",
+            "mobile_sticky",
+        }:
             setting_problems.append(
-                "egress mode must be dedicated_static_isp or residential_sticky"
+                "egress mode must be dedicated_static_isp, residential_sticky, or mobile_sticky"
             )
         if settings.request_delay_seconds < MIN_SAFE_DELAY_SECONDS:
             setting_problems.append("request delay is below the safety minimum")
@@ -804,6 +810,12 @@ def _build_windows_readiness_report(
     } and not configured_capsolver_key:
         settings_environment["CBRS_CAPTCHA_SOLVER_MODE"] = "browser"
     settings = load_settings(settings_environment, root=repo_root)
+    try:
+        validate_service_browser(settings)
+    except ValueError as exc:
+        add("native_chrome_policy", "fail", str(exc))
+    else:
+        add("native_chrome_policy", "pass", "regular Google Chrome required for startup and recovery")
     native_assets = (
         "deploy/windows/Install-CbrsNative.ps1",
         "deploy/windows/Start-CbrsNative.ps1",
@@ -1010,14 +1022,14 @@ def _build_windows_readiness_report(
             str(account.get("proxy_url_env") or "")
             for account in enabled_accounts
             if normalize_proxy_provider(account.get("proxy_provider"))
-            != "dataimpulse_residential_sticky"
+            not in {"dataimpulse_residential_sticky", "dataimpulse_mobile_sticky"}
         ]
         proxy_values = [environment.get(name, "") for name in proxy_refs]
         dataimpulse_accounts = [
             account
             for account in enabled_accounts
             if normalize_proxy_provider(account.get("proxy_provider"))
-            == "dataimpulse_residential_sticky"
+            in {"dataimpulse_residential_sticky", "dataimpulse_mobile_sticky"}
         ]
         dataimpulse_ports = [
             int(account.get("dataimpulse_port"))
@@ -1080,7 +1092,7 @@ def _build_windows_readiness_report(
         provider in two_captcha_providers for provider in proxy_providers
     )
     dataimpulse_provider_count = sum(
-        provider == "dataimpulse_residential_sticky"
+        provider in {"dataimpulse_residential_sticky", "dataimpulse_mobile_sticky"}
         for provider in proxy_providers
     )
     add(
@@ -1104,6 +1116,12 @@ def _build_windows_readiness_report(
         provider_health = dataimpulse_configuration_health(
             environment.get("DATAIMPULSE_PROXY_LOGIN"),
             environment.get("DATAIMPULSE_PROXY_PASSWORD"),
+            provider=next(
+                provider
+                for provider in proxy_providers
+                if provider
+                in {"dataimpulse_residential_sticky", "dataimpulse_mobile_sticky"}
+            ),
         )
     elif two_captcha_provider_count:
         from .proxy_provider import two_captcha_proxy_health

@@ -1,12 +1,32 @@
 # Endurance E2E nativo en Windows
 
+> **Regla obligatoria:** nunca parar/reiniciar el worker ni sus instancias Chrome
+> para desplegar, probar o recuperar una cuenta. Preservarlos hasta reboot/apagado
+> o detención explícita de todo el servicio. Los cambios Python que requieran
+> reinicio quedan pendientes. El watchdog conserva procesos existentes incluso
+> con heartbeat vencido. [AGENTS.md](../AGENTS.md) prevalece sobre pasos históricos.
+
 Esta es la ruta operativa vigente. Usa la cola SQLite durable, Chrome instalado,
 Python y restic nativos. No usa WSL, Docker ni máquinas virtuales.
 
 ## Límites y distribución
 
+La protección se aplica en dos capas: el pool bloquea descartes/rotaciones de
+contextos existentes y `BrowserSession.close()` rechaza cierres genéricos cuando
+el navegador pertenece al servicio. Solo el cierre explícito de todo el servicio
+libera esa protección. Un job `captcha_validation` terminado no finaliza el worker
+continuo. Un error Python recuperable deja el worker reteniendo las sesiones y
+esperando una detención explícita, incluso si falla temporalmente SQLite.
+
+Las tareas persistentes no usan los reintentos automáticos de Task Scheduler:
+la recuperación de un worker ausente pasa por el watchdog, que comprueba que no
+sobreviva un owner/browser anterior. El script de inicio no reinicia procesos
+existentes ni mata sesiones si falla readiness. No existe timeout de ejecución
+para worker/dashboard y pasar a batería no los detiene.
+
 - Validación finita: tres cuentas, cada una con su perfil y una ruta DataImpulse
-  residential sticky de Chile distinta, limitada a 120 minutos.
+  Mobile sticky de Chile distinta, limitada a 120 minutos. Residential queda
+  disponible solo como fallback explícito.
 - Selección: round-robin durable compartido por jobs production y endurance.
 - CAPTCHA: token Enterprise v3 del navegador primero. El control grande
   **🤖 2CAPTCHA AUTOMÁTICO** permite al operador autorizar fallback pagado
@@ -53,8 +73,8 @@ C:\ProgramData\CBRS\cbrs.env
 C:\ProgramData\CBRS\restic-password
 ```
 
-Comprar tráfico residencial DataImpulse tras confirmación financiera y
-provisionar tres puertos sticky Chile de 120 minutos. Después de configurar las cuentas y proxies,
+Provisionar tráfico DataImpulse Mobile y tres puertos sticky Chile de 120
+minutos. Después de configurar las cuentas y credenciales proxy del plan móvil,
 ejecutar un primer backup desde el entorno protegido. Para operación larga, el
 worker renueva un egreso vencido únicamente después de los gates completos y
 archiva el baseline saneado anterior.
@@ -146,6 +166,15 @@ terminar y registra sólo estado saneado en
 El dashboard escucha solo en `http://127.0.0.1:8765` y expone los mismos
 controles en `/api/endurance`.
 
+Cada tarjeta de cuenta incluye un monitor de baja frecuencia del Chrome headless
+que posee el worker. El cuadro se actualiza por defecto cada cinco segundos y se
+puede abrir en un visor con zoom y pantalla completa. Es una captura de solo
+lectura: no cambia la página, no mueve el foco y no crea un segundo navegador.
+El endpoint `/api/browser-preview/<cuenta>` responde únicamente desde loopback,
+solo para el owner del lease activo y solo si el JPEG sigue fresco. Al detener o
+reemplazar el contexto, el cuadro se elimina y el dashboard vuelve al estado
+**Esperando señal**.
+
 El botón **Configuración** abre el panel de operación. Permite ajustar sin
 exponer secretos el cupo diario, comportamiento humano, jitter, frecuencia de
 polling del worker, límite de cola de producción, trabajos inmediatos,
@@ -187,3 +216,12 @@ La configuración, recuperación y rotación DataImpulse se documentan en
 5. Observar 24 horas y luego siete días: ningún egreso compartido, backlog,
    PDF inválido, fuga de secreto, pérdida de prioridad production ni exceso del
    límite CAPTCHA.
+# Configuración del modo de ventana
+
+La tarea nativa respeta `CBRS_HEADLESS` del archivo protegido; no impone
+`--headless` en su línea de comandos. `CBRS_HEADLESS=0` y
+`CBRS_WINDOW_MODE=normal` abren Chrome visible para login y recuperación;
+`CBRS_HEADLESS=1` conserva el modo sin ventana. Cambiar estos valores no modifica
+procesos existentes: requiere reinicio explícitamente autorizado del servicio.
+La vista general muestra el modo configurado y el modo real de cada contexto;
+los navegadores diagnósticos externos no cuentan como sesiones del worker.

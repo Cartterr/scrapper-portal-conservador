@@ -2,10 +2,14 @@
 param(
     [string]$EnvFile = 'C:\ProgramData\CBRS\cbrs.env',
     [string]$PoolConfig = 'G:\CBRS\account-pool.json',
-    [string]$LocalEnvFile = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path '.env')
+    [string]$LocalEnvFile = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path '.env'),
+    [ValidateSet('residential', 'mobile')][string]$Network = 'residential'
 )
 
 $ErrorActionPreference = 'Stop'
+$dataImpulseProvider = "dataimpulse_${Network}_sticky"
+$egressMode = "${Network}_sticky"
+$proxyBrand = if ($Network -eq 'mobile') { 'DataImpulse Mobile' } else { 'DataImpulse' }
 
 function Write-AtomicText {
     param(
@@ -149,7 +153,7 @@ $settings = [ordered]@{
     'CBRS_BROWSER_REAUTH_BACKOFF_SECONDS' = '60'
     'CBRS_HEADLESS' = '1'
     'CBRS_WINDOW_MODE' = 'normal'
-    'CBRS_EGRESS_MODE' = 'residential_sticky'
+    'CBRS_EGRESS_MODE' = $egressMode
     'CBRS_EXPECTED_EGRESS_COUNTRY' = 'CL'
 }
 foreach ($entry in $settings.GetEnumerator()) {
@@ -160,8 +164,8 @@ for ($index = 0; $index -lt 3; $index++) {
     $account = $accounts[$index]
     $account.PSObject.Properties.Remove('proxy_url_env')
     foreach ($pair in @{
-        proxy_provider = 'dataimpulse_residential_sticky'
-        proxy_brand = 'DataImpulse'
+        proxy_provider = $dataImpulseProvider
+        proxy_brand = $proxyBrand
         dataimpulse_port = [int]$routes[$index].Port
     }.GetEnumerator()) {
         if ($account.PSObject.Properties.Name -contains $pair.Key) {
@@ -189,7 +193,7 @@ catch {
 [pscustomobject]@{
     ok = $true
     accounts_configured = 3
-    provider = 'dataimpulse_residential_sticky'
+    provider = $dataImpulseProvider
     country = 'CL'
     session_minutes = 120
     distinct_routes = 3

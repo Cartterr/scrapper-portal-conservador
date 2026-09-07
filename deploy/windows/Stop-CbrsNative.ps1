@@ -7,6 +7,16 @@ param(
 $ErrorActionPreference = 'Stop'
 $python = Join-Path $RepoRoot '.venv\Scripts\python.exe'
 $runner = Join-Path $RepoRoot 'deploy\run_with_env.py'
+if (Select-String -LiteralPath $EnvFile -Pattern '^CBRS_BROWSER_OWNER_MODE=external\s*$' -Quiet) {
+    # Ordinary service maintenance detaches the worker, not the browser owner.
+    # Closing the owner requires its separate explicit `browser_owner stop`.
+    $workerName = if (Get-ScheduledTask -TaskName 'CBRS User Worker' -ErrorAction SilentlyContinue) { 'CBRS User Worker' } else { 'CBRS Worker' }
+    Disable-ScheduledTask -TaskName $workerName | Out-Null
+    & $python $runner $EnvFile -- $python -m cbrs jobs endurance pause
+    & $python $runner $EnvFile -- $python -m cbrs pool stop
+    Write-Host 'Worker drain requested; independent owner and Chrome preserved. Dashboard remains available.'
+    return
+}
 & $python $runner $EnvFile -- $python -m cbrs jobs endurance pause
 & $python $runner $EnvFile -- $python -m cbrs pool stop
 Start-Sleep -Seconds 2
@@ -44,4 +54,5 @@ function Stop-CbrsWorkerProcesses {
 }
 Stop-CbrsWorkerProcesses
 & $python $runner $EnvFile -- $python -c "from cbrs.jobs import WORKER_LEASE_NAME, default_job_store; s=default_job_store(); lease=s.lease(); s.release_lease(WORKER_LEASE_NAME, str(lease['owner'])) if lease else None"
+& $python $runner $EnvFile -- $python -c "from cbrs.account_pool import default_pool_store; s=default_pool_store(); run=s.latest_run(dry_run=False); active=bool(run and not run.get('finished_at')); s.update_run(str(run['run_id']), status='stopped', blocked_reason='verified native stop', finished=True) if active else None"
 Write-Host 'Worker and dashboard stopped; queue, completed PDFs, and endurance state were preserved.'

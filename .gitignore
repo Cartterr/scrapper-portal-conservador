@@ -15,3 +15,4 @@ __pycache__/
 .pytest_cache/
 .pytest_tmp/
 .playwright-mcp/
+.codex_tmp_*

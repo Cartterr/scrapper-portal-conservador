@@ -51,6 +51,33 @@ class BrowserStatus:
     error: str | None = None
 
 
+def validate_native_chrome_executable(path: Path) -> None:
+    """Reject alternate browsers before launch; never change an existing context."""
+    normalized = str(path).replace("\\", "/").lower()
+    name = normalized.rsplit("/", 1)[-1]
+    if (
+        name not in {"chrome.exe", "chrome", "google-chrome", "google-chrome-stable"}
+        or any(marker in normalized for marker in ("gologin", "orbita", "dolphin", "cloakbrowser"))
+    ):
+        raise ValueError(
+            "The CBRS service requires regular Google Chrome. "
+            "Set CBRS_BROWSER_EXECUTABLE_PATH to the installed Google Chrome executable."
+        )
+
+
+def validate_service_browser(settings: Settings) -> None:
+    """One policy for worker startup, pooled login, and recovery candidates."""
+    if settings.browser_backend != "chrome":
+        raise ValueError(
+            "The CBRS service requires CBRS_BROWSER_BACKEND=chrome; "
+            "GoLogin, Dolphin, and anti-detect backends are not supported."
+        )
+    if settings.cloak_proxy_url:
+        raise ValueError("Remove CBRS_CLOAK_PROXY_URL from the regular Chrome service configuration.")
+    if settings.browser_executable_path is not None:
+        validate_native_chrome_executable(settings.browser_executable_path)
+
+
 def detect_browser(
     settings: Settings = SETTINGS,
     *,

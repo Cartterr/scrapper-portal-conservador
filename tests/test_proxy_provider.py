@@ -12,6 +12,7 @@ from cbrs.proxy_provider import (
     normalize_proxy_provider,
     two_captcha_proxy_health,
 )
+from cbrs.dataimpulse import DATAIMPULSE_MOBILE_STICKY_PROVIDER
 
 
 def test_proxy_provider_defaults_to_generic_static() -> None:
@@ -21,6 +22,10 @@ def test_proxy_provider_defaults_to_generic_static() -> None:
     assert (
         normalize_proxy_provider("2CAPTCHA_RESIDENTIAL_STICKY")
         == TWO_CAPTCHA_RESIDENTIAL_STICKY_PROVIDER
+    )
+    assert (
+        normalize_proxy_provider("DATAIMPULSE_MOBILE_STICKY")
+        == DATAIMPULSE_MOBILE_STICKY_PROVIDER
     )
 
 

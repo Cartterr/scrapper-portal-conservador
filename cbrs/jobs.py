@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
@@ -31,12 +31,19 @@ from .account_pool import (
     utc_now,
 )
 from .browser_session import CommerceAuthState, CredentialsRejectedError
+from .browser_runtime import validate_service_browser
+from .browser_preview import capture_browser_preview, remove_browser_preview
+def capture_error(*args, **kwargs):
+    from .runtime_updates import runtime_module
+    return runtime_module("error_evidence").capture_error(*args, **kwargs)
 from .config import SETTINGS, Settings
 from .dataimpulse import (
-    DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER,
+    DATAIMPULSE_STICKY_PROVIDERS,
     next_unused_sticky_port,
 )
-from .pdf import create_pdf
+def create_pdf(*args, **kwargs):
+    from .runtime_updates import runtime_module
+    return runtime_module("pdf").create_pdf(*args, **kwargs)
 from .safety import SafetyStopException, StopReason, redact, redact_text
 
 JOB_STATES = frozenset(
@@ -125,6 +132,17 @@ class _ManagedAccountScraper:
     last_reauth_at: float = 0.0
     last_restart_at: float = 0.0
     reauth_required: bool = False
+    authenticated_once: bool = False
+
+
+def _browser_engine(settings: Settings | None) -> str:
+    """Return the stable, non-secret engine identifier published to operators."""
+    backend = str(getattr(settings, "browser_backend", "chrome") or "chrome").lower()
+    return {
+        "chrome": "native_chrome",
+        "cloak": "cloakbrowser",
+        "gologin": "gologin",
+    }.get(backend, backend)
 
 
 class _PersistentAccountBrowsers:
@@ -143,51 +161,48 @@ class _PersistentAccountBrowsers:
         self.store = store
         self.worker_id = worker_id
         self._entries: dict[str, _ManagedAccountScraper] = {}
+        self._retained_entries: list[tuple[str, _ManagedAccountScraper]] = []
         self._known_accounts: dict[str, tuple[Settings, str, str]] = {}
         self._last_reconcile_at = 0.0
+        self._last_preview_at = 0.0
+        self.on_auth_failure: Callable[[str, Exception], None] | None = None
+        self.on_auth_success: Callable[[str], None] | None = None
+        self.can_reauthenticate: Callable[[str], bool] = lambda _account_id: True
 
-    def refresh_page_auth_states(self) -> None:
-        """Publish fail-closed DOM evidence without performing authentication."""
+    def capture_previews(self, *, force: bool = False) -> None:
+        """Publish low-frequency viewport frames without changing browser state."""
+        now = time.monotonic()
+        intervals = [
+            settings.browser_preview_interval_seconds
+            for settings, _username, _password in self._known_accounts.values()
+        ]
+        interval = min(intervals, default=5.0)
+        from .runtime_updates import runtime_module
+        interval = runtime_module("runtime_observation").preview_interval(interval)
+        if not force and now - self._last_preview_at < interval:
+            return
+        self._last_preview_at = now
         for account_id, entry in tuple(self._entries.items()):
             browser = getattr(entry.scraper, "browser", entry.scraper)
-            detector = getattr(browser, "detect_commerce_auth_state", None)
-            if not callable(detector):
-                legacy_detector = getattr(browser, "page_requires_login", None)
-                if not callable(legacy_detector):
-                    continue
-                detector = lambda: (
-                    CommerceAuthState.LOGIN_GATE
-                    if legacy_detector()
-                    else CommerceAuthState.UNKNOWN
-                )
+            page = getattr(browser, "page", None)
+            if page is None or not callable(getattr(page, "screenshot", None)):
+                continue
             try:
-                raw_state = detector()
-                state = (
-                    raw_state
-                    if isinstance(raw_state, CommerceAuthState)
-                    else CommerceAuthState(str(raw_state))
-                )
+                if callable(getattr(page, "is_closed", None)) and page.is_closed():
+                    continue
+                # Keep the badge's DOM evidence on the same cadence as its
+                # preview, including during account cooldowns. This is purely
+                # observational: no login, navigation, or cooldown reset.
+                self.refresh_page_auth_states(account_ids={account_id})
+                capture_browser_preview(page, self.store.path, account_id)
             except Exception:
-                state = CommerceAuthState.UNKNOWN
-            entry.unknown_checks = (
-                entry.unknown_checks + 1
-                if state is CommerceAuthState.UNKNOWN
-                else 0
-            )
-            self.store.set_account_browser_state(
-                account_id,
-                live=True,
-                authenticated=state is CommerceAuthState.AUTHENTICATED_FORM,
-                headless=self.headless,
-                owner=self.worker_id,
-                status={
-                    CommerceAuthState.AUTHENTICATED_FORM: "authenticated_form_visible",
-                    CommerceAuthState.LOGIN_GATE: "login_gate_visible",
-                    CommerceAuthState.CONFLICT: "authentication_dom_conflict",
-                    CommerceAuthState.UNKNOWN: "authentication_unknown",
-                }[state],
-                auth_state=state.value,
-            )
+                # Preview capture is observational and must never interrupt the
+                # login, search, recovery, or exclusive browser-owner lease.
+                continue
+
+    def refresh_page_auth_states(self, *, account_ids: set[str] | None = None) -> None:
+        from .runtime_updates import runtime_module
+        runtime_module("runtime_observation").sample_auth(self, account_ids=account_ids)
 
     def reconcile(self) -> None:
         """Keep successful per-account contexts alive without cross-account resets."""
@@ -197,19 +212,38 @@ class _PersistentAccountBrowsers:
             for settings, _username, _password in self._known_accounts.values()
         ]
         interval = min(intervals, default=30.0)
-        if now - self._last_reconcile_at < interval:
-            return
-        self._last_reconcile_at = now
-        self.refresh_page_auth_states()
+        healthcheck_due = now - self._last_reconcile_at >= interval
+        if healthcheck_due:
+            self._last_reconcile_at = now
+            self.refresh_page_auth_states()
         for account_id, credentials in tuple(self._known_accounts.items()):
             settings, username, password = credentials
             entry = self._entries.get(account_id)
+            # An already-known failed login need not wait for the next passive
+            # health scan after its cooldown expires. This is scheduling only:
+            # account/global/route gates and the retry floor still apply.
+            now = time.monotonic()
+            if not healthcheck_due:
+                if entry is None or not entry.reauth_required:
+                    continue
+                if now - entry.last_reauth_at < settings.browser_reauth_backoff_seconds:
+                    continue
+            if not self.can_reauthenticate(account_id):
+                continue
+            if not healthcheck_due:
+                # The operator may already have completed login manually.
+                # Re-check that account's DOM before any active recovery.
+                self.refresh_page_auth_states(account_ids={account_id})
             if entry is None:
                 try:
                     with self.session(account_id, settings, username, password):
                         pass
-                except Exception:
-                    continue
+                except Exception as exc:
+                    if self.on_auth_failure:
+                        self.on_auth_failure(account_id, exc)
+                else:
+                    if self.on_auth_success:
+                        self.on_auth_success(account_id)
                 continue
             try:
                 browser = getattr(entry.scraper, "browser", entry.scraper)
@@ -218,6 +252,8 @@ class _PersistentAccountBrowsers:
                     self.discard(account_id, status="browser_context_closed")
                     with self.session(account_id, settings, username, password):
                         pass
+                    if self.on_auth_success:
+                        self.on_auth_success(account_id)
                     continue
                 raw_state = browser.detect_commerce_auth_state()
                 state = (
@@ -225,14 +261,34 @@ class _PersistentAccountBrowsers:
                     if isinstance(raw_state, CommerceAuthState)
                     else CommerceAuthState(str(raw_state))
                 )
-                if state is CommerceAuthState.UNKNOWN and entry.unknown_checks >= 2:
+                if self.can_replace_rejected_login(account_id):
+                    # Do not repeatedly submit the same visibly rejected login.
+                    # Route it to the existing bounded account-recovery policy.
+                    if now - entry.last_reauth_at < settings.browser_reauth_backoff_seconds:
+                        continue
+                    entry.last_reauth_at = now
+                    check = self.store.account_check(account_id) or {}
+                    exc = SafetyStopException(
+                        StopReason.TEMPORARY_UNAVAILABLE,
+                        "Visible rejected login requires scoped recovery",
+                        status=check.get("browser_last_auth_http_status"),
+                        context="auth login",
+                    )
+                    capture_error(self.store, account_id, browser, exc)
+                    if self.on_auth_failure:
+                        self.on_auth_failure(account_id, exc)
+                    continue
+                if (state is CommerceAuthState.UNKNOWN and entry.unknown_checks >= 2
+                        and not entry.authenticated_once and not entry.reauth_required):
                     browser.reload_current_page()
                     state = browser.wait_for_commerce_auth_state()
                     entry.unknown_checks = 0
                 should_reauthenticate = state is CommerceAuthState.LOGIN_GATE or (
                     state is CommerceAuthState.UNKNOWN and entry.reauth_required
+                    and not entry.authenticated_once
                 )
                 if should_reauthenticate:
+                    now = time.monotonic()
                     if now - entry.last_reauth_at < settings.browser_reauth_backoff_seconds:
                         continue
                     entry.last_reauth_at = now
@@ -244,9 +300,13 @@ class _PersistentAccountBrowsers:
                         force=True,
                     ):
                         pass
+                    if self.on_auth_success:
+                        self.on_auth_success(account_id)
             except Exception as exc:
                 if _looks_like_connection_failure(exc):
                     self.discard(account_id, status="browser_context_failed")
+                if self.on_auth_failure:
+                    self.on_auth_failure(account_id, exc)
 
     @contextmanager
     def session(
@@ -258,6 +318,7 @@ class _PersistentAccountBrowsers:
         *,
         force: bool = False,
     ) -> Iterator[Any]:
+        validate_service_browser(settings)
         self._known_accounts[account_id] = (settings, username, password)
         entry = self._entries.get(account_id)
         if entry is None:
@@ -271,6 +332,7 @@ class _PersistentAccountBrowsers:
                     authenticated=False,
                     headless=self.headless,
                     owner=self.worker_id,
+                    engine=_browser_engine(settings),
                     status="launch_failed",
                 )
                 raise
@@ -289,14 +351,29 @@ class _PersistentAccountBrowsers:
                 authenticated=False,
                 headless=self.headless,
                 owner=self.worker_id,
+                engine=_browser_engine(settings),
                 status="authenticating",
             )
 
+        browser = getattr(entry.scraper, "browser", entry.scraper)
+        preserve = getattr(browser, "preserve_for_service_lifetime", None)
+        browser.error_capture_callback = lambda exc: capture_error(self.store, account_id, browser, exc)
+        if callable(preserve):
+            preserve()
+        preview_setter = getattr(browser, "set_preview_callback", None)
+        if callable(preview_setter):
+            preview_setter(self.capture_previews)
+
+        # Publish the existing viewport before authentication begins. This
+        # gives the operator immediate visual evidence even if CBRS, Imperva,
+        # or reCAPTCHA makes the login step slow.
+        self.capture_previews(force=True)
         try:
             auth_method = entry.scraper.ensure_authenticated(
                 username, password, force=force
             )
         except Exception as exc:
+            capture_error(self.store, account_id, browser, exc)
             if _looks_like_connection_failure(exc):
                 self.discard(account_id, status="browser_context_failed")
             else:
@@ -308,18 +385,25 @@ class _PersistentAccountBrowsers:
                     authenticated=False,
                     headless=self.headless,
                     owner=self.worker_id,
+                    engine=_browser_engine(entry.settings),
                     status="authentication_unconfirmed",
                     auth_state=CommerceAuthState.UNKNOWN.value,
+                    auth_error=(exc.reason.value if isinstance(exc, SafetyStopException)
+                                else "credentials_invalid" if isinstance(exc, CredentialsRejectedError)
+                                else "authentication_failed"),
+                    auth_http_status=getattr(exc, "status", None),
                 )
             raise
 
         entry.reauth_required = False
+        entry.authenticated_once = True
         self.store.set_account_browser_state(
             account_id,
             live=True,
             authenticated=True,
             headless=self.headless,
             owner=self.worker_id,
+            engine=_browser_engine(entry.settings),
             status={
                 "refreshed": "authenticated_refresh",
                 "browser_fetch": "authenticated_login_api",
@@ -327,31 +411,147 @@ class _PersistentAccountBrowsers:
             }.get(str(auth_method or ""), "authenticated"),
             auth_state=CommerceAuthState.AUTHENTICATED_FORM.value,
         )
-        yield entry.scraper
+        self.capture_previews(force=True)
+        try:
+            yield entry.scraper
+        except Exception as exc:
+            capture_error(self.store, account_id, browser, exc)
+            raise
+        finally:
+            self.capture_previews(force=True)
 
-    def discard(self, account_id: str, *, status: str) -> None:
+    def has_protected_session(self, account_id: str) -> bool:
+        entries = [entry for key, entry in self._retained_entries if key == account_id]
+        current = self._entries.get(account_id)
+        if current is not None:
+            entries.append(current)
+            browser = getattr(current.scraper, "browser", current.scraper)
+            detector = getattr(browser, "detect_commerce_auth_state", None)
+            if callable(detector):
+                try:
+                    if detector() == CommerceAuthState.AUTHENTICATED_FORM:
+                        current.authenticated_once = True
+                except Exception:
+                    pass
+        return any(entry.authenticated_once for entry in entries)
+
+    def can_replace_rejected_login(self, account_id: str) -> bool:
+        allowed = {v.strip() for v in os.environ.get(
+            "CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS", ""
+        ).split(",") if v.strip()}
+        if account_id not in allowed:
+            return False
+        current = self._entries.get(account_id)
+        if current is None:
+            return False
+        browser = getattr(current.scraper, "browser", current.scraper)
+        detector = getattr(browser, "has_visible_rejected_login", None)
+        try:
+            return bool(callable(detector) and detector())
+        except Exception:
+            return False
+
+    def adopt_authenticated_candidate(self, account_id: str, entry: _ManagedAccountScraper) -> None:
+        """Keep the exact proven browser; retain the older failed context open."""
+        previous = self._entries.get(account_id)
+        if previous is not None:
+            # Recheck immediately before cleanup. Only an explicitly scoped
+            # account with the complete visible failed-login signature qualifies.
+            # Never close an accepted candidate to reopen it or touch a sibling.
+            cleanup = self.can_replace_rejected_login(account_id)
+            if cleanup:
+                new_browser = getattr(entry.scraper, "browser", entry.scraper)
+                try:
+                    cleanup = new_browser.detect_commerce_auth_state() == CommerceAuthState.AUTHENTICATED_FORM
+                except Exception:
+                    cleanup = False
+            if cleanup and entry.authenticated_once:
+                try:
+                    old_browser = getattr(previous.scraper, "browser", previous.scraper)
+                    old_browser.shutdown_service_context()
+                    if hasattr(previous.manager, "__exit__"):
+                        previous.manager.__exit__(None, None, None)
+                    self.store.add_event("rejected_login_context_closed", account_id=account_id,
+                        data={"reason": "explicit_account_scope_after_candidate_authenticated"})
+                except Exception:
+                    self._retained_entries.append((account_id, previous))
+            else:
+                self._retained_entries.append((account_id, previous))
+        self._entries[account_id] = entry
+        self._known_accounts[account_id] = (entry.settings, entry.username, entry.password)
+        browser = getattr(entry.scraper, "browser", entry.scraper)
+        setter = getattr(browser, "set_preview_callback", None)
+        if callable(setter):
+            setter(self.capture_previews)
+        self.store.set_account_browser_state(
+            account_id, live=True, authenticated=True, headless=self.headless,
+            owner=self.worker_id, engine=_browser_engine(entry.settings),
+            status="authenticated_candidate_retained", auth_state="authenticated_form",
+        )
+        self.capture_previews(force=True)
+
+    def discard(self, account_id: str, *, status: str,
+                service_shutdown: bool = False) -> None:
+        entry = self._entries.get(account_id)
+        if service_shutdown and entry and getattr(getattr(entry.scraper, "browser", None), "is_remote", False):
+            self._entries.pop(account_id, None)
+            return  # worker detaches; owner keeps previews, evidence and Chrome
+        # HARD LIFECYCLE RULE: an existing production context is irreplaceable
+        # during service operation. A network error is not browser termination.
+        # Keep even unknown/disconnected contexts for operator inspection.
+        if account_id in self._entries and not service_shutdown:
+            self.store.add_event(
+                "browser_close_blocked", account_id=account_id, level="warning",
+                data={"reason": status, "policy": "preserve_until_service_stop"},
+            )
+            return
         entry = self._entries.pop(account_id, None)
+        engine = _browser_engine(entry.settings if entry is not None else None)
         if entry is not None:
             try:
+                browser = getattr(entry.scraper, "browser", entry.scraper)
+                preview_setter = getattr(browser, "set_preview_callback", None)
+                if callable(preview_setter):
+                    preview_setter(None)
+                shutdown = getattr(browser, "shutdown_service_context", None)
+                if service_shutdown and callable(shutdown):
+                    shutdown()
                 if hasattr(entry.manager, "__exit__"):
                     entry.manager.__exit__(None, None, None)
                 elif hasattr(entry.scraper, "close"):
                     entry.scraper.close()
             except Exception:
                 pass
+        remove_browser_preview(self.store.path, account_id)
         self.store.set_account_browser_state(
             account_id,
             live=False,
             authenticated=False,
             headless=self.headless,
             owner=self.worker_id,
+            engine=engine,
             status=status,
         )
 
-    def close_all(self, *, status: str = "worker_stopped") -> None:
+    def close_all(self, *, status: str = "worker_stopped",
+                  service_shutdown: bool = False) -> None:
         for account_id in tuple(self._entries):
-            self.discard(account_id, status=status)
-        self._known_accounts.clear()
+            self.discard(account_id, status=status, service_shutdown=service_shutdown)
+        if service_shutdown:
+            for _account_id, entry in self._retained_entries:
+                try:
+                    browser = getattr(entry.scraper, "browser", entry.scraper)
+                    shutdown = getattr(browser, "shutdown_service_context", None)
+                    if callable(shutdown):
+                        shutdown()
+                    if hasattr(entry.manager, "__exit__"):
+                        entry.manager.__exit__(None, None, None)
+                    elif hasattr(entry.scraper, "close"):
+                        entry.scraper.close()
+                except Exception:
+                    pass
+            self._retained_entries.clear()
+            self._known_accounts.clear()
 
 
 class JobStore:
@@ -384,6 +584,17 @@ class JobStore:
                     version INTEGER NOT NULL,
                     applied_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS attempt_error_evidence (
+                    evidence_id TEXT PRIMARY KEY,
+                    attempt_id TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    capture_status TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    http_status INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_attempt_error_evidence
+                ON attempt_error_evidence(attempt_id);
 
                 CREATE TABLE IF NOT EXISTS jobs (
                     job_id TEXT PRIMARY KEY,
@@ -482,6 +693,7 @@ class JobStore:
                     browser_authenticated INTEGER NOT NULL DEFAULT 0,
                     browser_headless INTEGER,
                     browser_owner TEXT,
+                    browser_engine TEXT,
                     browser_status TEXT,
                     browser_auth_state TEXT,
                     browser_started_at TEXT,
@@ -534,7 +746,15 @@ class JobStore:
                     rotation_count INTEGER NOT NULL DEFAULT 0,
                     temporary_window_started_at TEXT,
                     temporary_failure_count INTEGER NOT NULL DEFAULT 0,
+                    rejected_ports_json TEXT NOT NULL DEFAULT '[]',
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS proxy_candidate_exits (
+                    account_id TEXT NOT NULL,
+                    egress_hash TEXT NOT NULL,
+                    failed_at TEXT NOT NULL,
+                    PRIMARY KEY(account_id, egress_hash)
                 );
 
                 CREATE TABLE IF NOT EXISTS endurance_state (
@@ -549,7 +769,7 @@ class JobStore:
             db.execute(
                 """
                 INSERT INTO schema_versions(component, version, applied_at)
-                VALUES ('jobs', 7, ?)
+                VALUES ('jobs', 9, ?)
                 ON CONFLICT(component) DO UPDATE SET
                     version = MAX(version, excluded.version),
                     applied_at = CASE
@@ -572,14 +792,29 @@ class JobStore:
                 "browser_authenticated": "INTEGER NOT NULL DEFAULT 0",
                 "browser_headless": "INTEGER",
                 "browser_owner": "TEXT",
+                "browser_engine": "TEXT",
                 "browser_status": "TEXT",
                 "browser_auth_state": "TEXT",
                 "browser_started_at": "TEXT",
                 "browser_checked_at": "TEXT",
+                "browser_authenticated_at": "TEXT",
+                "browser_last_auth_error": "TEXT",
+                "browser_last_auth_http_status": "INTEGER",
             }
             for name, definition in browser_columns.items():
                 if name not in columns:
                     db.execute(f"ALTER TABLE account_checks ADD COLUMN {name} {definition}")
+            route_columns = {
+                str(row["name"])
+                for row in db.execute(
+                    "PRAGMA table_info(account_proxy_routes)"
+                ).fetchall()
+            }
+            if "rejected_ports_json" not in route_columns:
+                db.execute(
+                    "ALTER TABLE account_proxy_routes ADD COLUMN "
+                    "rejected_ports_json TEXT NOT NULL DEFAULT '[]'"
+                )
             job_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(jobs)").fetchall()
@@ -757,8 +992,11 @@ class JobStore:
                 SELECT job_id FROM jobs
                 WHERE status = 'running'
                   AND (lease_expires_at IS NULL OR lease_expires_at < ?)
+                  AND NOT EXISTS (SELECT 1 FROM leases
+                    WHERE lease_name = 'browser_operation:' || jobs.job_id
+                    AND expires_at >= ?)
                 """,
-                (now,),
+                (now, now),
             ).fetchall()
             job_ids = [str(row["job_id"]) for row in rows]
             for job_id in job_ids:
@@ -775,6 +1013,8 @@ class JobStore:
                         """
                         UPDATE job_attempts
                         SET status = 'worker_recovered', quota_consumed = 0,
+                            safety_stop = CASE WHEN quota_consumed = 1
+                                THEN 'search_outcome_unknown' ELSE safety_stop END,
                             error_message = 'Released after an expired worker lease.',
                             finished_at = ?
                         WHERE attempt_id = ?
@@ -857,15 +1097,52 @@ class JobStore:
             ).fetchone()
             return bool(row and row["cancel_requested"])
 
-    def add_results(self, job_id: str, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def search_checkpoint(self, job_id: str) -> dict[str, Any]:
+        """A saved empty result list is also a final search, never a retry signal."""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT result_count, current_account_id FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            receipt = db.execute(
+                "SELECT account_id FROM job_attempts WHERE job_id = ? "
+                "AND status = 'search_completed' ORDER BY started_at LIMIT 1", (job_id,)
+            ).fetchone()
+            uncertain = db.execute(
+                "SELECT 1 FROM job_attempts WHERE job_id = ? AND safety_stop = 'search_outcome_unknown'",
+                (job_id,),
+            ).fetchone()
+            return {
+                "saved": row["result_count"] is not None,
+                "result_count": row["result_count"],
+                "account_id": receipt["account_id"] if receipt else row["current_account_id"],
+                "incomplete_receipt": receipt is not None and row["result_count"] is None,
+                "uncertain": uncertain is not None and row["result_count"] is None,
+            }
+
+    def add_results(
+        self, job_id: str, results: list[dict[str, Any]], *, attempt_id: str | None = None,
+        materialize_items: bool = True,
+    ) -> list[dict[str, Any]]:
         now = utc_now()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute(
-                "SELECT COUNT(*) AS count FROM job_items WHERE job_id = ?", (job_id,)
+                "SELECT result_count FROM jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
-            if int(existing["count"] or 0) == 0:
-                for sequence, result in enumerate(results, 1):
+            if existing is None:
+                raise KeyError(job_id)
+            if existing["result_count"] is None:
+                attempt = None
+                if attempt_id is not None:
+                    attempt = db.execute(
+                        "SELECT * FROM job_attempts WHERE attempt_id = ? AND job_id = ? "
+                        "AND status = 'running' AND quota_consumed = 1", (attempt_id, job_id)
+                    ).fetchone()
+                    if attempt is None:
+                        raise ValueError("Search receipt requires its active reserved attempt")
+                for sequence, result in enumerate(results if materialize_items else [], 1):
                     ticket = result.get("ticket")
                     public_result = {key: value for key, value in result.items() if key != "ticket"}
                     db.execute(
@@ -892,6 +1169,15 @@ class JobStore:
                 self._add_event_db(
                     db, job_id, "search_results_saved", {"result_count": len(results)}
                 )
+                if attempt is not None:
+                    # Results, successful-search receipt and quota are one commit.
+                    db.execute(
+                        "UPDATE job_attempts SET status = 'search_completed', finished_at = ? "
+                        "WHERE attempt_id = ?", (now, attempt_id)
+                    )
+                    self._sync_account_daily_usage_db(
+                        db, str(attempt["account_id"]), str(attempt["quota_date"])
+                    )
             return self._items_db(db, job_id, public=False)
 
     def items(self, job_id: str, *, public: bool = True) -> list[dict[str, Any]]:
@@ -1028,6 +1314,17 @@ class JobStore:
             if not account or account["status"] != "available":
                 return None
             if consume_quota:
+                checkpoint = db.execute(
+                    "SELECT result_count FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                prior_search = db.execute(
+                    "SELECT 1 FROM job_attempts WHERE job_id = ? AND "
+                    "(status = 'search_completed' OR safety_stop = 'search_outcome_unknown' "
+                    "OR (status = 'running' AND quota_consumed = 1))",
+                    (job_id,),
+                ).fetchone()
+                if checkpoint is None or checkpoint["result_count"] is not None or prior_search:
+                    return None
                 usage = self._account_usage_db(db, account_id, quota_date)
                 if usage >= quota:
                     return None
@@ -1075,6 +1372,14 @@ class JobStore:
                 and int(attempt["quota_consumed"] or 0)
                 and status not in QUOTA_SUCCESS_ATTEMPT_STATUSES
             )
+            if release_quota and db.execute(
+                "SELECT 1 FROM leases WHERE lease_name=? AND expires_at>=?",
+                ("browser_operation:" + attempt["job_id"], utc_now()),
+            ).fetchone():
+                # A disconnected/timed-out worker cannot cancel an in-flight
+                # portal operation owned by another process. Keep its reserved
+                # slot until the owner commits acceptance or finishes failure.
+                return
             db.execute(
                 """
                 UPDATE job_attempts SET status = ?, safety_stop = ?,
@@ -1189,6 +1494,7 @@ class JobStore:
         quota_by_account: Mapping[str, int] | None = None,
         source: str = "production",
         source_quota_by_account: Mapping[str, int] | None = None,
+        require_search_capacity: bool = True,
     ) -> PoolAccount | None:
         excluded = excluded or set()
         with self.connect() as db:
@@ -1210,9 +1516,9 @@ class JobStore:
                     if quota_by_account and account.account_id in quota_by_account
                     else config.quota_for(account)
                 )
-                if used >= quota:
+                if require_search_capacity and used >= quota:
                     continue
-                if source_quota_by_account and account.account_id in source_quota_by_account:
+                if require_search_capacity and source_quota_by_account and account.account_id in source_quota_by_account:
                     source_used = int(
                         db.execute(
                             """
@@ -1409,18 +1715,30 @@ class JobStore:
         authenticated: bool,
         headless: bool,
         owner: str,
+        engine: str = "native_chrome",
         status: str,
         auth_state: str | None = None,
+        auth_error: str | None = None,
+        auth_http_status: int | None = None,
     ) -> None:
+        browser_owner = self.active_lease("browser_owner")
+        if browser_owner and browser_owner["owner"] != owner:
+            return  # independent owner is authoritative, even while worker stops
         now = utc_now()
+        normalized_auth_state = str(auth_state or CommerceAuthState.UNKNOWN.value)
+        authenticated = bool(
+            live
+            and authenticated
+            and normalized_auth_state == CommerceAuthState.AUTHENTICATED_FORM.value
+        )
         with self.connect() as db:
             db.execute(
                 """
                 INSERT INTO account_checks(
                     account_id, browser_live, browser_authenticated, browser_headless,
-                    browser_owner, browser_status, browser_started_at,
+                    browser_owner, browser_engine, browser_status, browser_started_at,
                     browser_checked_at, browser_auth_state, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id) DO UPDATE SET
                     browser_started_at = CASE
                         WHEN excluded.browser_live = 1 AND account_checks.browser_live = 0
@@ -1431,6 +1749,7 @@ class JobStore:
                     browser_authenticated = excluded.browser_authenticated,
                     browser_headless = excluded.browser_headless,
                     browser_owner = excluded.browser_owner,
+                    browser_engine = excluded.browser_engine,
                     browser_status = excluded.browser_status,
                     browser_auth_state = excluded.browser_auth_state,
                     browser_checked_at = excluded.browser_checked_at,
@@ -1442,13 +1761,26 @@ class JobStore:
                     int(authenticated),
                     int(headless),
                     owner,
+                    str(engine or "unknown").strip().lower(),
                     status,
                     now if live else None,
                     now,
-                    auth_state,
+                    normalized_auth_state,
                     now,
                 ),
             )
+            if authenticated:
+                db.execute(
+                    "UPDATE account_checks SET browser_authenticated_at = ?, "
+                    "browser_last_auth_error = NULL, browser_last_auth_http_status = NULL "
+                    "WHERE account_id = ?", (now, account_id),
+                )
+            elif auth_error:
+                db.execute(
+                    "UPDATE account_checks SET browser_last_auth_error = ?, "
+                    "browser_last_auth_http_status = ? WHERE account_id = ?",
+                    (auth_error, auth_http_status, account_id),
+                )
 
     def finalize_job(self, job_id: str) -> str:
         now = utc_now()
@@ -1644,6 +1976,7 @@ class JobStore:
         port_max: int,
         cooldown_seconds: float,
         max_rotations_per_hour: int,
+        randomize: bool = False,
     ) -> dict[str, Any]:
         now_dt = datetime.now(timezone.utc)
         now = now_dt.replace(microsecond=0).isoformat()
@@ -1698,12 +2031,30 @@ class JobStore:
                 for value in (used["active_port"], used["pending_port"])
                 if value is not None
             }
-            candidate = next_unused_sticky_port(
-                int(state["active_port"]),
-                used_ports=used_ports,
-                minimum=port_min,
-                maximum=port_max,
+            try:
+                rejected_ports = {
+                    int(value)
+                    for value in json.loads(
+                        str(state.get("rejected_ports_json") or "[]")
+                    )
+                }
+            except (TypeError, ValueError, json.JSONDecodeError):
+                rejected_ports = set()
+            used_ports.update(
+                port for port in rejected_ports if port_min <= port <= port_max
             )
+            if randomize:
+                available = [
+                    port for port in range(port_min, port_max + 1) if port not in used_ports
+                ]
+                if not available:
+                    raise ValueError("No unused sticky ports available")
+                candidate = secrets.choice(available)
+            else:
+                candidate = next_unused_sticky_port(
+                    int(state["active_port"]), used_ports=used_ports,
+                    minimum=port_min, maximum=port_max,
+                )
             cooldown = (now_dt + timedelta(seconds=cooldown_seconds)).replace(
                 microsecond=0
             ).isoformat()
@@ -1760,20 +2111,38 @@ class JobStore:
                         generation = generation + 1, status = 'active',
                         last_error_code = NULL, last_rotated_at = ?,
                         temporary_window_started_at = NULL,
-                        temporary_failure_count = 0, updated_at = ?
+                        temporary_failure_count = 0, rejected_ports_json = '[]',
+                        updated_at = ?
                     WHERE account_id = ?
                     """,
                     (now, now, account_id),
                 )
             else:
+                try:
+                    rejected_ports = [
+                        int(value)
+                        for value in json.loads(
+                            str(row["rejected_ports_json"] or "[]")
+                        )
+                    ]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    rejected_ports = []
+                if row["pending_port"] is not None:
+                    rejected_ports.append(int(row["pending_port"]))
+                rejected_ports = list(dict.fromkeys(rejected_ports))[-100:]
                 db.execute(
                     """
                     UPDATE account_proxy_routes
                     SET pending_port = NULL, status = 'candidate_failed',
-                        last_error_code = ?, updated_at = ?
+                        last_error_code = ?, rejected_ports_json = ?, updated_at = ?
                     WHERE account_id = ?
                     """,
-                    (redact_text(error_code or "candidate_failed"), now, account_id),
+                    (
+                        redact_text(error_code or "candidate_failed"),
+                        json.dumps(rejected_ports, separators=(",", ":")),
+                        now,
+                        account_id,
+                    ),
                 )
             updated = db.execute(
                 "SELECT * FROM account_proxy_routes WHERE account_id = ?",
@@ -1818,8 +2187,49 @@ class JobStore:
             )
             return count
 
+    def candidate_exit_rejected(self, account_id: str, egress_hash: str) -> bool:
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=120)).isoformat()
+        with self.connect() as db:
+            return db.execute(
+                "SELECT 1 FROM proxy_candidate_exits WHERE account_id=? AND egress_hash=? AND failed_at>=?",
+                (account_id, egress_hash, cutoff),
+            ).fetchone() is not None
+
+    def record_failed_candidate_exit(self, account_id: str, egress_hash: str) -> None:
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO proxy_candidate_exits(account_id,egress_hash,failed_at) VALUES (?,?,?) "
+                "ON CONFLICT(account_id,egress_hash) DO UPDATE SET failed_at=excluded.failed_at",
+                (account_id, egress_hash, utc_now()),
+            )
+
+    def reserve_mobile_login_canary(self) -> bool:
+        """At most three pool-wide probes/hour, separated by five minutes."""
+        now = utc_now()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM job_control WHERE key = 'mobile_login_canary'").fetchone()
+            state = json.loads(row["value"]) if row else {}
+            last = state.get("last_attempt")
+            if last and seconds_since(last) < 300:
+                return False
+            started = state.get("window_started")
+            count = int(state.get("count", 0))
+            if not started or seconds_since(started) >= 3600:
+                started, count = now, 0
+            if count >= 3:
+                return False
+            payload = stable_json({"window_started": started, "last_attempt": now, "count": count + 1})
+            db.execute(
+                "INSERT INTO job_control(key,value,updated_at) VALUES ('mobile_login_canary',?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                (payload, now),
+            )
+            return True
+
     def another_account_succeeded_recently(
-        self, account_id: str, *, within_seconds: float = 600
+        self, account_id: str, *, within_seconds: float = 600,
+        allow_authenticated_form: bool = False,
     ) -> bool:
         cutoff = (
             datetime.now(timezone.utc) - timedelta(seconds=within_seconds)
@@ -1833,6 +2243,23 @@ class JobStore:
                 LIMIT 1
                 """,
                 (account_id, cutoff),
+            ).fetchone()
+            if row is not None:
+                return True
+            if not allow_authenticated_form:
+                return False
+            # Login recovery can use a fresh protected form. Search recovery
+            # still requires a successful search/download, since login alone
+            # does not establish that the query service is healthy.
+            row = db.execute(
+                "SELECT 1 FROM account_checks c JOIN leases l "
+                "ON c.browser_owner = l.owner "
+                "WHERE c.account_id != ? AND c.browser_live = 1 "
+                "AND c.browser_authenticated = 1 "
+                "AND c.browser_auth_state = 'authenticated_form' "
+                "AND c.browser_checked_at >= ? "
+                "AND l.lease_name IN (?, 'browser_owner') AND l.expires_at >= ? LIMIT 1",
+                (account_id, cutoff, WORKER_LEASE_NAME, utc_now()),
             ).fetchone()
             return row is not None
 
@@ -2079,6 +2506,7 @@ class JobStore:
                 (row["job_id"],),
             ).fetchone()
             account_id = attempt["account_id"] if attempt else None
+        raw_input = json.loads(str(row["input_json"]))
         payload = {
             "job_id": row["job_id"],
             "kind": row["kind"],
@@ -2088,6 +2516,15 @@ class JobStore:
             "priority": int(row["priority"] or 0),
             "result_count": row["result_count"],
             "completed_items": row["completed_items"],
+            "search_status": "completed" if row["result_count"] is not None else "unconfirmed",
+            "document_status": (
+                "not_started" if row["result_count"] is None else
+                "not_required" if row["result_count"] == 0 or (
+                    row["source"] == "captcha_validation" and raw_input.get("validation_only")
+                ) else
+                "completed" if row["completed_items"] == row["result_count"] else
+                "failed" if row["failed_items"] else "pending"
+            ),
             "failed_items": row["failed_items"],
             "error_code": row["error_code"],
             "error_message": row["error_message"],
@@ -2102,7 +2539,6 @@ class JobStore:
             "attempts": self._attempts_db(db, str(row["job_id"])),
             "items": self._items_db(db, str(row["job_id"]), public=True),
         }
-        raw_input = json.loads(str(row["input_json"]))
         if include_input:
             payload["input"] = raw_input
         elif row["kind"] == "fna":
@@ -2115,7 +2551,7 @@ class JobStore:
     def _attempts_db(db: sqlite3.Connection, job_id: str) -> list[dict[str, Any]]:
         rows = db.execute(
             """
-            SELECT account_id, status, safety_stop, started_at, finished_at
+            SELECT attempt_id, account_id, status, safety_stop, started_at, finished_at
             FROM job_attempts
             WHERE job_id = ?
             ORDER BY started_at, rowid
@@ -2130,6 +2566,10 @@ class JobStore:
                     "reason": row["safety_stop"] or row["status"],
                     "started_at": row["started_at"],
                     "finished_at": row["finished_at"],
+                    "error_evidence": [dict(e) for e in db.execute(
+                        "SELECT evidence_id, captured_at, capture_status, reason, http_status "
+                        "FROM attempt_error_evidence WHERE attempt_id=? ORDER BY captured_at",
+                        (row["attempt_id"],)).fetchall()],
                 }
             )
             for row in rows
@@ -2373,9 +2813,11 @@ def run_job_worker(
     from .proxy_health import run_proxy_health
     from .scraper import CBRSScraper
 
+    validate_service_browser(settings)
     config = config or load_account_pool_config(settings)
     store = store or default_job_store(settings)
     pool_store = pool_store or AccountPoolStore(store.path)
+    supplied_factory = scraper_factory
     scraper_factory = scraper_factory or CBRSScraper
     preflight_runner = preflight_runner or run_preflight
     proxy_health_runner = proxy_health_runner or run_proxy_health
@@ -2388,6 +2830,16 @@ def run_job_worker(
     )
     runtime_headless = settings.headless if headless is None else headless
     worker_id = f"{socket.gethostname()}-{os.getpid()}-{secrets.token_hex(3)}"
+    owner_mode = os.environ.get("CBRS_BROWSER_OWNER_MODE", "embedded")
+    if owner_mode not in {"embedded", "external"}:
+        raise ValueError("Invalid browser owner mode")
+    if supplied_factory is None and owner_mode == "external":
+        from functools import partial
+        from .owner_protocol import RemoteScraper, OWNER_LEASE, command_path
+        if not store.active_lease(OWNER_LEASE):
+            raise RuntimeError("Start the independent browser owner before the worker")
+        scraper_factory = partial(RemoteScraper, worker_id=worker_id,
+                                  store_path=store.path, commands_path=command_path(settings))
     if not store.acquire_lease(WORKER_LEASE_NAME, worker_id):
         raise RuntimeError("Another CBRS job worker has an active lease.")
 
@@ -2404,7 +2856,10 @@ def run_job_worker(
         store=store,
         worker_id=worker_id,
     )
+    from .runtime_updates import RuntimeUpdates
+    updates = None
     try:
+        updates = RuntimeUpdates(Path(__file__).parent, store.path.parent / "runtime-updates", owner=worker_id)
         store.recover_abandoned_jobs()
         legacy_stop = store.get_control("global_safety_stop")
         if legacy_stop:
@@ -2424,6 +2879,10 @@ def run_job_worker(
         )
         pool_store.clear_stop_request()
         pool_store.create_run(run_id=run_id, dry_run=False, config=config, dashboard_url=None)
+        _wire_browser_auth_recovery(
+            settings, config, store, pool_store, run_id, browser_pool,
+            preflight_runner, proxy_health_runner,
+        )
         pool_store.add_event(run_id, message="job worker started", data={"worker_id": worker_id})
         heartbeat_thread = threading.Thread(
             target=_worker_heartbeat,
@@ -2433,9 +2892,13 @@ def run_job_worker(
         )
         heartbeat_thread.start()
         while max_jobs is None or processed < max_jobs:
+            # Same owner/thread and browser objects; switch only before the next
+            # complete operation, never inside a search or PDF job.
+            updates.poll()
             pool_store.reset_quota_day(run_id, local_today())
             pool_store.reactivate_expired_cooldowns(run_id)
             browser_pool.reconcile()
+            browser_pool.capture_previews()
             # A replacement worker can acquire the global lease moments before
             # the previous job lease expires. Recheck on every scheduler pass
             # so that job is requeued once it becomes stale without requiring
@@ -2517,7 +2980,7 @@ def run_job_worker(
                     break
                 sleep_fn(max(0.1, runtime_poll_seconds))
                 continue
-            if job.source == "captcha_validation":
+            if job.source == "captcha_validation" and (once or max_jobs is not None):
                 final_status = outcome
                 break
             if once:
@@ -2544,10 +3007,29 @@ def run_job_worker(
     except Exception as exc:
         final_status = "failed"
         exit_code = 1
-        store.add_event("worker_failed", level="error", data={"error": str(exc)})
-        raise
+        try:
+            store.add_event("worker_failed", level="error", data={"error": redact_text(str(exc))})
+        except Exception:
+            pass  # Database failure must not cascade into closing Chrome.
+        if once or max_jobs is not None:
+            raise
+        # A recoverable Python exception must not destroy expensive browser
+        # sessions. Retain the owner/heartbeat and wait for explicit service stop.
+        while True:
+            try:
+                if pool_store.stop_requested():
+                    break
+                pool_store.update_run(run_id, status="waiting",
+                                     blocked_reason="worker_failed_sessions_preserved")
+                browser_pool.capture_previews()
+            except Exception:
+                pass
+            sleep_fn(5)
+        final_status = "stopped"
     finally:
-        browser_pool.close_all()
+        browser_pool.close_all(service_shutdown=True)
+        if updates is not None:
+            updates.close()
         heartbeat_stop.set()
         if heartbeat_thread:
             heartbeat_thread.join(timeout=5)
@@ -2562,9 +3044,12 @@ def run_job_worker(
     return WorkerResult(exit_code, worker_id, run_id, final_status, processed)
 
 
-def _process_claimed_job(
-    job: Job,
-    *,
+def _process_claimed_job(*args, **kwargs):
+    from .runtime_updates import runtime_module
+    return runtime_module("runtime_logic").process_job(*args, **kwargs)
+
+
+def _wire_browser_auth_recovery(
     settings: Settings,
     config: PoolConfig,
     store: JobStore,
@@ -2573,386 +3058,53 @@ def _process_claimed_job(
     browser_pool: _PersistentAccountBrowsers,
     preflight_runner: Callable[..., Any],
     proxy_health_runner: Callable[..., Any],
-    endurance_plan: Any | None = None,
-) -> str:
-    target_account_id = (
-        str(job.input.get("target_account_id") or "")
-        if job.source == "captcha_validation"
-        else ""
-    )
-    excluded: set[str] = (
-        {
-            account.account_id
-            for account in config.accounts
-            if account.account_id != target_account_id
-        }
-        if target_account_id
-        else set()
-    )
-    quota_date = local_today()
-    while True:
-        if store.cancel_requested(job.job_id):
-            return store.finalize_job(job.job_id)
-        account = store.select_account(
-            run_id=run_id,
-            config=config,
-            quota_date=quota_date,
-            excluded=excluded,
-            source=job.source,
-            source_quota_by_account=(
-                endurance_plan.source_quota(config)
-                if job.source == "endurance" and endurance_plan is not None
-                else None
-            ),
+) -> None:
+    accounts = {account.account_id: account for account in config.accounts if account.enabled}
+    for account in accounts.values():
+        if _is_dataimpulse_account(account) and account.dataimpulse_port is not None:
+            store.ensure_dataimpulse_route(account.account_id, account.dataimpulse_port)
+
+    def allowed(account_id: str) -> bool:
+        if account_id not in accounts or pool_store.stop_requested() or store.global_cooldown():
+            return False
+        states = {row["account_id"]: row for row in pool_store.accounts(run_id)}
+        state = states.get(account_id, {})
+        if state.get("status") in {"paused", "captcha_pending", "captcha_solving"}:
+            return False
+        route = store.dataimpulse_route(account_id) or {}
+        return not (str(route.get("cooldown_until") or "") > utc_now())
+
+    def failed(account_id: str, exc: Exception) -> None:
+        account = accounts[account_id]
+        reason = (exc.reason.value if isinstance(exc, SafetyStopException)
+                  else "credentials_invalid" if isinstance(exc, CredentialsRejectedError)
+                  else "authentication_failed")
+        store.add_event(
+            "background_auth_failed", account_id=account_id, level="warning",
+            data={"reason": reason, "http_status": getattr(exc, "status", None)},
         )
-        if account is None:
-            if target_account_id:
-                target_state = next(
-                    (
-                        str(row["status"])
-                        for row in pool_store.accounts(run_id)
-                        if str(row["account_id"]) == target_account_id
-                    ),
-                    "paused",
-                )
-                status = (
-                    "waiting_captcha"
-                    if target_state == CAPTCHA_PENDING_STATUS
-                    else "waiting_capacity"
-                )
-            else:
-                status = _unavailable_job_status(pool_store, run_id, config, excluded)
-            store.set_waiting(job.job_id, status, reason=status)
-            pool_store.update_run(
-                run_id,
-                status=status,
-                next_cycle_at=next_quota_reset_at() if status == "waiting_capacity" else "",
-                blocked_reason=status,
+        if isinstance(exc, SafetyStopException):
+            _handle_account_safety_stop(
+                exc, job_id=None, account=account, store=store,
+                pool_store=pool_store, run_id=run_id, config=config,
+                settings=settings, browser_pool=browser_pool,
+                preflight_runner=preflight_runner, proxy_health_runner=proxy_health_runner,
             )
-            return status
-        excluded.add(account.account_id)
-        try:
-            runtime_settings = _runtime_account_settings(settings, account, store)
-        except ValueError as exc:
+        else:
             pool_store.pause_account(
-                run_id, account.account_id, reason="account_configuration_invalid"
+                run_id, account_id, reason=reason,
+                cooldown_seconds=None if isinstance(exc, CredentialsRejectedError) else 300,
             )
-            store.add_event(
-                "account_configuration_invalid",
-                job_id=job.job_id,
-                account_id=account.account_id,
-                level="error",
-                data={"error": str(exc)},
-            )
-            continue
-        if not _ensure_account_gate(
-            account,
-            runtime_settings,
-            store,
-            pool_store,
-            run_id,
-            preflight_runner,
-            proxy_health_runner,
-        ):
-            continue
-        try:
-            username, password = account_credentials(account)
-        except ValueError as exc:
-            pool_store.pause_account(run_id, account.account_id, reason="credentials_missing")
-            store.add_event(
-                "account_credentials_missing",
-                job_id=job.job_id,
-                account_id=account.account_id,
-                level="error",
-                data={"error": str(exc)},
-            )
-            continue
 
-        attempt_id: str | None = None
-        try:
-            with browser_pool.session(
-                account.account_id,
-                runtime_settings,
-                username,
-                password,
-            ) as scraper:
-                store.set_account_check(account.account_id, session_checked=True)
+    def succeeded(account_id: str) -> None:
+        pool_store.mark_account_available(run_id, account_id)
+        store.set_account_check(account_id, session_checked=True)
+        store.add_event("background_auth_recovered", account_id=account_id,
+                        data={"evidence": "authenticated_form"})
 
-                items = store.items(job.job_id, public=False)
-                if not items:
-                    attempt_id = store.begin_attempt(
-                        job_id=job.job_id,
-                        account_id=account.account_id,
-                        quota_date=quota_date,
-                        quota=config.quota_for(account),
-                        run_id=run_id,
-                        consume_quota=True,
-                    )
-                    if not attempt_id:
-                        continue
-                    try:
-                        results = _search_job(scraper, job)
-                    except SafetyStopException as exc:
-                        if exc.reason == StopReason.AUTH_REQUIRED:
-                            store.finish_attempt(
-                                attempt_id,
-                                status="auth_expired",
-                                safety_stop=exc.reason.value,
-                                error=str(exc),
-                            )
-                            with browser_pool.session(
-                                account.account_id,
-                                runtime_settings,
-                                username,
-                                password,
-                                force=True,
-                            ) as scraper:
-                                pass
-                            attempt_id = store.begin_attempt(
-                                job_id=job.job_id,
-                                account_id=account.account_id,
-                                quota_date=quota_date,
-                                quota=config.quota_for(account),
-                                run_id=run_id,
-                                consume_quota=True,
-                            )
-                            if not attempt_id:
-                                continue
-                            results = _search_job(scraper, job)
-                        else:
-                            raise
-                    store.clear_external_outage_backoff()
-                    store.finish_attempt(attempt_id, status="search_completed")
-                    attempt_id = None
-                    if job.source == "captcha_validation" and job.input.get(
-                        "validation_only"
-                    ):
-                        from .captcha_budget import CaptchaBudgetStore
-
-                        CaptchaBudgetStore(
-                            settings.captcha_state_path,
-                            daily_limit=settings.two_captcha_daily_limit,
-                            circuit_seconds=settings.two_captcha_circuit_breaker_seconds,
-                            rejection_cooldown_seconds=(
-                                settings.two_captcha_rejection_cooldown_seconds
-                            ),
-                        ).finish_manual_authorization(
-                            account_id=account.account_id,
-                            status="not_required",
-                            reason="browser_token_accepted",
-                        )
-                        store.add_event(
-                            "captcha_validation_completed",
-                            job_id=job.job_id,
-                            account_id=account.account_id,
-                            data={"result_count": len(results)},
-                        )
-                        return store.finalize_job(job.job_id)
-                    items = store.add_results(job.job_id, results)
-                else:
-                    attempt_id = store.begin_attempt(
-                        job_id=job.job_id,
-                        account_id=account.account_id,
-                        quota_date=quota_date,
-                        quota=config.quota_for(account),
-                        run_id=run_id,
-                        consume_quota=False,
-                    )
-
-                for item in items:
-                    if item["status"] == "completed":
-                        continue
-                    if store.cancel_requested(job.job_id):
-                        if attempt_id:
-                            store.finish_attempt(attempt_id, status="cancelled")
-                        return store.finalize_job(job.job_id)
-                    sample_pages = (
-                        (int(job.input.get("sample_pages") or 0) or None)
-                        if job.source == "endurance"
-                        else None
-                    )
-                    final_path = _expected_artifact_path(
-                        settings.output_dir,
-                        job.job_id,
-                        item,
-                        sample_pages=sample_pages,
-                    )
-                    store.mark_item_downloading(str(item["item_id"]), final_path)
-                    try:
-                        if final_path.exists():
-                            expected_pages = int(item.get("expected_pages") or 1)
-                            sha256, size = validate_pdf(
-                                final_path, expected_pages=expected_pages
-                            )
-                            page_count = expected_pages
-                        else:
-                            try:
-                                final_path, page_count, sha256, size = download_job_item(
-                                    scraper,
-                                    item,
-                                    job_id=job.job_id,
-                                    output_root=settings.output_dir,
-                                    sample_pages=sample_pages,
-                                    on_expected_pages=lambda count: store.set_item_expected_pages(
-                                        str(item["item_id"]), count
-                                    ),
-                                )
-                            except SafetyStopException as exc:
-                                if exc.reason != StopReason.AUTH_REQUIRED:
-                                    raise
-                                with browser_pool.session(
-                                    account.account_id,
-                                    runtime_settings,
-                                    username,
-                                    password,
-                                    force=True,
-                                ) as scraper:
-                                    pass
-                                final_path, page_count, sha256, size = download_job_item(
-                                    scraper,
-                                    item,
-                                    job_id=job.job_id,
-                                    output_root=settings.output_dir,
-                                    sample_pages=sample_pages,
-                                    on_expected_pages=lambda count: store.set_item_expected_pages(
-                                        str(item["item_id"]), count
-                                    ),
-                                )
-                        store.complete_item(
-                            str(item["item_id"]),
-                            expected_pages=page_count,
-                            output_path=final_path,
-                            sha256=sha256,
-                            bytes_count=size,
-                        )
-                    except SafetyStopException:
-                        raise
-                    except Exception as exc:
-                        if _looks_like_connection_failure(exc):
-                            raise
-                        store.fail_item(
-                            str(item["item_id"]), code="download_failed", message=str(exc)
-                        )
-                if attempt_id:
-                    store.finish_attempt(attempt_id, status="completed")
-                return store.finalize_job(job.job_id)
-        except CredentialsRejectedError as exc:
-            browser_pool.discard(account.account_id, status="credentials_invalid")
-            if attempt_id:
-                store.finish_attempt(attempt_id, status="credentials_invalid")
-            pool_store.pause_account(run_id, account.account_id, reason="credentials_invalid")
-            store.add_event(
-                "account_credentials_invalid",
-                job_id=job.job_id,
-                account_id=account.account_id,
-                level="error",
-                data={
-                    "http_status": exc.status,
-                    "response_code": exc.response_code,
-                },
-            )
-        except SafetyStopException as exc:
-            if attempt_id:
-                store.finish_attempt(
-                    attempt_id,
-                    status="safety_stop",
-                    safety_stop=exc.reason.value,
-                    error=str(exc),
-                )
-            outcome = _handle_account_safety_stop(
-                exc,
-                job_id=job.job_id,
-                account=account,
-                store=store,
-                pool_store=pool_store,
-                run_id=run_id,
-                config=config,
-                settings=settings,
-                browser_pool=browser_pool,
-                preflight_runner=preflight_runner,
-                proxy_health_runner=proxy_health_runner,
-            )
-            if outcome in {"safety_stop", "cooldown"}:
-                store.set_waiting(job.job_id, "queued", reason=exc.reason.value)
-                return outcome
-        except Exception as exc:
-            safe_error = _redact_known_values(str(exc), username, password)
-            if attempt_id:
-                store.finish_attempt(attempt_id, status="failed", error=safe_error)
-            connection_failure = _looks_like_connection_failure(exc)
-            dataimpulse_failure = (
-                _dataimpulse_failure_kind(exc)
-                if _is_dataimpulse_account(account)
-                else "unknown"
-            )
-            recovered_route = False
-            if (
-                _is_dataimpulse_account(account)
-                and dataimpulse_failure != "provider_terminal"
-                and (connection_failure or dataimpulse_failure == "transient_route")
-            ):
-                recovered_route = _rotate_dataimpulse_route(
-                    account,
-                    settings,
-                    store,
-                    pool_store,
-                    run_id,
-                    browser_pool,
-                    preflight_runner,
-                    proxy_health_runner,
-                    reason="confirmed_connection_failure",
-                )
-            if dataimpulse_failure == "provider_terminal":
-                pool_store.pause_account(
-                    run_id,
-                    account.account_id,
-                    reason="dataimpulse_provider_terminal",
-                    cooldown_seconds=None,
-                )
-                store.add_event(
-                    "dataimpulse_provider_terminal",
-                    job_id=job.job_id,
-                    account_id=account.account_id,
-                    level="error",
-                    data={"action": "operator_required"},
-                )
-                continue
-            if connection_failure and not recovered_route:
-                browser_pool.discard(account.account_id, status="browser_context_failed")
-            if recovered_route:
-                store.add_event(
-                    "account_route_recovered_after_failure",
-                    job_id=job.job_id,
-                    account_id=account.account_id,
-                )
-                continue
-            gate_ok = _ensure_account_gate(
-                account,
-                runtime_settings,
-                store,
-                pool_store,
-                run_id,
-                preflight_runner,
-                proxy_health_runner,
-                force=True,
-            )
-            if gate_ok:
-                pool_store.pause_account(
-                    run_id,
-                    account.account_id,
-                    reason=(
-                        "browser_context_failed"
-                        if _looks_like_connection_failure(exc)
-                        else "unexpected_worker_failure"
-                    ),
-                )
-            store.add_event(
-                "account_paused_after_failure",
-                job_id=job.job_id,
-                account_id=account.account_id,
-                level="error",
-                data={"error": safe_error},
-            )
+    browser_pool.can_reauthenticate = allowed
+    browser_pool.on_auth_failure = failed
+    browser_pool.on_auth_success = succeeded
 
 
 def _run_startup_gates(
@@ -3008,7 +3160,8 @@ def _run_startup_gates(
             pool_store.mark_account_available(run_id, account.account_id)
         except CredentialsRejectedError as exc:
             browser_pool.discard(account.account_id, status="credentials_invalid")
-            pool_store.pause_account(run_id, account.account_id, reason="credentials_invalid")
+            pool_store.pause_account(run_id, account.account_id, reason="credentials_invalid",
+                                     cooldown_seconds=None)
             store.add_event(
                 "account_credentials_invalid",
                 account_id=account.account_id,
@@ -3019,7 +3172,9 @@ def _run_startup_gates(
                 },
             )
         except SafetyStopException as exc:
-            if exc.reason in GLOBAL_SAFETY_REASONS:
+            if browser_pool.on_auth_failure:
+                browser_pool.on_auth_failure(account.account_id, exc)
+            elif exc.reason in GLOBAL_SAFETY_REASONS:
                 store.set_global_cooldown(
                     exc.reason.value,
                     SAFETY_COOLDOWN_SECONDS[exc.reason],
@@ -3081,7 +3236,30 @@ def _runtime_account_settings(
         account.account_id, account.dataimpulse_port
     )
     port = dataimpulse_port or int(route["active_port"])
-    return account_settings(settings, account, dataimpulse_port=port)
+    runtime = account_settings(settings, account, dataimpulse_port=port)
+    generation = int(route.get("generation") or 0)
+    if generation > 0:
+        # A promoted sticky port represents a new exit peer.  Do not carry the
+        # rejected peer's cache, cookies, storage, or service workers into the
+        # replacement session.  The generation-specific directory remains
+        # stable while that route is healthy, preserving successful logins.
+        scoped_profile = (
+            runtime.profile_dir.parent
+            / f"chrome-profile-route-{generation}-port-{port}"
+        ).resolve()
+        legacy_profile = (
+            runtime.profile_dir.parent
+            / f"chrome-profile-route-{generation}"
+        ).resolve()
+        runtime = replace(
+            runtime,
+            profile_dir=(
+                scoped_profile
+                if scoped_profile.exists() or not legacy_profile.exists()
+                else legacy_profile
+            ),
+        )
+    return runtime
 
 
 def _ensure_account_gate(
@@ -3116,16 +3294,21 @@ def _ensure_account_gate(
                 write_report=True,
                 allow_baseline_replacement=True,
             )
-            if (
-                replacement_preflight.ok
-                and _egress_baseline_status(replacement_preflight) == "replacement_pending"
-            ):
+            if replacement_preflight.ok:
+                replacement_status = _egress_baseline_status(
+                    replacement_preflight
+                )
+                preflight = replacement_preflight
+            else:
+                replacement_status = "failed"
+            if replacement_status == "replacement_pending":
                 if _is_dataimpulse_account(account):
                     from .proxy_provider import dataimpulse_configuration_health
 
                     provider_health = dataimpulse_configuration_health(
                         settings.dataimpulse_proxy_login,
                         settings.dataimpulse_proxy_password,
+                        provider=account.proxy_provider,
                     )
                 else:
                     from .proxy_provider import two_captcha_proxy_health
@@ -3141,7 +3324,6 @@ def _ensure_account_gate(
                         "Residential proxy traffic is unavailable.",
                         context="job worker startup",
                     )
-                preflight = replacement_preflight
                 rotate_residential_baseline = True
         if not preflight.ok:
             raise SafetyStopException(
@@ -3211,12 +3393,12 @@ def _is_sticky_residential_account(account: PoolAccount) -> bool:
 
     return account.proxy_provider in {
         TWO_CAPTCHA_RESIDENTIAL_STICKY_PROVIDER,
-        DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER,
+        *DATAIMPULSE_STICKY_PROVIDERS,
     }
 
 
 def _is_dataimpulse_account(account: PoolAccount) -> bool:
-    return account.proxy_provider == DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER
+    return account.proxy_provider in DATAIMPULSE_STICKY_PROVIDERS
 
 
 def _dataimpulse_failure_kind(exc: Exception) -> str:
@@ -3249,9 +3431,29 @@ def _rotate_dataimpulse_route(
     proxy_health_runner: Callable[..., Any],
     *,
     reason: str,
+    _owner_execution: bool = False,
 ) -> bool:
     """Validate then promote one new sticky port for one account only."""
+    if os.environ.get("CBRS_BROWSER_OWNER_MODE") == "external" and not _owner_execution:
+        entry = browser_pool._entries.get(account.account_id)
+        if entry is None or not getattr(getattr(entry.scraper, "browser", None), "is_remote", False):
+            return False
+        recovered = bool(entry.scraper._call("recover_route", {"reason": reason}))
+        if recovered:
+            browser_pool.discard(account.account_id, status="remote_route_adopted", service_shutdown=True)
+            fresh = _runtime_account_settings(settings, account, store)
+            browser_pool._known_accounts[account.account_id] = (fresh, entry.username, entry.password)
+        return recovered
+    validate_service_browser(settings)
     if not _is_dataimpulse_account(account) or account.dataimpulse_port is None:
+        return False
+    if (browser_pool.has_protected_session(account.account_id)
+            and not browser_pool.can_replace_rejected_login(account.account_id)):
+        store.add_event(
+            "dataimpulse_rotation_skipped", account_id=account.account_id,
+            level="warning",
+            data={"reason": "authenticated_browser_preserved_until_service_stop"},
+        )
         return False
     candidate = store.begin_dataimpulse_rotation(
         account.account_id,
@@ -3261,6 +3463,7 @@ def _rotate_dataimpulse_route(
         port_max=settings.dataimpulse_port_max,
         cooldown_seconds=settings.dataimpulse_rotation_cooldown_seconds,
         max_rotations_per_hour=settings.dataimpulse_max_rotations_per_hour,
+        randomize=True,
     )
     if not candidate.get("ok"):
         blocked_reason = str(candidate.get("reason") or "proxy_rotation_blocked")
@@ -3280,6 +3483,12 @@ def _rotate_dataimpulse_route(
         return False
     pending_port = int(candidate["pending_port"])
     promoted = False
+    candidate_manager = None
+    candidate_scraper = None
+    proven_entry = None
+    adopted = False
+    egress_hash = ""
+    provider_terminal = False
     try:
         candidate_settings = _runtime_account_settings(
             settings,
@@ -3287,12 +3496,25 @@ def _rotate_dataimpulse_route(
             store,
             dataimpulse_port=pending_port,
         )
+        candidate_generation = int(candidate.get("generation") or 0) + 1
+        candidate_settings = replace(
+            candidate_settings,
+            profile_dir=(
+                candidate_settings.profile_dir.parent
+                / (
+                    f"chrome-profile-route-{candidate_generation}"
+                    f"-port-{pending_port}"
+                )
+            ).resolve(),
+        )
         preflight = preflight_runner(
             candidate_settings,
             write_report=True,
             allow_baseline_replacement=True,
         )
         if not preflight.ok:
+            details = " ".join(str(value) for value in preflight.report.get("errors", []))
+            provider_terminal = "407" in details or _dataimpulse_failure_kind(RuntimeError(details)) == "provider_terminal"
             raise SafetyStopException(
                 StopReason.EGRESS_PREFLIGHT,
                 "Candidate DataImpulse route failed preflight.",
@@ -3300,6 +3522,8 @@ def _rotate_dataimpulse_route(
             )
         proxy = proxy_health_runner(candidate_settings, write_report=True)
         if not proxy.ok:
+            details = " ".join(str(value) for value in proxy.report.get("errors", []))
+            provider_terminal = "407" in details or _dataimpulse_failure_kind(RuntimeError(details)) == "provider_terminal"
             raise SafetyStopException(
                 StopReason.PROXY_HEALTH,
                 "Candidate DataImpulse route failed proxy health.",
@@ -3312,6 +3536,14 @@ def _rotate_dataimpulse_route(
                 "Candidate DataImpulse route did not produce an egress identity.",
                 context="dataimpulse rotation",
             )
+        previous_hash = (store.account_check(account.account_id) or {}).get("egress_hash")
+        if ((previous_hash and egress_hash == previous_hash)
+                or store.candidate_exit_rejected(account.account_id, egress_hash)):
+            raise SafetyStopException(
+                StopReason.EGRESS_PREFLIGHT,
+                "Candidate reused a previous/rejected exit; no login attempted.",
+                context="dataimpulse rotation",
+            )
         owner = store.egress_owner(egress_hash, exclude_account=account.account_id)
         if owner:
             raise SafetyStopException(
@@ -3319,6 +3551,48 @@ def _rotate_dataimpulse_route(
                 "Candidate DataImpulse route is already assigned to another account.",
                 context="dataimpulse rotation",
             )
+        # Prove the target application's strongest signal before making the
+        # route durable.  This standalone context uses the exact profile that
+        # the worker will retain after promotion while the current account
+        # context remains untouched until the candidate succeeds.
+        username, password = account_credentials(account)
+        candidate_manager = browser_pool.scraper_factory(
+            headless=browser_pool.headless,
+            settings=candidate_settings,
+        )
+        candidate_scraper = None
+        try:
+            candidate_scraper = (
+                candidate_manager.__enter__()
+                if hasattr(candidate_manager, "__enter__")
+                else candidate_manager
+            )
+            candidate_scraper.ensure_authenticated(username, password)
+            candidate_browser = getattr(
+                candidate_scraper, "browser", candidate_scraper
+            )
+            raw_auth_state = candidate_browser.wait_for_commerce_auth_state()
+            auth_state = (
+                raw_auth_state
+                if isinstance(raw_auth_state, CommerceAuthState)
+                else CommerceAuthState(str(raw_auth_state))
+            )
+            if auth_state is not CommerceAuthState.AUTHENTICATED_FORM:
+                raise SafetyStopException(
+                    StopReason.AUTH_REQUIRED,
+                    "Candidate route did not render the protected commerce form.",
+                    context="dataimpulse rotation",
+                )
+            proven_entry = _ManagedAccountScraper(
+                manager=candidate_manager, scraper=candidate_scraper,
+                settings=candidate_settings, username=username, password=password,
+                authenticated_once=True, last_restart_at=time.monotonic(),
+            )
+            preserve = getattr(candidate_browser, "preserve_for_service_lifetime", None)
+            if callable(preserve):
+                preserve()
+        except Exception:
+            raise
         from .preflight import replace_egress_baseline
 
         replace_egress_baseline(
@@ -3333,16 +3607,8 @@ def _rotate_dataimpulse_route(
             proxy_status="passed",
             egress_hash=egress_hash,
         )
-        browser_pool.discard(account.account_id, status="proxy_route_rotated")
-        username, password = account_credentials(account)
-        promoted_settings = _runtime_account_settings(settings, account, store)
-        with browser_pool.session(
-            account.account_id,
-            promoted_settings,
-            username,
-            password,
-        ):
-            pass
+        adopted = True
+        browser_pool.adopt_authenticated_candidate(account.account_id, proven_entry)
         pool_store.mark_account_available(run_id, account.account_id)
         store.add_event(
             "dataimpulse_route_rotated",
@@ -3359,6 +3625,14 @@ def _rotate_dataimpulse_route(
         )
         return True
     except Exception as exc:
+        if proven_entry is None and egress_hash:
+            store.record_failed_candidate_exit(account.account_id, egress_hash)
+        if provider_terminal or isinstance(exc, CredentialsRejectedError):
+            pool_store.pause_account(
+                run_id, account.account_id,
+                reason="provider_terminal" if provider_terminal else "credentials_invalid",
+                cooldown_seconds=None,
+            )
         if not promoted:
             store.finish_dataimpulse_rotation(
                 account.account_id,
@@ -3386,6 +3660,19 @@ def _rotate_dataimpulse_route(
             },
         )
         return False
+    finally:
+        if proven_entry is not None and not adopted:
+            # Even persistence failure cannot authorize closing a proven session.
+            browser_pool._retained_entries.append((account.account_id, proven_entry))
+        elif proven_entry is None and candidate_manager is not None:
+            # Only a new, rejected disposable probe is eligible for cleanup.
+            try:
+                if hasattr(candidate_manager, "__exit__"):
+                    candidate_manager.__exit__(None, None, None)
+                elif candidate_scraper is not None and hasattr(candidate_scraper, "close"):
+                    candidate_scraper.close()
+            except Exception:
+                pass
 
 
 def _process_requested_dataimpulse_rotation(
@@ -3473,7 +3760,7 @@ def _process_requested_dataimpulse_rotation(
 def _handle_account_safety_stop(
     exc: SafetyStopException,
     *,
-    job_id: str,
+    job_id: str | None,
     account: PoolAccount,
     store: JobStore,
     pool_store: AccountPoolStore,
@@ -3524,9 +3811,32 @@ def _handle_account_safety_stop(
             account.account_id,
             initial_port=account.dataimpulse_port,
         )
+        recent_success = store.another_account_succeeded_recently(
+            account.account_id, allow_authenticated_form=job_id is None,
+        )
+        canary = False
+        if (not recent_success and job_id is None
+                and account.proxy_provider == "dataimpulse_mobile_sticky"
+                and exc.status == 400 and exc.context == "auth login"
+                and failures >= settings.dataimpulse_temp_unavailable_threshold
+                and not store.global_cooldown()
+                and not browser_pool.has_protected_session(account.account_id)):
+            # The operator confirmed direct-IP logins work. Permit a small
+            # Mobile-only sample even when no current proxy account works;
+            # this does not bypass the outage wait or establish its cause.
+            canary = store.reserve_mobile_login_canary()
+        store.add_event(
+            "dataimpulse_recovery_evaluated", account_id=account.account_id,
+            job_id=job_id,
+            data={"reason": exc.reason.value, "failures": failures,
+                  "threshold": settings.dataimpulse_temp_unavailable_threshold,
+                  "other_account_succeeded": recent_success,
+                  "mobile_canary_reserved": canary,
+                  "scope": "login" if job_id is None else "query"},
+        )
         if (
             failures >= settings.dataimpulse_temp_unavailable_threshold
-            and store.another_account_succeeded_recently(account.account_id)
+            and (recent_success or canary)
         ):
             if _rotate_dataimpulse_route(
                 account,
@@ -3537,7 +3847,7 @@ def _handle_account_safety_stop(
                 browser_pool,
                 preflight_runner,
                 proxy_health_runner,
-                reason="repeated_account_temporary_unavailable",
+                reason="mobile_login_canary" if canary else "repeated_account_temporary_unavailable",
             ):
                 store.add_event(
                     "dataimpulse_account_recovered",
@@ -3602,6 +3912,9 @@ def _all_enabled_accounts_temporarily_unavailable(
 
 
 def _search_job(scraper: Any, job: Job) -> list[dict[str, Any]]:
+    context_setter = getattr(scraper, "set_job_context", None)
+    if callable(context_setter):
+        context_setter(job.job_id)
     if job.kind == "text":
         return scraper.search_by_text(str(job.input["text"]))
     return scraper.search_by_fna(

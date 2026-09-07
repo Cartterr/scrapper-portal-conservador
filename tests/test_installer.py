@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,19 @@ from cbrs.readiness import REQUIRED_SOURCE_FILES
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_native_env_templates_keep_exact_key_parity() -> None:
+    def keys(path: Path) -> set[str]:
+        return {
+            line.split("=", 1)[0]
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if re.fullmatch(r"[A-Z][A-Z0-9_]*=.*", line)
+        }
+
+    assert keys(ROOT / ".env.example") == keys(
+        ROOT / "deploy" / "cbrs-native.env.example"
+    )
 
 
 def _load_configure_module():
@@ -52,9 +66,13 @@ def test_installer_assets_are_required_by_readiness() -> None:
         "PREREQUISITES.txt",
         "deploy/configure_runtime.py",
         "deploy/run_with_env.py",
-        "deploy/cbrs-configuration-apply.path",
-        "deploy/cbrs-configuration-apply.service",
+        "deploy/cbrs-native.env.example",
+        "deploy/account-pool.native.json.example",
         "deploy/windows/Install-CbrsE2E.ps1",
+        "deploy/windows/Install-CbrsNative.ps1",
+        "deploy/windows/Start-CbrsNative.ps1",
+        "deploy/windows/Set-CbrsDataImpulseNetwork.ps1",
+        "deploy/windows/Set-CbrsDataImpulseProxySessions.ps1",
     }
     assert expected.issubset(REQUIRED_SOURCE_FILES)
     assert all((ROOT / path).is_file() for path in expected)
@@ -172,26 +190,28 @@ def test_windows_installer_has_required_safety_gates() -> None:
     powershell = (ROOT / "deploy" / "windows" / "Install-CbrsE2E.ps1").read_text(
         encoding="utf-8"
     )
+    native = (ROOT / "deploy" / "windows" / "Install-CbrsNative.ps1").read_text(
+        encoding="utf-8"
+    )
 
     assert "fltmc.exe" in batch
     assert "-Verb RunAs" in batch
     assert "-ExecutionPolicy Bypass" in batch
     assert "--plan" in batch
-    assert "Read-Host $Prompt -AsSecureString" in powershell
-    assert "configure_runtime.py" in powershell
-    assert "run_with_env.py" in powershell
-    assert "--approve-egress-baseline" in powershell
-    assert "¿Autoriza habilitar e iniciar ahora el worker CBRS?" in powershell
+    assert "Install-CbrsNative.ps1" in batch
+    assert "Install-CbrsNative.ps1" in powershell
+    assert "wsl.exe" not in powershell.lower()
+    assert "Google.Chrome" in native
+    assert "live_traffic_started = $false" in native
     assert "Start-Transcript" not in powershell
     assert "source /etc/cbrs/cbrs.env" not in powershell
 
 
-def test_windows_wsl_helpers_strip_cr_before_bash() -> None:
+def test_legacy_wsl_helpers_strip_cr_before_bash() -> None:
     for relative_path in (
         "deploy/windows/Get-CbrsIndefiniteStatus.ps1",
         "deploy/windows/Start-CbrsIndefiniteTest.ps1",
         "deploy/windows/Stop-CbrsIndefiniteTest.ps1",
-        "deploy/windows/Install-CbrsE2E.ps1",
     ):
         source = (ROOT / relative_path).read_text(encoding="utf-8")
         assert '-replace "`r", \'\'' in source
@@ -213,7 +233,7 @@ def test_native_windows_installer_is_repeatable_and_does_not_start_traffic() -> 
     assert "Disable-ScheduledTask" in source
     assert "live_traffic_started = $false" in source
     assert "Start-ScheduledTask" not in source
-    assert "-RestartCount 999" in source
+    assert "-RestartCount 999" not in source
     assert "-ExecutionTimeLimit ([TimeSpan]::Zero)" in source
     assert "-AllowStartIfOnBatteries" in source
     assert "-DontStopIfGoingOnBatteries" in source
@@ -226,7 +246,7 @@ def test_native_windows_installer_is_repeatable_and_does_not_start_traffic() -> 
     assert "pytest==9.0.3" in development_requirements
 
 
-def test_native_start_verifies_operational_runtime_and_rolls_back_on_failure() -> None:
+def test_native_start_verifies_runtime_and_preserves_sessions_on_failure() -> None:
     source = (ROOT / "deploy" / "windows" / "Start-CbrsNative.ps1").read_text(
         encoding="utf-8"
     )
@@ -237,10 +257,13 @@ def test_native_start_verifies_operational_runtime_and_rolls_back_on_failure() -
     assert "jobs recover" in source
     assert "operational.json" in source
     assert "startedByThisRun" in source
-    assert "Stop-ScheduledTask" in source
-    assert "Disable-ScheduledTask" in source
+    assert "Stop-ScheduledTask" not in source
+    assert "Stop-Process" not in source
+    assert "No automatic rollback shutdown" in source
+    assert "Existing CBRS worker/browser preserved" in source
+    assert "Disable-ScheduledTask" not in source
     assert "Set-ScheduledTask" in source
-    assert "-RestartCount 999" in source
+    assert "-RestartCount 999" not in source
     assert "-ExecutionTimeLimit ([TimeSpan]::Zero)" in source
     assert "CBRS User Worker" in source
     assert "CBRS User Runtime Watchdog" in source
@@ -251,6 +274,19 @@ def test_native_start_verifies_operational_runtime_and_rolls_back_on_failure() -
     assert "New-CbrsHiddenTaskAction" in source
     assert '"--wait powershell.exe $powershellArguments"' in source
     assert '$escapedCommand' not in source
+    assert "$live/$expected worker-owned Chrome contexts" in source
+
+
+def test_native_stop_closes_only_the_verified_worker_and_pool_ownership() -> None:
+    source = (ROOT / "deploy" / "windows" / "Stop-CbrsNative.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Stop-CbrsWorkerProcesses" in source
+    assert "WORKER_LEASE_NAME" in source
+    assert "latest_run(dry_run=False)" in source
+    assert "verified native stop" in source
+    assert "finished=True" in source
 
 
 def test_native_worker_and_periodic_watchdog_cover_reboot_and_child_crashes() -> None:
@@ -262,15 +298,20 @@ def test_native_worker_and_periodic_watchdog_cover_reboot_and_child_crashes() ->
     ).read_text(encoding="utf-8")
 
     assert "jobs recover" in task_source
+    assert "@('-m', 'cbrs', 'jobs', 'worker')" in task_source
+    assert "'--headless'" not in task_source
+    assert "'--headed'" not in task_source
     assert "Ensure-TaskRunning" in watchdog_source
     assert "[ValidateSet('User', 'System')]" in watchdog_source
     assert "CBRS User Worker" in watchdog_source
     assert "CBRS Worker" in watchdog_source
     assert "Start-ScheduledTask" in watchdog_source
-    assert "Stop-ScheduledTask" in watchdog_source
-    assert "Stop-VerifiedWorkerChild" in watchdog_source
-    assert "Stop-Process" in watchdog_source
-    assert "prior worker child survives" in watchdog_source
+    assert "Stop-ScheduledTask" not in watchdog_source
+    assert "Stop-VerifiedWorkerChild" not in watchdog_source
+    assert "Stop-Process" not in watchdog_source
+    assert "CBRS processes still alive" in watchdog_source
+    assert "worker and browser sessions preserved" in watchdog_source
+    assert "Enable-ScheduledTask" not in watchdog_source
     assert "expires_at" in watchdog_source
     assert "pastStartupGrace" in watchdog_source
 

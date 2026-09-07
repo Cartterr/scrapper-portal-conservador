@@ -11,6 +11,25 @@ if (-not $AcknowledgeAuthorizedLiveTraffic) {
 }
 $python = Join-Path $RepoRoot '.venv\Scripts\python.exe'
 $runner = Join-Path $RepoRoot 'deploy\run_with_env.py'
+if (Select-String -LiteralPath $EnvFile -Pattern '^CBRS_BROWSER_OWNER_MODE=external\s*$' -Quiet) {
+    $workerName = if (Get-ScheduledTask -TaskName 'CBRS User Worker' -ErrorAction SilentlyContinue) { 'CBRS User Worker' } else { 'CBRS Worker' }
+    & (Join-Path $PSScriptRoot 'Manage-CbrsBrowserOwner.ps1') -Action Start -RepoRoot $RepoRoot -EnvFile $EnvFile -WorkerTask $workerName
+    $otherTasks = if ($workerName -eq 'CBRS User Worker') { @('CBRS User Dashboard','CBRS User Runtime Watchdog') } else { @('CBRS Dashboard','CBRS Runtime Watchdog') }
+    foreach ($taskName in $otherTasks) {
+        Enable-ScheduledTask -TaskName $taskName | Out-Null
+        if ((Get-ScheduledTask -TaskName $taskName).State -ne 'Running') { Start-ScheduledTask -TaskName $taskName }
+    }
+    return
+}
+# Starting an already active service is a no-op, never a repair/restart.
+$existingOwners = @(Get-CimInstance Win32_Process | Where-Object {
+    ($_.Name -eq 'python.exe' -and $_.CommandLine -like '*-m cbrs*jobs*worker*') -or
+    ($_.Name -eq 'chrome.exe' -and $_.CommandLine -like '*--user-data-dir*CBRS*')
+})
+if ($existingOwners.Count -gt 0) {
+    Write-Warning 'Existing CBRS worker/browser preserved. Start deferred; no process was stopped or restarted.'
+    return
+}
 $readiness = Join-Path 'G:\CBRS' 'readiness\pre-live.json'
 $operationalReadiness = Join-Path 'G:\CBRS' 'readiness\operational.json'
 New-Item -ItemType Directory -Path (Split-Path -Parent $readiness) -Force | Out-Null
@@ -20,8 +39,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Expired worker-state recovery failed. No task 
 if ($LASTEXITCODE -ne 0) { throw 'Native readiness failed. No task was started.' }
 
 $persistentTaskSettings = New-ScheduledTaskSettingsSet `
-    -RestartCount 999 `
-    -RestartInterval (New-TimeSpan -Minutes 1) `
     -StartWhenAvailable `
     -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
@@ -57,28 +74,6 @@ function New-CbrsHiddenTaskAction {
         -WorkingDirectory $WorkingDirectory
 }
 
-function Stop-CbrsWorkerProcesses {
-    $repoPattern = [regex]::Escape([IO.Path]::GetFullPath($RepoRoot))
-    $deadline = (Get-Date).AddSeconds(20)
-    do {
-        $workers = @(
-            Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-                Where-Object {
-                    $_.CommandLine -match $repoPattern -and
-                    $_.CommandLine -match '(?i)-m\s+cbrs\s+--headless\s+jobs\s+worker'
-                }
-        )
-        if (-not $workers) { return }
-        $parentIds = @($workers | ForEach-Object { [int]$_.ParentProcessId })
-        $leaves = @($workers | Where-Object { [int]$_.ProcessId -notin $parentIds })
-        foreach ($worker in $leaves) {
-            Stop-Process -Id ([int]$worker.ProcessId) -Force -ErrorAction SilentlyContinue
-        }
-        Start-Sleep -Milliseconds 500
-    } while ((Get-Date) -lt $deadline)
-    throw 'Verified CBRS worker process tree did not stop after startup rollback.'
-}
-
 $legacyTaskNames = @('CBRS Worker', 'CBRS Dashboard', 'CBRS Daily Backup', 'CBRS Runtime Watchdog')
 $userTaskNames = @('CBRS User Worker', 'CBRS User Dashboard', 'CBRS User Daily Backup', 'CBRS User Runtime Watchdog')
 $taskNames = $legacyTaskNames
@@ -100,6 +95,19 @@ if (-not $headedRuntime) {
             $previouslyEnabled[$name] = [bool]$task.Settings.Enabled
         }
         foreach ($name in $legacyTaskNames[0..1]) {
+            # CIM merges an old RestartInterval with Count=0 into invalid XML.
+            # Remove the entire policy before applying the remaining settings.
+            $scheduler = New-Object -ComObject 'Schedule.Service'
+            $scheduler.Connect()
+            $folder = $scheduler.GetFolder('\')
+            $registered = $folder.GetTask($name)
+            [xml]$definition = $registered.Xml
+            $restart = $definition.SelectSingleNode("//*[local-name()='Settings']/*[local-name()='RestartOnFailure']")
+            if ($restart) {
+                [void]$restart.ParentNode.RemoveChild($restart)
+                [void]$folder.RegisterTask($name, $definition.OuterXml, 36, $null, $null,
+                    $registered.Definition.Principal.LogonType, $null)
+            }
             Set-ScheduledTask -TaskName $name -Settings $persistentTaskSettings -ErrorAction Stop | Out-Null
         }
         Set-ScheduledTask -TaskName $legacyTaskNames[2] -Settings $backupTaskSettings -ErrorAction Stop | Out-Null
@@ -225,19 +233,10 @@ try {
             worker_contexts_retained = ($live -eq $expected)
         }
         $recoveryReport | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $operationalReadiness -Encoding utf8
-        Write-Warning 'CBRS is temporarily unavailable; three worker-owned Chrome contexts remain live and will retry authentication with bounded backoff.'
+        Write-Warning "CBRS is temporarily unavailable; $live/$expected worker-owned Chrome contexts are live and retained contexts will retry authentication with bounded backoff."
         Write-Host 'CBRS native runtime started in authentication-recovery mode. Dashboard: http://127.0.0.1:8765'
     }
 } catch {
-    foreach ($name in $startedByThisRun) {
-        Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-    }
-    foreach ($name in $taskNames) {
-        if (-not $previouslyEnabled[$name]) {
-            Disable-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue | Out-Null
-        }
-    }
-    Stop-CbrsWorkerProcesses
-    & $python $runner $EnvFile -- $python -c "from cbrs.jobs import WORKER_LEASE_NAME, default_job_store; s=default_job_store(); lease=s.lease(); s.release_lease(WORKER_LEASE_NAME, str(lease['owner'])) if lease else None"
+    Write-Warning 'Startup validation failed; any launched worker and Chrome sessions are preserved for inspection. No automatic rollback shutdown.'
     throw
 }

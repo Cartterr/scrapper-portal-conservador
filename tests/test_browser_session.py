@@ -19,6 +19,21 @@ from cbrs.safety import SafetyStopException, StopReason
 from cbrs.config import load_settings
 
 
+def test_service_owned_browser_ignores_generic_close_and_context_manager_exit(tmp_path):
+    session = BrowserSession(load_settings({}, root=tmp_path))
+    closures = []
+    context = SimpleNamespace(close=lambda: closures.append("closed"))
+    session._context = context
+    session.preserve_for_service_lifetime()
+    session.close()
+    session.__exit__(None, None, None)
+    assert closures == []
+    assert session._context is context
+    session.shutdown_service_context()
+    assert closures == ["closed"]
+    assert session._context is None
+
+
 def test_browser_session_defaults_to_headless_settings(tmp_path: Path) -> None:
     settings = load_settings({}, root=tmp_path)
 
@@ -505,33 +520,55 @@ def test_ensure_authenticated_reuses_a_valid_persistent_session(tmp_path: Path) 
     assert session.ensure_authenticated(None, None) == "refreshed"
 
 
-def test_ensure_authenticated_uses_browser_fetch_and_confirms_refresh(tmp_path: Path) -> None:
+def test_ensure_authenticated_uses_visible_form_first_and_confirms_refresh(
+    tmp_path: Path,
+) -> None:
     session = BrowserSession(load_settings({}, root=tmp_path))
     session.open = lambda: session
     states = iter([False, True])
     session.has_active_login = lambda: next(states)
     captured = {}
-    session._login_with_fetch = lambda username, password: captured.update(
+    session._login_with_form = lambda username, password: captured.update(
         {"username": username, "password": password}
     )
+    session._login_with_fetch = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("fetch fallback should not run")
+    )
 
-    assert session.ensure_authenticated("operator@example.test", "private") == "browser_fetch"
+    assert session.ensure_authenticated("operator@example.test", "private") == "browser_form"
     assert captured == {"username": "operator@example.test", "password": "private"}
 
 
-def test_ensure_authenticated_does_not_form_retry_rejected_credentials(tmp_path: Path) -> None:
+def test_ensure_authenticated_does_not_fetch_retry_rejected_credentials(tmp_path: Path) -> None:
     session = BrowserSession(load_settings({}, root=tmp_path))
     session.open = lambda: session
     session.has_active_login = lambda: False
-    session._login_with_fetch = lambda *_args: (_ for _ in ()).throw(
+    session._login_with_form = lambda *_args: (_ for _ in ()).throw(
         CredentialsRejectedError("rejected")
     )
-    session._login_with_form = lambda *_args: (_ for _ in ()).throw(
-        AssertionError("form fallback must not repeat rejected credentials")
+    session._login_with_fetch = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("fetch fallback must not repeat rejected credentials")
     )
 
     with pytest.raises(CredentialsRejectedError):
         session.ensure_authenticated("operator@example.test", "private")
+
+
+def test_ensure_authenticated_uses_fetch_only_when_form_cannot_render(
+    tmp_path: Path,
+) -> None:
+    session = BrowserSession(load_settings({}, root=tmp_path))
+    session.open = lambda: session
+    states = iter([False, True])
+    session.has_active_login = lambda: next(states)
+    session._login_with_form = lambda *_args: (_ for _ in ()).throw(
+        RuntimeError("form did not render")
+    )
+    called: list[str] = []
+    session._login_with_fetch = lambda *_args: called.append("fetch")
+
+    assert session.ensure_authenticated("operator@example.test", "private") == "browser_fetch"
+    assert called == ["fetch"]
 
 
 def test_login_response_preserves_generic_retry_as_temporary_stop(tmp_path: Path) -> None:
@@ -934,12 +971,62 @@ def test_prepare_interactive_login_prefills_without_submitting(tmp_path: Path) -
 
     session = BrowserSession(settings)
     session._context = SimpleNamespace(pages=[FakePage()])
+    session._open_login_form_from_protected_gate = lambda: captured.update(
+        {"gate_entry": settings.commerce_url}
+    )
 
     session.prepare_interactive_login("operator@example.test", "private")
 
-    assert captured["goto"][0].endswith("/login")
+    assert captured["gate_entry"] == settings.commerce_url
     assert captured["fill_email"] == "operator@example.test"
     assert captured["fill_password"] == "private"
+
+
+def test_login_navigation_clicks_the_protected_page_gate(tmp_path: Path) -> None:
+    settings = load_settings({}, root=tmp_path)
+    captured: dict[str, object] = {"state": "login_gate"}
+
+    class FakeLocator:
+        first = None
+
+        def __init__(self, kind: str) -> None:
+            self.kind = kind
+            self.first = self
+
+        def click(self, **_kwargs) -> None:
+            captured["clicked"] = self.kind
+            captured["state"] = "form"
+
+        def wait_for(self, **_kwargs) -> None:
+            if self.kind != "email" or captured["state"] != "form":
+                raise RuntimeError("not visible")
+
+        def inner_text(self, **_kwargs) -> str:
+            return ""
+
+    class FakePage:
+        url = "about:blank"
+
+        def goto(self, url: str, **_kwargs) -> None:
+            captured["goto"] = url
+
+        def evaluate(self, _script: str) -> str:
+            return str(captured["state"])
+
+        def locator(self, selector: str, **_kwargs) -> FakeLocator:
+            if selector.startswith("a[href"):
+                return FakeLocator("gate-link")
+            if selector == "body":
+                return FakeLocator("body")
+            return FakeLocator("email")
+
+    session = BrowserSession(settings)
+    session._context = SimpleNamespace(pages=[FakePage()])
+
+    session._open_login_form_from_protected_gate()
+
+    assert captured["goto"] == settings.commerce_url
+    assert captured["clicked"] == "gate-link"
 
 
 def test_visible_form_login_submits_and_confirms_session(tmp_path: Path) -> None:

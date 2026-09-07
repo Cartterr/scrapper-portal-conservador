@@ -1,5 +1,53 @@
 # Plataforma de Consulta Documental CBRS
 
+## Chrome independiente del worker
+
+La arquitectura opcional `CBRS_BROWSER_OWNER_MODE=external` conserva Chrome en un
+proceso propietario separado. Permite reemplazar el worker sin cerrar sesiones;
+la migración inicial es explícita, no automática. Consulte
+[arquitectura, instalación y límites](docs/independent-browser-owner.md).
+
+## Actualizaciones en vivo
+
+La lógica de jobs, búsqueda por formulario, observación de autenticación,
+capturas de error y generación PDF admite releases locales versionados entre
+operaciones, sin cerrar Chrome ni cambiar su propietario. La interfaz vive en
+`cbrs/web/overview.html` y se actualiza al refrescar el overview.
+Usar `deploy/windows/Update-CbrsRuntime.ps1`; publicar no equivale a activar.
+Ver [arquitectura, límites y rollback](docs/runtime-live-updates.md).
+Los cambios de núcleo, navegador, esquema o dependencias todavía requieren una
+migración controlada; no se promete hot reload arbitrario de todo Python.
+
+## Política de navegador
+
+El servicio y su recuperación usan exclusivamente **Google Chrome normal con
+Playwright**. GoLogin/Orbita, Dolphin y backends anti-detect quedan fuera del
+onboarding y de la recuperación: no existe fallback automático hacia ellos.
+Startup, creación de sesiones y candidatos validan esta política; una ruta a
+otro ejecutable se rechaza antes de lanzar el navegador.
+
+`CBRS_BROWSER_BACKEND=chrome` y `CBRS_BROWSER_EXECUTABLE_PATH` deben apuntar a
+Google Chrome instalado. `CBRS_HEADLESS=1` sigue siendo el valor por defecto;
+`0` habilita una ventana visible. Los éxitos diagnósticos recientes en modo
+visible no prueban estabilidad indefinida ni se transfieren automáticamente al
+worker. No cerrar una sesión aceptada para cambiar su modo: activar cambios que
+requieren reiniciar sólo con autorización explícita de reinicio de TODO el servicio.
+
+> **Regla obligatoria de preservación:** no cerrar ni reiniciar Chrome, su
+> contexto ni el worker que lo posee durante operación, recuperación o despliegue.
+> Conservar las instancias hasta reiniciar/apagar el PC o una detención explícita
+> de TODO el servicio. Los cambios de código quedan pendientes de activación si
+> requieren reiniciar el worker. Véase [AGENTS.md](AGENTS.md); esta regla prevalece
+> sobre procedimientos históricos de reinicio. Cookies persistentes no garantizan
+> recuperar una sesión aceptada al volver a abrir Chrome.
+
+La recuperación de cuentas sin login puede probar candidatos Mobile separados y
+adoptar el navegador que logró autenticarse **sin cerrarlo ni repetir el login**.
+La instancia anterior queda abierta/inactiva hasta detener el servicio; las
+cuentas con una sesión ya comprobada no rotan. Cada candidato debe mostrar una
+salida chilena diferente y el formulario protegido. Las pruebas de rutas nuevas
+tienen límites persistentes por cuenta y por pool.
+
 > Solución controlada para consultar el Índice del Registro de Comercio del
 > Conservador de Bienes Raíces de Santiago (CBRS), organizar resultados y generar
 > documentos PDF con trazabilidad operacional.
@@ -25,6 +73,11 @@ elevado:
 .\deploy\windows\Install-CbrsNative.ps1
 ```
 
+El acceso de doble clic `INSTALL-CBRS.bat` llama a ese mismo instalador nativo;
+`INSTALL-CBRS.bat --plan` muestra el plan sin instalar dependencias ni iniciar
+tráfico. `Install-CbrsE2E.ps1` se conserva únicamente como alias compatible y
+también delega en la ruta nativa.
+
 El instalador nativo:
 
 1. instala/reutiliza Python, Chrome y restic nativos;
@@ -49,21 +102,25 @@ real y las limitaciones del keeper usado para validar la recuperación sin tocar
 la cola. **Disponible** expresa elegibilidad; solo **Sesión saludable** confirma
 que existe un Chrome vivo y autenticado bajo el lease vigente.
 
-### DataImpulse: egreso recomendado
+### DataImpulse Mobile: egreso recomendado
 
-El runtime de producción usa **DataImpulse Residential Proxy** como proveedor
-de egreso: tres rutas sticky de Chile, un puerto distinto por cuenta y una
+El runtime de producción usa **DataImpulse Mobile Proxy** como proveedor
+de egreso primario: tres rutas sticky de Chile, un puerto distinto por cuenta y una
 duración de sesión de 120 minutos. Las URLs autenticadas se construyen solo en
 memoria desde `DATAIMPULSE_PROXY_LOGIN` y `DATAIMPULSE_PROXY_PASSWORD`; nunca se
 guardan en el pool ni se muestran en el dashboard. `DATAIMPULSE_EMAIL` y
 `DATAIMPULSE_PASSWORD`, si se configuran, son credenciales administrativas del
 panel y no credenciales proxy ni una API de rotación.
 
-La rotación normal se controla mediante los puertos sticky documentados por el
-proveedor. Ante una falla confirmada se prueba otro puerto, se exige egreso
+Las credenciales proxy deben pertenecer al plan móvil; las credenciales del plan
+residencial o del dashboard no son intercambiables. Aunque el dashboard y Chrome
+siempre muestren `gw.dataimpulse.com`, cada puerto sticky `10000–20000` representa
+una sesión peer y una salida distinta. Ante una falla confirmada se prueba otro
+puerto, se exige egreso
 chileno, acceso a CBRS/reCAPTCHA y unicidad, y solo entonces se promueve la ruta
-para esa cuenta. 2Captcha y CapSolver permanecen como solvers CAPTCHA; no son el
-proxy principal. El procedimiento completo está en
+para esa cuenta. El login entra desde la tarjeta protegida **Iniciar sesión** y
+solo acepta como prueba el formulario de búsqueda protegido. 2Captcha y CapSolver
+permanecen como solvers CAPTCHA; no son el proxy principal. El procedimiento completo está en
 [`docs/dataimpulse-cbrs-operations.md`](docs/dataimpulse-cbrs-operations.md).
 
 Esta plataforma facilita consultas documentales autorizadas en el portal CBRS y
@@ -330,6 +387,16 @@ funcionales del portal mientras las tareas del runtime continúen activas. Para
 recuperación visual manual, primero se pausa endurance y se detiene el worker.
 El worker y la recuperación nunca comparten un perfil simultáneamente.
 
+El dashboard muestra dentro de cada tarjeta una vista local, de solo lectura y
+baja frecuencia del viewport headless correspondiente. El worker publica un JPEG
+atómico cada cinco segundos; el dashboard solo entrega cuadros frescos mientras
+el owner coincide con el lease vigente. Al seleccionar la vista se abre un visor
+con zoom, `Ctrl` + rueda y pantalla completa. Los cuadros no contienen secretos de
+configuración, nunca salen de loopback, usan `Cache-Control: no-store` y se
+eliminan cuando se descarta el contexto. Se puede ajustar la frecuencia con
+`CBRS_BROWSER_PREVIEW_INTERVAL_SECONDS` y la caducidad con
+`CBRS_BROWSER_PREVIEW_MAX_AGE_SECONDS`.
+
 ## Inicio rápido
 
 ### 1. Instalar dependencias
@@ -350,13 +417,15 @@ Parte desde `.env.example`; el ejemplo solo contiene placeholders. Para
 producción, los secretos viven en `C:\ProgramData\CBRS\cbrs.env`:
 
 ```dotenv
-CBRS_EGRESS_MODE=residential_sticky
+CBRS_EGRESS_MODE=mobile_sticky
 CBRS_EXPECTED_EGRESS_COUNTRY=CL
 CBRS_HEADLESS=1
 CBRS_WINDOW_MODE=normal
 DATAIMPULSE_PROXY_HOST=gw.dataimpulse.com
+DATAIMPULSE_PROXY_SCHEME=http
 DATAIMPULSE_COUNTRY=cl
 DATAIMPULSE_STICKY_TTL_MINUTES=120
+# DATAIMPULSE_ASN=REPLACE_WITH_VALIDATED_CHILE_MOBILE_ASN
 CBRS_REQUEST_DELAY_SECONDS=5.0
 CBRS_PROFILE_DIR=.cbrs/chrome-profile
 CBRS_OUTPUT_DIR=outputs
@@ -392,8 +461,10 @@ python -m cbrs preflight --approve-egress-baseline
 python -m cbrs pool proxy-health --approve-egress-baseline
 ```
 
-El worker intenta primero el refresh persistente y después el login automático
-browser-origin. `init` y `pool init` permanecen como herramientas de diagnóstico
+El worker intenta primero el refresh persistente. Si debe autenticarse, abre la
+ruta protegida, pulsa su enlace real **Iniciar sesión** y completa el formulario
+en ese mismo Chrome. El fetch browser-origin queda como fallback acotado solo si
+la interfaz de login no puede renderizarse. `init` y `pool init` permanecen como herramientas de diagnóstico
 manual; no forman parte de la preparación diaria.
 
 ## Cola de producción
@@ -578,8 +649,8 @@ contener los proxies reales:
       "label": "Ejecutivo 1",
       "username_env": "CBRS_ACCOUNT_1_USERNAME",
       "password_env": "CBRS_ACCOUNT_1_PASSWORD",
-      "proxy_provider": "dataimpulse_residential_sticky",
-      "proxy_brand": "DataImpulse",
+      "proxy_provider": "dataimpulse_mobile_sticky",
+      "proxy_brand": "DataImpulse Mobile",
       "dataimpulse_port": 10000,
       "profile_dir": "G:\\CBRS\\accounts\\ejecutivo_1\\chrome-profile",
       "daily_quota": 20
@@ -600,6 +671,13 @@ Cada cuenta DataImpulse declara un puerto sticky distinto (`10000`, `10001`,
 memoria y rechaza configuraciones ambiguas que también incluyan
 `proxy_url_env`. Los proveedores genéricos heredados siguen aceptando una URL
 por cuenta para compatibilidad.
+
+`DATAIMPULSE_ASN` es opcional y agrega `asn.<n>` al usuario proxy. DataImpulse
+advierte que consume el doble de tráfico; por eso no se inventa ni activa un ASN
+sin una selección operativa validada. HTTP es el protocolo productivo probado.
+`74.81.81.81`, HTTPS/823 y SOCKS5/824 quedan como diagnósticos de conectividad,
+no como rotaciones automáticas: cambiar de peer se hace cambiando el puerto
+sticky, no el hostname visible.
 
 En modo `2captcha_manual`, un rechazo del token del navegador deja la cuenta como
 `captcha pendiente` sin contactar a 2Captcha. El operador puede pulsar
@@ -687,5 +765,13 @@ reinicio durante descarga, 24 horas y luego siete días de endurance.
 - [Prerrequisitos Windows nativo](docs/native-windows-prerequisites.md)
 - [Endurance E2E nativo](docs/native-windows-endurance.md)
 - [Recuperación E2E de sesiones persistentes](docs/persistent-account-session-recovery.md)
+- [Búsqueda final y procesamiento documental sin repetir consultas](docs/search-document-checkpoints.md)
 - [Operación CBRS con DataImpulse](docs/dataimpulse-cbrs-operations.md)
 - [Preparación Ubuntu legacy](docs/e2e-production-readiness.md)
+
+## Portal quota exhaustion
+
+The overview distinguishes local successful-search counts from a portal-reported
+quota hold. Holds survive restarts, retain logged-in Chrome sessions, and show an
+estimated next check rather than promising a reset time. See
+[portal quota holds](docs/portal-quota-holds.md) for bounded refresh/retry rules.

@@ -6,6 +6,13 @@ import sqlite3
 from urllib.parse import quote
 
 DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER = "dataimpulse_residential_sticky"
+DATAIMPULSE_MOBILE_STICKY_PROVIDER = "dataimpulse_mobile_sticky"
+DATAIMPULSE_STICKY_PROVIDERS = frozenset(
+    {
+        DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER,
+        DATAIMPULSE_MOBILE_STICKY_PROVIDER,
+    }
+)
 DEFAULT_DATAIMPULSE_HOST = "gw.dataimpulse.com"
 DEFAULT_DATAIMPULSE_COUNTRY = "cl"
 DEFAULT_DATAIMPULSE_STICKY_TTL_MINUTES = 120
@@ -58,6 +65,8 @@ def build_dataimpulse_proxy_url(
     country: str,
     ttl_minutes: int,
     port: int,
+    asn: int | None = None,
+    scheme: str = "http",
     port_min: int = DEFAULT_DATAIMPULSE_PORT_MIN,
     port_max: int = DEFAULT_DATAIMPULSE_PORT_MAX,
 ) -> str:
@@ -67,6 +76,7 @@ def build_dataimpulse_proxy_url(
     proxy_host = str(host or "").strip().lower()
     proxy_country = str(country or "").strip().lower()
     ttl = int(ttl_minutes)
+    proxy_scheme = str(scheme or "").strip().lower()
     if not username or not secret:
         raise ValueError("DataImpulse proxy login and password are required")
     if not proxy_host or any(char.isspace() for char in proxy_host):
@@ -75,10 +85,18 @@ def build_dataimpulse_proxy_url(
         raise ValueError("DataImpulse country must be a two-letter code")
     if not 1 <= ttl <= 120:
         raise ValueError("DataImpulse sticky TTL must be between 1 and 120 minutes")
+    if proxy_scheme not in {"http", "https", "socks5"}:
+        raise ValueError("DataImpulse proxy scheme must be http, https, or socks5")
+    proxy_asn = int(asn) if asn is not None else None
+    if proxy_asn is not None and proxy_asn <= 0:
+        raise ValueError("DataImpulse ASN must be a positive integer")
     sticky_port = validate_dataimpulse_port(port, minimum=port_min, maximum=port_max)
-    routed_login = f"{username}__cr.{proxy_country};sessttl.{ttl}"
+    asn_parameter = f"asn.{proxy_asn};" if proxy_asn is not None else ""
+    routed_login = (
+        f"{username}__cr.{proxy_country};{asn_parameter}sessttl.{ttl}"
+    )
     return (
-        f"http://{quote(routed_login, safe='')}:{quote(secret, safe='')}@"
+        f"{proxy_scheme}://{quote(routed_login, safe='')}:{quote(secret, safe='')}@"
         f"{proxy_host}:{sticky_port}"
     )
 

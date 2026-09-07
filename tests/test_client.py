@@ -42,6 +42,26 @@ class FakeBrowser:
         return BrowserFetchResponse(200, {"content-type": "application/json"}, "[]")
 
 
+def test_observed_form_rejection_does_not_repeat_browser_token_request(tmp_path):
+    browser = FakeBrowser()
+    client = BrowserOriginClient(browser, load_settings({}, root=tmp_path))
+    client._pace = lambda _: None
+    client.ensure_auth = lambda **_: 'jwt'
+
+    def accepted(path, *, headers, body):
+        browser.requests.append((headers, body))
+        return BrowserFetchResponse(200, {'content-type': 'application/json'}, '[]')
+
+    browser.fetch_json = accepted
+    observed = BrowserFetchResponse(400, {'content-type': 'application/json'},
+                                   '{"msg":"captcha verification failed"}')
+    assert client.post_json('/api/v1/comercio/indice/texto', {},
+                            captcha_action='indice_com_texto', context='form search',
+                            _initial_response=observed) == []
+    assert browser.tokens == ['2captcha']
+    assert len(browser.requests) == 1
+
+
 def test_client_retries_rejected_captcha_once_with_external_solver(tmp_path) -> None:
     browser = FakeBrowser()
     settings = load_settings(

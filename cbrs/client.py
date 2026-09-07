@@ -19,6 +19,15 @@ from .safety import (
 logger = logging.getLogger(__name__)
 
 
+def _capture_error(browser, error):
+    try:
+        callback = getattr(browser, "error_capture_callback", None)
+        if callable(callback):
+            callback(error)
+    except Exception:
+        pass
+
+
 class BrowserOriginClient:
     def __init__(self, browser: BrowserSession, settings: Settings = SETTINGS) -> None:
         self.browser = browser
@@ -71,6 +80,7 @@ class BrowserOriginClient:
         include_recaptcha_in_body: bool = False,
         auth: bool = True,
         context: str,
+        _initial_response: Any = None,
     ) -> Any:
         payload = dict(body)
         headers = {
@@ -82,7 +92,7 @@ class BrowserOriginClient:
             headers["Authorization"] = f"Bearer {self.ensure_auth()}"
 
         solution: RecaptchaSolution | None = None
-        if captcha_action:
+        if captcha_action and _initial_response is None:
             solution = self._generate_recaptcha_solution(captcha_action)
             self._set_captcha_token(
                 headers,
@@ -92,7 +102,8 @@ class BrowserOriginClient:
             )
 
         try:
-            response = self._post_json_response(path, headers, payload, context=context)
+            response = (_initial_response if _initial_response is not None else
+                        self._post_json_response(path, headers, payload, context=context))
         except Exception:
             self._record_external_outcome(
                 solution,
@@ -108,6 +119,7 @@ class BrowserOriginClient:
                 context=context,
             )
         except SafetyStopException as exc:
+            _capture_error(self.browser, exc)
             self._record_external_outcome(
                 solution,
                 status=(
@@ -146,6 +158,7 @@ class BrowserOriginClient:
                     context=context,
                 )
             except SafetyStopException as external_exc:
+                _capture_error(self.browser, external_exc)
                 secondary_generator = getattr(
                     self.browser,
                     "generate_secondary_external_recaptcha_solution",
@@ -211,6 +224,7 @@ class BrowserOriginClient:
                         context=context,
                     )
                 except SafetyStopException as secondary_exc:
+                    _capture_error(self.browser, secondary_exc)
                     self._record_external_outcome(
                         solution,
                         status=(
@@ -288,7 +302,11 @@ class BrowserOriginClient:
         context: str,
     ):
         self._pace(context)
-        return self.browser.fetch_json(path, headers=headers, body=payload)
+        try:
+            return self.browser.fetch_json(path, headers=headers, body=payload)
+        except Exception as exc:
+            _capture_error(self.browser, exc)
+            raise
 
     @staticmethod
     def _set_captcha_token(

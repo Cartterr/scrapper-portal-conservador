@@ -1,5 +1,11 @@
 # Recuperación E2E de sesiones persistentes por cuenta
 
+> **Regla vigente de preservación (06-09-2026):** las instancias de producción
+> permanecen abiertas hasta reboot/apagado o detención explícita de TODO el
+> servicio. No cerrar/reiniciar workers o Chrome para diagnosticar, recuperar ni
+> cargar cambios. Un error temporal o heartbeat vencido no autoriza reinicio.
+> [AGENTS.md](../AGENTS.md) prevalece sobre los procedimientos históricos debajo.
+
 Este documento describe el procedimiento comprobado el **31 de agosto de 2026**
 para recuperar las tres sesiones CBRS sin mezclar cuentas, perfiles ni rutas de
 salida. Es la referencia operativa para el cliente y para cualquier LLM que deba
@@ -84,7 +90,7 @@ La configuración protegida conserva esta relación uno a uno:
 Los valores reales viven únicamente en `C:\ProgramData\CBRS\cbrs.env`. El
 repositorio guarda referencias, nunca usuarios completos, contraseñas, cookies,
 tokens ni URLs proxy con credenciales. El runtime construye tres rutas
-DataImpulse Residential Proxy en memoria desde una credencial protegida común,
+DataImpulse Mobile Proxy en memoria desde la credencial protegida del plan móvil,
 el parámetro `cr.cl;sessttl.120` y un puerto sticky único por cuenta.
 
 No se debe “probar rápido” una identidad con otro perfil, copiar cookies entre
@@ -96,25 +102,24 @@ proxy-health/preflight y se aprueba el nuevo baseline antes de autenticar.
 
 ### 1. Congelar tráfico sin perder estado
 
-Pausar endurance y detener el worker antes de tocar perfiles. No cancelar la
-cola, no borrar SQLite y no eliminar perfiles.
+Pausar únicamente endurance; conservar worker, Chrome y perfiles. No cancelar la
+cola, no borrar SQLite y no eliminar perfiles. Los pasos de mantenimiento que
+necesiten cerrar Chrome esperan una detención explícita de TODO el servicio.
 
 ```powershell
 .\.venv\Scripts\python.exe -m cbrs jobs endurance pause
-.\deploy\windows\Stop-CbrsNative.ps1
 .\deploy\windows\Get-CbrsNativeStatus.ps1
 ```
 
-Confirmar además que no quede otro worker, lease vigente o Chrome usando uno de
-los tres directorios de producción. Un perfil bloqueado por otro proceso no se
-debe forzar ni copiar.
+Confirmar un único owner y conservar sus contextos. No abrir un segundo proceso
+sobre perfiles que estén en uso; no forzar ni copiar un perfil bloqueado.
 
 ### 2. Validar configuración sin revelar secretos
 
 Revisar `G:\CBRS\account-pool.json` y confirmar para cada cuenta:
 
 - `username_env`, `password_env` y `dataimpulse_port` correctos;
-- proveedor `dataimpulse_residential_sticky` y tres puertos distintos;
+- proveedor `dataimpulse_mobile_sticky` y tres puertos distintos;
 - un directorio de perfil distinto;
 - proveedor y marca esperados;
 - país `CL`, proxy-health `passed` y baseline `matched`.
@@ -136,6 +141,8 @@ El orden interno de una única invocación de
 5. si aún no hay sesión, intentar una sola vez el formulario real del portal;
 6. si no se confirma autenticación, detener esa cuenta con `auth_required`.
 
+Si hace falta login, volver primero al índice protegido y pulsar su enlace
+visible **Iniciar sesión**. No navegar directamente al URL codificado de login.
 La regla es **una invocación acotada**, nunca un bucle de login. Un rechazo, un
 timeout o `temporary_unavailable` no autoriza a martillar el portal.
 
@@ -261,6 +268,29 @@ reemplazo del worker. No sobrevive un reinicio y no entrega sus procesos
 Playwright a otro proceso. El worker normal debe abrir sus propios contextos
 persistentes y conservarlos durante su vida.
 
+## Recuperación sin esperas de planificación innecesarias
+
+El barrido DOM general conserva su intervalo de 30 segundos. Una cuenta con
+login pendiente conocido se revisa en el siguiente ciclo disponible del worker
+(normalmente cada 5 segundos en reposo), sin esperar otro barrido completo.
+Antes de enviar un login se comprueba nuevamente su DOM: si el usuario ya
+completó el acceso, se registra la sesión sin repetir el envío.
+
+Esto no reduce el piso de reautenticación, los cooldowns por cuenta/ruta/globales,
+las pausas CAPTCHA ni los presupuestos de rotación. Tampoco garantiza un máximo
+de 5 segundos: una operación de navegador o red en curso puede demorar el ciclo.
+El reloj se actualiza por cuenta para no reutilizar la hora anterior a una
+operación lenta de otra cuenta.
+
+Un fallo de login conocido pasa directamente a la navegación de autenticación,
+sin una recarga preliminar redundante. Los estados DOM desconocidos sin fallo
+de login conservan su recuperación acotada; una sesión previamente autenticada
+no se recarga, cierra ni reemplaza por quedar temporalmente desconocida.
+
+Los cambios de código requieren un reinicio del servicio explícitamente
+autorizado para activarse. No se reinicia el worker para desplegarlos mientras
+hay sesiones abiertas sin esa autorización.
+
 ## Criterio de aceptación para el cliente
 
 La recuperación E2E se considera aprobada únicamente cuando:
@@ -291,3 +321,27 @@ condiciones:
 - se repite login para “ver si ahora funciona”;
 - se interpreta un token de solver como aceptación de CBRS;
 - se reactiva la cola antes de completar el gate de las tres sesiones.
+# Scoped visible-login rejection recovery
+
+`CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS` is blank by default. An explicitly
+authorized account ID enables a narrow exception to the historical-auth latch:
+a visible login route, email/password inputs, login button and the exact
+"Se ha detectado un problema, refresque la página e intente nuevamente" alert
+must all be present, without a protected form or conflicting auth evidence.
+Passive observations then report `login_rejected_visible`, not merely unknown.
+
+For the currently requested middle-account scope use `ejecutivo_2`, never all
+accounts. Recovery retains normal retry floors, cooldowns and hourly budgets.
+Candidates use `secrets.choice` over unused, non-rejected sticky ports across
+the configured range; port numbers do not imply adjacent or randomly distributed
+exit IPs. Existing egress-hash checks reject the previous/rejected/shared exits.
+The successful candidate is adopted alive. Only then may the previously rejected
+scoped context close, after rechecking its visible failure signature.
+
+These changes require source activation. The old living coupled worker cannot
+load new core methods through its allowlisted hot releases. Do not restart it
+and destroy healthy siblings without explicit migration authorization.
+External-owner mode routes scoped recovery through `recover_route` and rechecks
+the actual browser DOM before invoking bounded candidate adoption. Other live
+bindings remain pinned. Verify live command receipts and authentication before
+reporting a source change as deployed recovery.

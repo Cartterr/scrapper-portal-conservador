@@ -248,7 +248,11 @@ def _proxy_route_allowed(settings: config.Settings) -> bool:
         return False
     if not settings.proxy_url:
         return True
-    return settings.egress_mode in {"dedicated_static_isp", "residential_sticky"}
+    return settings.egress_mode in {
+        "dedicated_static_isp",
+        "residential_sticky",
+        "mobile_sticky",
+    }
 
 
 def _proxy_route_detail(settings: config.Settings) -> str:
@@ -256,10 +260,14 @@ def _proxy_route_detail(settings: config.Settings) -> str:
         return "CBRS_CLOAK_PROXY_URL configured"
     if not settings.proxy_url:
         return "not configured"
-    if settings.egress_mode not in {"dedicated_static_isp", "residential_sticky"}:
+    if settings.egress_mode not in {
+        "dedicated_static_isp",
+        "residential_sticky",
+        "mobile_sticky",
+    }:
         return (
             "CBRS_PROXY_URL requires CBRS_EGRESS_MODE="
-            "dedicated_static_isp or residential_sticky"
+            "dedicated_static_isp, residential_sticky, or mobile_sticky"
         )
     return f"configured for {settings.egress_mode}"
 
@@ -835,7 +843,10 @@ def cmd_jobs(args: argparse.Namespace) -> int:
             )
             return 2
         account = _pool_account_by_id(pool_config, args.account)
-        if account.proxy_provider != "dataimpulse_residential_sticky":
+        if account.proxy_provider not in {
+            "dataimpulse_residential_sticky",
+            "dataimpulse_mobile_sticky",
+        }:
             print("The selected account is not a DataImpulse sticky route.", file=sys.stderr)
             return 2
         if not store.active_lease():

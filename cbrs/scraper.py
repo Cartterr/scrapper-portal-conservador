@@ -67,6 +67,12 @@ class CBRSScraper:
         return self._search(body)
 
     def search_by_fna(self, foja: int, numero: int, ano: int) -> list[dict[str, Any]]:
+        from .runtime_updates import runtime_module
+        return runtime_module("form_search").search_fna_form(self.browser, foja, numero, ano,
+                               client=self.client, pace=self.client._pace)
+
+    def search_by_fna_api(self, foja: int, numero: int, ano: int) -> list[dict[str, Any]]:
+        """Explicit legacy diagnostic path, never an automatic form fallback."""
         logger.info("Searching commerce index by FNA")
         body = {
             "foja": foja,

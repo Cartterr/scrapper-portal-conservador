@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-title Instalador E2E - Plataforma CBRS
+title Instalador nativo - Plataforma CBRS
 cd /d "%~dp0"
 
 if /I "%~1"=="--plan" goto :plan
@@ -21,12 +21,10 @@ if errorlevel 1 (
 )
 
 :install
-echo El instalador configurara el dashboard local, cuentas protegidas y los servicios Ubuntu.
-set "CBRS_PS_ARGS="
-if /I "%~1"=="--resume" set "CBRS_PS_ARGS=-Resume"
+echo El instalador configurara el runtime CBRS completamente nativo en Windows.
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ^
-  "%~dp0deploy\windows\Install-CbrsE2E.ps1" ^
-  -RepoRoot "%~dp0." %CBRS_PS_ARGS%
+  "%~dp0deploy\windows\Install-CbrsNative.ps1" ^
+  -RepoRoot "%~dp0."
 set "CBRS_EXIT=%ERRORLEVEL%"
 echo.
 if "%CBRS_EXIT%"=="0" (
@@ -42,7 +40,7 @@ exit /b %CBRS_EXIT%
 :plan
 echo Mostrando el plan de instalacion sin realizar cambios.
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ^
-  "%~dp0deploy\windows\Install-CbrsE2E.ps1" ^
+  "%~dp0deploy\windows\Install-CbrsNative.ps1" ^
   -RepoRoot "%~dp0." -PlanOnly
 set "CBRS_EXIT=%ERRORLEVEL%"
 pause

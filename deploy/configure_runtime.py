@@ -30,7 +30,11 @@ PROXY_PROVIDERS = frozenset(
         "2captcha_dedicated_isp",
         "2captcha_residential_sticky",
         "dataimpulse_residential_sticky",
+        "dataimpulse_mobile_sticky",
     }
+)
+DATAIMPULSE_PROVIDERS = frozenset(
+    {"dataimpulse_residential_sticky", "dataimpulse_mobile_sticky"}
 )
 MAX_INPUT_BYTES = 2 * 1024 * 1024
 
@@ -49,7 +53,8 @@ def _proxy_provider(value: object) -> str:
     if provider not in PROXY_PROVIDERS:
         raise ValueError(
             "proxy_provider must be generic_static, 2captcha_dedicated_isp, "
-            "2captcha_residential_sticky, or dataimpulse_residential_sticky"
+            "2captcha_residential_sticky, dataimpulse_residential_sticky, "
+            "or dataimpulse_mobile_sticky"
         )
     return provider
 
@@ -88,10 +93,10 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         proxy_url = _single_line(
             raw.get("proxy_url"),
             f"{account_id} proxy URL",
-            allow_empty=proxy_provider == "dataimpulse_residential_sticky",
+            allow_empty=proxy_provider in DATAIMPULSE_PROVIDERS,
         )
         dataimpulse_port = None
-        if proxy_provider == "dataimpulse_residential_sticky":
+        if proxy_provider in DATAIMPULSE_PROVIDERS:
             try:
                 dataimpulse_port = int(raw.get("dataimpulse_port"))
             except (TypeError, ValueError) as exc:
@@ -124,7 +129,7 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         password_env = f"CBRS_ACCOUNT_{index}_PASSWORD"
         proxy_url_env = (
             None
-            if proxy_provider == "dataimpulse_residential_sticky"
+            if proxy_provider in DATAIMPULSE_PROVIDERS
             else f"CBRS_ACCOUNT_{index}_PROXY_URL"
         )
         if proxy_url_env:
@@ -169,7 +174,7 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     dataimpulse_ports = [
         int(account["dataimpulse_port"])
         for account in accounts
-        if account["proxy_provider"] == "dataimpulse_residential_sticky"
+        if account["proxy_provider"] in DATAIMPULSE_PROVIDERS
     ]
     if len(dataimpulse_ports) != len(set(dataimpulse_ports)):
         raise ValueError("DataImpulse sticky ports must be unique")
@@ -217,7 +222,7 @@ def build_environment(
             del environment[key]
 
     dataimpulse_only = all(
-        account["proxy_provider"] == "dataimpulse_residential_sticky"
+        account["proxy_provider"] in DATAIMPULSE_PROVIDERS
         for account in validated["accounts"]
     )
     environment.update(
@@ -227,7 +232,17 @@ def build_environment(
             "CBRS_HEADLESS": "1",
             "CBRS_WINDOW_MODE": "normal",
             "CBRS_EGRESS_MODE": (
-                "residential_sticky" if dataimpulse_only else "dedicated_static_isp"
+                (
+                    "mobile_sticky"
+                    if dataimpulse_only
+                    and all(
+                        account["proxy_provider"] == "dataimpulse_mobile_sticky"
+                        for account in validated["accounts"]
+                    )
+                    else "residential_sticky"
+                )
+                if dataimpulse_only
+                else "dedicated_static_isp"
             ),
             "CBRS_EXPECTED_EGRESS_COUNTRY": "CL",
             "CBRS_PROFILE_DIR": "/var/lib/cbrs/chrome-profile",

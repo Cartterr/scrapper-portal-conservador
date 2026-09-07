@@ -76,4 +76,26 @@ Responsive rules keep the runtime status grouped when the header wraps below 900
 1. Before: the daily `2Captcha` counter showed only a number; there was no evidence for a specific authorization.
 2. After: every paid attempt is visible as a durable sanitized record, alongside its current CBRS account state. No actionable P0/P1/P2 visual differences remain.
 
+## Headless browser live previews
+
+- Source visual truth: `C:\Users\josec\AppData\Local\Temp\codex-clipboard-0ee952c6-48da-4fc9-99b0-11c614ee9486.png`
+- Implementation URL: `http://127.0.0.1:8765/`
+- State: three persistent native-Chrome contexts active in headless mode; three preview feeds available.
+
+### Findings and implementation
+
+- [P1] The account cards reported browser state but gave the operator no visual evidence of what a headless context was displaying.
+  Location: each of the three account cards, above `Ruta proxy`.
+  Fix: added a 16:9 low-frame-rate preview surface that preserves the existing card layout and semantic status styling.
+- Each surface is one accessible button with a current-state badge and an `Ampliar` affordance. Opening it provides zoom out, reset, zoom in, fullscreen, close, Ctrl+wheel zoom, and Escape handling.
+- Preview capture remains observational: screenshot failure cannot fail authentication or a job. Frames are JPEG-compressed, atomically replaced, exposed only on loopback to the active browser lease, marked `no-store`, and removed when the context is discarded.
+
+### Post-fix verification
+
+- Live UI: all three cards rendered `En vivo · 0,2 FPS`; all three `Ampliar vista de ...` controls were present.
+- Evidence fidelity: successive filesystem timestamps changed during authentication, and the enlarged viewer showed the real protected CBRS form from the headless browser rather than a placeholder.
+- Interaction: modal opening, zoom-in, fullscreen entry, and Escape exit were exercised in the running dashboard.
+- Layout: previews fit the current three-column card grid without replacing existing proxy, browser, or authentication evidence.
+- No actionable P0/P1/P2 visual or interaction defects remain.
+
 final result: passed

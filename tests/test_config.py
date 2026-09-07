@@ -176,15 +176,23 @@ def test_dataimpulse_runtime_settings_are_loaded_and_secret_repr_is_safe(
             "DATAIMPULSE_PROXY_LOGIN": "private-login",
             "DATAIMPULSE_PROXY_PASSWORD": "private-password",
             "DATAIMPULSE_STICKY_TTL_MINUTES": "120",
+            "DATAIMPULSE_ASN": "27651",
+            "DATAIMPULSE_PROXY_SCHEME": "http",
             "CBRS_BROWSER_HEALTHCHECK_SECONDS": "30",
             "CBRS_BROWSER_REAUTH_BACKOFF_SECONDS": "60",
+            "CBRS_BROWSER_PREVIEW_INTERVAL_SECONDS": "5",
+            "CBRS_BROWSER_PREVIEW_MAX_AGE_SECONDS": "60",
         },
         root=tmp_path,
     )
 
     assert settings.egress_mode == "residential_sticky"
     assert settings.dataimpulse_sticky_ttl_minutes == 120
+    assert settings.dataimpulse_asn == 27651
+    assert settings.dataimpulse_proxy_scheme == "http"
     assert settings.browser_healthcheck_seconds == 30
+    assert settings.browser_preview_interval_seconds == 5
+    assert settings.browser_preview_max_age_seconds == 60
     assert "private-login" not in repr(settings)
     assert "private-password" not in repr(settings)
 

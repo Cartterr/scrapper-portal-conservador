@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 from .config import SETTINGS, Settings
 from .dataimpulse import (
-    DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER,
+    DATAIMPULSE_STICKY_PROVIDERS,
     active_dataimpulse_port,
     build_dataimpulse_proxy_url,
     validate_dataimpulse_port,
@@ -887,9 +887,7 @@ def load_account_pool_config(
         raise ValueError("enabled pool accounts must use distinct proxy_url_env references")
     dataimpulse_ports: list[int] = []
     for account in config.accounts:
-        is_dataimpulse = (
-            account.proxy_provider == DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER
-        )
+        is_dataimpulse = account.proxy_provider in DATAIMPULSE_STICKY_PROVIDERS
         if is_dataimpulse and account.proxy_url_env:
             raise ValueError(
                 "DataImpulse accounts must use dataimpulse_port, not proxy_url_env"
@@ -933,7 +931,7 @@ def account_settings(
     if profile_dir is None:
         profile_dir = settings.profile_dir.parent / "accounts" / account.account_id / "chrome-profile"
     proxy_url = settings.proxy_url
-    if account.proxy_provider == DATAIMPULSE_RESIDENTIAL_STICKY_PROVIDER:
+    if account.proxy_provider in DATAIMPULSE_STICKY_PROVIDERS:
         port = dataimpulse_port or account.dataimpulse_port
         if port is None:
             raise ValueError(
@@ -954,6 +952,8 @@ def account_settings(
             port=port,
             port_min=settings.dataimpulse_port_min,
             port_max=settings.dataimpulse_port_max,
+            asn=settings.dataimpulse_asn,
+            scheme=settings.dataimpulse_proxy_scheme,
         )
     elif account.proxy_url_env:
         proxy_url = os.environ.get(account.proxy_url_env)

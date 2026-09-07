@@ -49,6 +49,8 @@ DEFAULT_CAPSOLVER_POLL_SECONDS = 3.0
 DEFAULT_PROXY_RECHECK_SECONDS = 300.0
 DEFAULT_BROWSER_HEALTHCHECK_SECONDS = 30.0
 DEFAULT_BROWSER_REAUTH_BACKOFF_SECONDS = 60.0
+DEFAULT_BROWSER_PREVIEW_INTERVAL_SECONDS = 5.0
+DEFAULT_BROWSER_PREVIEW_MAX_AGE_SECONDS = 60.0
 DEFAULT_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS = 300.0
 DEFAULT_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR = 3
 DEFAULT_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD = 2
@@ -58,6 +60,7 @@ ALLOWED_EGRESS_MODES = frozenset(
         "client_office",
         "dedicated_static_isp",
         "residential_sticky",
+        "mobile_sticky",
     }
 )
 PERSONAL_DIRECT_EGRESS_MODE = "personal_direct"
@@ -88,11 +91,15 @@ class Settings:
     dataimpulse_sticky_ttl_minutes: int
     dataimpulse_port_min: int
     dataimpulse_port_max: int
+    dataimpulse_asn: int | None
+    dataimpulse_proxy_scheme: str
     dataimpulse_rotation_cooldown_seconds: float
     dataimpulse_max_rotations_per_hour: int
     dataimpulse_temp_unavailable_threshold: int
     browser_healthcheck_seconds: float
     browser_reauth_backoff_seconds: float
+    browser_preview_interval_seconds: float
+    browser_preview_max_age_seconds: float
     captcha_solver_mode: str
     two_captcha_api_key: str | None = field(repr=False)
     two_captcha_min_score: float
@@ -310,6 +317,17 @@ def load_settings(
         or dataimpulse_port_min > dataimpulse_port_max
     ):
         raise ValueError("DataImpulse sticky port range is invalid")
+    raw_dataimpulse_asn = _empty_to_none(env.get("DATAIMPULSE_ASN"))
+    dataimpulse_asn = int(raw_dataimpulse_asn) if raw_dataimpulse_asn else None
+    if dataimpulse_asn is not None and dataimpulse_asn <= 0:
+        raise ValueError("DATAIMPULSE_ASN must be a positive integer")
+    dataimpulse_proxy_scheme = env.get(
+        "DATAIMPULSE_PROXY_SCHEME", "http"
+    ).strip().lower()
+    if dataimpulse_proxy_scheme not in {"http", "https", "socks5"}:
+        raise ValueError(
+            "DATAIMPULSE_PROXY_SCHEME must be http, https, or socks5"
+        )
     dataimpulse_rotation_cooldown = _float(
         env.get("CBRS_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS"),
         default=DEFAULT_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS,
@@ -340,6 +358,20 @@ def load_settings(
     )
     if browser_reauth_backoff_seconds < 30:
         raise ValueError("CBRS_BROWSER_REAUTH_BACKOFF_SECONDS must be at least 30")
+    browser_preview_interval_seconds = _float(
+        env.get("CBRS_BROWSER_PREVIEW_INTERVAL_SECONDS"),
+        default=DEFAULT_BROWSER_PREVIEW_INTERVAL_SECONDS,
+    )
+    if browser_preview_interval_seconds < 2:
+        raise ValueError("CBRS_BROWSER_PREVIEW_INTERVAL_SECONDS must be at least 2")
+    browser_preview_max_age_seconds = _float(
+        env.get("CBRS_BROWSER_PREVIEW_MAX_AGE_SECONDS"),
+        default=DEFAULT_BROWSER_PREVIEW_MAX_AGE_SECONDS,
+    )
+    if browser_preview_max_age_seconds < browser_preview_interval_seconds * 2:
+        raise ValueError(
+            "CBRS_BROWSER_PREVIEW_MAX_AGE_SECONDS must be at least twice the preview interval"
+        )
 
     return Settings(
         base_url=env.get("CBRS_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
@@ -389,11 +421,15 @@ def load_settings(
         dataimpulse_sticky_ttl_minutes=dataimpulse_ttl,
         dataimpulse_port_min=dataimpulse_port_min,
         dataimpulse_port_max=dataimpulse_port_max,
+        dataimpulse_asn=dataimpulse_asn,
+        dataimpulse_proxy_scheme=dataimpulse_proxy_scheme,
         dataimpulse_rotation_cooldown_seconds=dataimpulse_rotation_cooldown,
         dataimpulse_max_rotations_per_hour=dataimpulse_max_rotations,
         dataimpulse_temp_unavailable_threshold=dataimpulse_temporary_threshold,
         browser_healthcheck_seconds=browser_healthcheck_seconds,
         browser_reauth_backoff_seconds=browser_reauth_backoff_seconds,
+        browser_preview_interval_seconds=browser_preview_interval_seconds,
+        browser_preview_max_age_seconds=browser_preview_max_age_seconds,
         captcha_solver_mode=captcha_solver_mode,
         two_captcha_api_key=two_captcha_api_key,
         two_captcha_min_score=two_captcha_min_score,

@@ -243,7 +243,7 @@ def test_preflight_fails_when_browser_proxy_has_wrong_mode(tmp_path: Path) -> No
     assert result.ok is False
     assert (
         "browser proxy route: CBRS_PROXY_URL requires CBRS_EGRESS_MODE="
-        "dedicated_static_isp or residential_sticky"
+        "dedicated_static_isp, residential_sticky, or mobile_sticky"
         in result.report["errors"]
     )
 

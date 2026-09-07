@@ -212,6 +212,46 @@ def test_dataimpulse_account_composes_proxy_from_common_secret_and_safe_port(
     assert "cr.cl%3Bsessttl.120" in runtime.proxy_url
 
 
+def test_dataimpulse_mobile_account_uses_same_sticky_route_contract(
+    tmp_path: Path,
+) -> None:
+    from cbrs.account_pool import account_settings, load_account_pool_config
+
+    settings = load_settings(
+        {
+            "CBRS_EGRESS_MODE": "mobile_sticky",
+            "DATAIMPULSE_PROXY_LOGIN": "mobile-login",
+            "DATAIMPULSE_PROXY_PASSWORD": "mobile-password",
+            "DATAIMPULSE_ASN": "27651",
+        },
+        root=tmp_path,
+    )
+    config_path = tmp_path / "pool.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "id": "a1",
+                        "proxy_provider": "dataimpulse_mobile_sticky",
+                        "proxy_brand": "DataImpulse Mobile",
+                        "dataimpulse_port": 10002,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    account = load_account_pool_config(settings, path=config_path).accounts[0]
+    runtime = account_settings(settings, account)
+
+    assert account.proxy_provider == "dataimpulse_mobile_sticky"
+    assert runtime.proxy_url is not None
+    assert "gw.dataimpulse.com:10002" in runtime.proxy_url
+    assert "asn.27651%3Bsessttl.120" in runtime.proxy_url
+
+
 def test_dataimpulse_account_rejects_ambiguous_full_proxy_url(tmp_path: Path) -> None:
     from cbrs.account_pool import load_account_pool_config
 
@@ -1017,7 +1057,28 @@ def test_pool_dashboard_api_and_html_are_sanitized(
     assert "Última consulta protegida" in html
     assert "LOGUEADA · BÚSQUEDA BLOQUEADA" in html
     assert "NO LOGUEADA" in html
-    assert "Chrome detenido" in html
+    assert "GoLogin (Orbita)" in html
+    assert "Chrome nativo" in html
+    assert "Navegador desconocido" in html
+    assert "Navegadores persistentes" in html
+    assert "Modo navegador" in html
+    assert "Chrome visible (headed)" in html
+    assert "INICIANDO SESIÓN" in html
+    assert "LOGIN RECHAZADO · HTTP" in html
+    assert "diagnósticos externos no incluidos" in html
+    assert "Recuperación en espera" in html
+    assert "Endurance pausado · verificación de sesiones activa" in html
+    assert 'id="browserPreviewModal"' in html
+    assert 'data-browser-preview-open="${escapeHtml(account.account_id)}"' in html
+    assert "/api/browser-preview/" in html
+    assert "refreshBrowserPreviews" in html
+    assert "browserPreviewFullscreen" in html
+    assert "browserPreviewZoomIn" in html
+    assert "browserPreviewZoomOut" in html
+    assert "browserPreviewZoomReset" in html
+    assert "function previewFrameLabel(frame)" in html
+    assert "Último cuadro" in html
+    assert "Chrome no iniciado" not in html
     assert "Cupo: ${escapeHtml(eligibilityLabel)}" in html
     assert payload["accounts"][0]["label"] == "operator.name"
     assert "job-account-icon" in html

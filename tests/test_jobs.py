@@ -32,11 +32,97 @@ from cbrs.jobs import (
     _PersistentAccountBrowsers,
     _ensure_account_gate,
     _expected_artifact_path,
+    _runtime_account_settings,
     run_job_worker,
     validate_pdf,
 )
 from cbrs.pdf import create_pdf
 from cbrs.safety import SafetyStopException, StopReason
+
+
+def test_search_receipt_is_atomic_and_empty_results_are_final(tmp_path, monkeypatch):
+    store = JobStore(tmp_path / "pool.sqlite3")
+    pool = AccountPoolStore(store.path)
+    pool.create_run(run_id="r", dry_run=False, config=_config(), dashboard_url=None)
+    job, _ = store.create_job(kind="text", input_data={"text": "Authorized"})
+    args = dict(job_id=job["job_id"], account_id="a1", quota_date=_today(),
+                quota=20, run_id="r", consume_quota=True)
+    attempt = store.begin_attempt(**args)
+    assert store.begin_attempt(**{**args, "account_id": "a2"}) is None
+    original = store._sync_account_daily_usage_db
+
+    def storage_failure(*args):
+        raise OSError("test storage failure")
+
+    monkeypatch.setattr(store, "_sync_account_daily_usage_db", storage_failure)
+    with pytest.raises(OSError):
+        store.add_results(job["job_id"], [], attempt_id=attempt)
+    assert not store.search_checkpoint(job["job_id"])["saved"]
+    monkeypatch.setattr(store, "_sync_account_daily_usage_db", original)
+    store.add_results(job["job_id"], [], attempt_id=attempt)
+    store.add_results(job["job_id"], [{"ticket": "must-not-replace-empty"}])
+    assert store.items(job["job_id"]) == []
+    assert store.search_checkpoint(job["job_id"])["result_count"] == 0
+    assert store.begin_attempt(**args) is None
+    assert store.usage_by_account(_today())["a1"] == 1
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_document_phase_reuses_original_account_at_full_search_quota(tmp_path, monkeypatch, failure):
+    settings, config = _settings(tmp_path), _config(quota=1)
+    _credentials(monkeypatch, config)
+    store = JobStore(tmp_path / "pool.sqlite3")
+    pool = AccountPoolStore(store.path)
+    pool.create_run(run_id="r", dry_run=False, config=config, dashboard_url=None)
+    job, _ = store.create_job(kind="text", input_data={"text": "Authorized"})
+    attempt = store.begin_attempt(job_id=job["job_id"], account_id="a1", quota_date=_today(),
+                                  quota=1, run_id="r", consume_quota=True)
+    store.add_results(job["job_id"], [{"ticket": "test", "foja": 1}], attempt_id=attempt)
+    with store.connect() as db:
+        db.execute("UPDATE runs SET finished_at = ?, status = 'stopped' WHERE run_id = 'r'", (utc_now(),))
+    retrieved = []
+    from cbrs.form_search import record_quota_hold
+    record_quota_hold(store.path, 'a1')  # Document resume must work even while searches are held.
+
+    class DocumentsOnly(FakeScraper):
+        def search_by_text(self, query):
+            pytest.fail("Completed search must never be repeated")
+
+        def get_image_refs(self, ticket):
+            retrieved.append(self.account_id)
+            if failure:
+                raise SafetyStopException(StopReason.TEMPORARY_UNAVAILABLE, "test")
+            return super().get_image_refs(ticket)
+
+    run_job_worker(settings=settings, config=config, store=store, pool_store=pool,
+                   once=True, scraper_factory=DocumentsOnly, preflight_runner=_gate,
+                   proxy_health_runner=_gate)
+    assert retrieved == ["a1"]
+    assert store.search_checkpoint(job["job_id"])["saved"]
+    assert store.usage_by_account(_today())["a1"] == 1
+    assert store.get_job(job["job_id"])["status"] == ("waiting_capacity" if failure else "completed")
+
+
+def test_portal_quota_hold_excludes_search_and_dashboard_credit(tmp_path, monkeypatch):
+    from cbrs.form_search import record_quota_hold
+    from cbrs.account_pool_dashboard import _with_job_pool_usage
+    settings, config = _settings(tmp_path), _config(accounts=1)
+    _credentials(monkeypatch, config)
+    store = JobStore(tmp_path / 'pool.sqlite3')
+    pool = AccountPoolStore(store.path)
+    job, _ = store.create_job(kind='text', input_data={'text':'Authorized'})
+    record_quota_hold(store.path, 'a1')
+    class NoSearch(FakeScraper):
+        def search_by_text(self, query):
+            pytest.fail('Held account must never submit a search')
+    run_job_worker(settings=settings, config=config, store=store, pool_store=pool,
+                   once=True, scraper_factory=NoSearch, preflight_runner=_gate, proxy_health_runner=_gate)
+    assert store.get_job(job['job_id'])['status'] == 'waiting_capacity'
+    payload = _with_job_pool_usage({'accounts':[{'account_id':'a1','status':'available','daily_quota':20}]}, store, config)
+    account = payload['accounts'][0]
+    assert account['used_today'] == 0
+    assert account['remaining_today'] == payload['pool']['remaining_today'] == 0
+    assert account['status'] == 'portal_quota_exhausted'
 
 
 def _settings(tmp_path: Path):
@@ -140,6 +226,7 @@ def test_persistent_browser_pool_demotes_visible_login_gate(tmp_path: Path) -> N
         headless=False,
         owner="worker-test",
         status="authenticated_refresh",
+        auth_state=CommerceAuthState.AUTHENTICATED_FORM.value,
     )
 
     pool.refresh_page_auth_states()
@@ -170,8 +257,32 @@ def test_persistent_browser_pool_promotes_only_protected_form_evidence(
     check = store.account_check("a1")
     assert check["browser_live"] == 1
     assert check["browser_authenticated"] == 1
+    assert check["browser_engine"] == "native_chrome"
     assert check["browser_status"] == "authenticated_form_visible"
     assert check["browser_auth_state"] == "authenticated_form"
+
+
+def test_browser_state_records_engine_but_authentication_requires_dom_evidence(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+
+    store.set_account_browser_state(
+        "a1",
+        live=True,
+        authenticated=True,
+        headless=True,
+        owner="worker-gologin",
+        engine="gologin",
+        status="login_gate_visible",
+        auth_state=CommerceAuthState.LOGIN_GATE.value,
+    )
+
+    check = store.account_check("a1")
+    assert check["browser_engine"] == "gologin"
+    assert check["browser_live"] == 1
+    assert check["browser_authenticated"] == 0
+    assert check["browser_auth_state"] == "login_gate"
 
 
 def test_persistent_browser_pool_retries_failed_auth_from_unknown_state(
@@ -223,7 +334,9 @@ def test_persistent_browser_pool_retries_failed_auth_from_unknown_state(
 
     pool.reconcile()
 
-    assert scraper.browser.reloads == 1
+    # Known failed authentication goes straight to login navigation, without
+    # an additional reload of the already unconfirmed page.
+    assert scraper.browser.reloads == 0
     assert scraper.forced == 1
     assert pool._entries["a1"].reauth_required is False
     check = store.account_check("a1")
@@ -360,8 +473,9 @@ def test_reconcile_quota_usage_repairs_legacy_failed_attempts(tmp_path):
         consume_quota=True,
     )
     store.finish_attempt(succeeded, status="search_completed")
+    another_job, _ = store.create_job(kind="text", input_data={"text": "Another authorized search"})
     legacy_failure = store.begin_attempt(
-        job_id=job["job_id"],
+        job_id=another_job["job_id"],
         account_id="a1",
         quota_date=_today(),
         quota=20,
@@ -507,6 +621,77 @@ def test_dataimpulse_route_rotation_is_durable_unique_and_two_phase(tmp_path):
     }
 
 
+def test_promoted_dataimpulse_route_uses_a_fresh_persistent_profile(tmp_path):
+    settings = load_settings(
+        {
+            "CBRS_PROFILE_DIR": str(tmp_path / "state" / "chrome-profile"),
+            "CBRS_EGRESS_MODE": "mobile_sticky",
+            "DATAIMPULSE_PROXY_LOGIN": "mobile-login",
+            "DATAIMPULSE_PROXY_PASSWORD": "mobile-password",
+        },
+        root=tmp_path,
+    )
+    account = PoolAccount(
+        "a1",
+        "Account 1",
+        proxy_provider="dataimpulse_mobile_sticky",
+        dataimpulse_port=10000,
+    )
+    store = JobStore(tmp_path / "pool.sqlite3")
+    store.ensure_dataimpulse_route("a1", 10000)
+    store.begin_dataimpulse_rotation(
+        "a1",
+        initial_port=10000,
+        reason="target_risk_rejection",
+        port_min=10000,
+        port_max=20000,
+        cooldown_seconds=300,
+        max_rotations_per_hour=3,
+    )
+    store.finish_dataimpulse_rotation("a1", promoted=True)
+
+    runtime = _runtime_account_settings(settings, account, store)
+
+    assert runtime.profile_dir.name == "chrome-profile-route-1-port-10001"
+    assert runtime.profile_dir.parent.name == "a1"
+    assert runtime.proxy_url is not None and ":10001" in runtime.proxy_url
+
+
+def test_promoted_route_preserves_an_existing_legacy_generation_profile(tmp_path):
+    settings = load_settings(
+        {
+            "CBRS_PROFILE_DIR": str(tmp_path / "state" / "chrome-profile"),
+            "DATAIMPULSE_PROXY_LOGIN": "mobile-login",
+            "DATAIMPULSE_PROXY_PASSWORD": "mobile-password",
+        },
+        root=tmp_path,
+    )
+    account = PoolAccount(
+        "a1",
+        "Account 1",
+        proxy_provider="dataimpulse_mobile_sticky",
+        dataimpulse_port=10000,
+    )
+    store = JobStore(tmp_path / "pool.sqlite3")
+    store.ensure_dataimpulse_route("a1", 10000)
+    store.begin_dataimpulse_rotation(
+        "a1",
+        initial_port=10000,
+        reason="legacy_profile_compatibility",
+        port_min=10000,
+        port_max=20000,
+        cooldown_seconds=300,
+        max_rotations_per_hour=3,
+    )
+    store.finish_dataimpulse_rotation("a1", promoted=True)
+    legacy = tmp_path / "state" / "accounts" / "a1" / "chrome-profile-route-1"
+    legacy.mkdir(parents=True)
+
+    runtime = _runtime_account_settings(settings, account, store)
+
+    assert runtime.profile_dir == legacy
+
+
 def test_worker_owned_dataimpulse_rotation_request_is_durable_and_sanitized(tmp_path):
     store = JobStore(tmp_path / "pool.sqlite3")
 
@@ -576,6 +761,39 @@ def test_dataimpulse_rotation_rate_limit_fails_closed(tmp_path):
     assert blocked["ok"] is False
     assert blocked["reason"] == "proxy_recovery_exhausted"
     assert store.dataimpulse_route("a1")["status"] == "proxy_recovery_exhausted"
+
+
+def test_dataimpulse_rotation_skips_a_recently_rejected_candidate(tmp_path):
+    store = JobStore(tmp_path / "pool.sqlite3")
+    first = store.begin_dataimpulse_rotation(
+        "a1",
+        initial_port=10000,
+        reason="target_risk_rejection",
+        port_min=10000,
+        port_max=20000,
+        cooldown_seconds=300,
+        max_rotations_per_hour=3,
+    )
+    assert first["pending_port"] == 10001
+    store.finish_dataimpulse_rotation(
+        "a1", promoted=False, error_code="temporary_unavailable"
+    )
+    with store.connect() as db:
+        db.execute(
+            "UPDATE account_proxy_routes SET cooldown_until = NULL WHERE account_id = 'a1'"
+        )
+
+    second = store.begin_dataimpulse_rotation(
+        "a1",
+        initial_port=10000,
+        reason="target_risk_rejection",
+        port_min=10000,
+        port_max=20000,
+        cooldown_seconds=300,
+        max_rotations_per_hour=3,
+    )
+
+    assert second["pending_port"] == 10002
 
 
 def test_quota_day_releases_daily_limit_but_preserves_captcha(tmp_path):
@@ -663,6 +881,53 @@ def test_sticky_residential_gate_rotates_baseline_after_every_safety_gate(
         if row["event"] == "residential_egress_rotated"
     )
     assert "new-sanitized-hash" not in event["data_json"]
+    assert store.account_check(account.account_id)["proxy_status"] == "passed"
+
+
+def test_sticky_gate_accepts_successful_retry_when_baseline_still_matches(tmp_path):
+    settings = replace(
+        _settings(tmp_path),
+        proxy_url="http://user:password@proxy.test:10000",
+        egress_mode="mobile_sticky",
+    )
+    config = _config(accounts=1)
+    account = replace(
+        config.accounts[0],
+        proxy_provider="dataimpulse_mobile_sticky",
+        dataimpulse_port=10000,
+    )
+    path = tmp_path / "pool.sqlite3"
+    pool_store = AccountPoolStore(path)
+    pool_store.create_run(run_id="run", dry_run=False, config=config, dashboard_url=None)
+    store = JobStore(path)
+    calls: list[bool] = []
+
+    def preflight(_settings, *, allow_baseline_replacement=False, **_kwargs):
+        calls.append(allow_baseline_replacement)
+        if not allow_baseline_replacement:
+            return SimpleNamespace(ok=False, report={})
+        return SimpleNamespace(
+            ok=True,
+            report={
+                "egress_hash": "same-sanitized-hash",
+                "egress_country": "CL",
+                "checks": [
+                    {"name": "egress baseline", "ok": True, "detail": "matched"}
+                ],
+            },
+        )
+
+    assert _ensure_account_gate(
+        account,
+        settings,
+        store,
+        pool_store,
+        "run",
+        preflight,
+        lambda *_args, **_kwargs: SimpleNamespace(ok=True),
+        force=True,
+    )
+    assert calls == [False, True]
     assert store.account_check(account.account_id)["proxy_status"] == "passed"
 
 
@@ -869,7 +1134,7 @@ def test_endurance_sample_page_limit_is_bounded() -> None:
         )
 
 
-def test_targeted_captcha_validation_uses_only_requested_account_and_no_download(
+def test_targeted_captcha_validation_keeps_worker_alive_until_explicit_stop(
     tmp_path, monkeypatch
 ):
     settings = _settings(tmp_path)
@@ -906,16 +1171,17 @@ def test_targeted_captcha_validation_uses_only_requested_account_and_no_download
         store=store,
         pool_store=pool_store,
         once=False,
+        sleep_fn=lambda _seconds: pool_store.request_stop(),
         scraper_factory=FakeScraper,
         preflight_runner=_gate,
         proxy_health_runner=_gate,
     )
 
     saved = store.get_job(job["job_id"])
-    assert result.status == "completed"
+    assert result.status == "stopped"
     assert result.processed_jobs == 1
     assert saved["status"] == "completed"
-    assert saved["result_count"] is None
+    assert saved["result_count"] == 1
     assert saved["completed_items"] == 0
     assert store.artifacts(job_id=job["job_id"]) == []
     assert [attempt["account_id"] for attempt in saved["attempts"]] == ["a2"]
@@ -956,6 +1222,7 @@ def test_targeted_captcha_validation_never_fails_over_to_another_account(
         store=store,
         pool_store=pool_store,
         once=False,
+        max_jobs=1,
         scraper_factory=FakeScraper,
         preflight_runner=_gate,
         proxy_health_runner=_gate,
@@ -986,10 +1253,18 @@ def test_worker_restart_registers_an_atomically_published_pdf_without_redownload
     store = JobStore(path)
     job, _ = store.create_job(kind="text", input_data={"text": "Authorized"})
     claimed = store.claim_next("dead-worker")
+    pool_store.create_run(run_id="original", dry_run=False, config=config, dashboard_url=None)
+    search_attempt = store.begin_attempt(
+        job_id=claimed.job_id, account_id="a1", quota_date=_today(), quota=20,
+        run_id="original", consume_quota=True,
+    )
     items = store.add_results(
         claimed.job_id,
         [{"ticket": "ticket-1", "foja": 10, "numero": 20, "ano": 2020}],
+        attempt_id=search_attempt,
     )
+    with store.connect() as db:
+        db.execute("UPDATE runs SET finished_at = ?, status = 'stopped' WHERE run_id = 'original'", (utc_now(),))
     final_path = _expected_artifact_path(settings.output_dir, claimed.job_id, items[0])
     final_path.parent.mkdir(parents=True)
     recovery_image = tmp_path / "recovery_page1.jpg"
@@ -1019,10 +1294,10 @@ def test_worker_restart_registers_an_atomically_published_pdf_without_redownload
     completed = store.get_job(job["job_id"])
     assert completed["status"] == "completed"
     assert completed["account_id"] == "a1"
-    assert len(completed["attempts"]) == 1
+    assert len(completed["attempts"]) == 2
     assert completed["attempts"][0]["account_id"] == "a1"
-    assert completed["attempts"][0]["status"] == "completed"
-    assert completed["attempts"][0]["reason"] == "completed"
+    assert [entry["status"] for entry in completed["attempts"]] == ["search_completed", "completed"]
+    assert completed["attempts"][0]["reason"] == "search_completed"
     assert final_path.read_bytes() == original
     assert len(store.artifacts(job_id=job["job_id"])) == 1
 
@@ -1096,7 +1371,7 @@ def test_worker_fails_over_after_account_captcha(tmp_path, monkeypatch):
     assert sum(store.usage_by_account(_today()).values()) == 1
 
 
-def test_worker_fails_over_to_next_account_after_browser_context_failure(
+def test_worker_holds_unknown_search_outcome_after_browser_context_failure(
     tmp_path,
     monkeypatch,
 ):
@@ -1128,7 +1403,7 @@ def test_worker_fails_over_to_next_account_after_browser_context_failure(
         proxy_health_runner=_gate,
     )
 
-    assert store.get_job(job["job_id"])["status"] == "completed"
+    assert store.get_job(job["job_id"])["status"] == "waiting_capacity"
     with store.connect() as db:
         accounts = [
             row["account_id"]
@@ -1137,7 +1412,9 @@ def test_worker_fails_over_to_next_account_after_browser_context_failure(
                 (job["job_id"],),
             ).fetchall()
         ]
-    assert accounts == ["a1", "a2"]
+    assert accounts == ["a1"]
+    assert FlakyBrowserScraper.search_calls == 1
+    assert store.search_checkpoint(job["job_id"])["uncertain"]
 
 
 def test_worker_waits_when_all_accounts_require_captcha(tmp_path, monkeypatch):
@@ -1434,7 +1711,11 @@ def test_jobs_api_is_loopback_idempotent_and_cancellable(tmp_path, monkeypatch):
             authenticated=True,
             headless=True,
             owner="worker-test",
+            engine=(
+                "gologin" if account.account_id == "a1" else "native_chrome"
+            ),
             status="authenticated",
+            auth_state=CommerceAuthState.AUTHENTICATED_FORM.value,
         )
     with pytest.raises(ValueError, match="loopback"):
         start_pool_dashboard(
@@ -1539,6 +1820,7 @@ def test_jobs_api_is_loopback_idempotent_and_cancellable(tmp_path, monkeypatch):
         assert accounts["a1"]["proxy_checked_at"]
         assert accounts["a1"]["browser_live"] is True
         assert accounts["a1"]["browser_authenticated"] is True
+        assert accounts["a1"]["browser_engine"] == "gologin"
         assert accounts["a1"]["worker_active"] is True
         assert accounts["a1"]["browser_mode"] == "headless"
         assert accounts["a1"]["browser_status"] == "authenticated"

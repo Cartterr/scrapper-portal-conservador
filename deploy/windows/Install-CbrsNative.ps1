@@ -4,7 +4,8 @@ param(
     [string]$StateRoot = 'G:\CBRS',
     [string]$BackupRepository = 'E:\CBRS-backup\restic',
     [string]$EnvFile = 'C:\ProgramData\CBRS\cbrs.env',
-    [switch]$InstallDevelopmentRequirements
+    [switch]$InstallDevelopmentRequirements,
+    [switch]$PlanOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -101,6 +102,18 @@ function Set-CbrsSecretAcl {
         [void]$fileAcl.AddAccessRule($rule)
     }
     Set-Acl -LiteralPath $Path -AclObject $fileAcl
+}
+
+if ($PlanOnly) {
+    Write-Host 'Plan de instalacion CBRS nativa (sin cambios):'
+    Write-Host '1. Validar Windows, winget y discos G: (estado) y E: (backup).'
+    Write-Host '2. Instalar o reutilizar Python 3.14, Google Chrome y restic.'
+    Write-Host '3. Crear el entorno Python e instalar requirements.txt.'
+    Write-Host '4. Crear templates DataImpulse Mobile para tres cuentas aisladas.'
+    Write-Host '5. Proteger cbrs.env y restic-password con ACL local.'
+    Write-Host '6. Registrar worker, dashboard, watchdog y backup deshabilitados.'
+    Write-Host '7. No iniciar Chrome ni trafico CBRS hasta readiness y autorizacion explicita.'
+    return
 }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -259,8 +272,6 @@ $watchdogScript = Join-Path $RepoRoot 'deploy\windows\Invoke-CbrsRuntimeWatchdog
 $taskUser = $identity.Name
 $principalTask = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited
 $persistentTaskSettings = New-ScheduledTaskSettingsSet `
-    -RestartCount 999 `
-    -RestartInterval (New-TimeSpan -Minutes 1) `
     -StartWhenAvailable `
     -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `

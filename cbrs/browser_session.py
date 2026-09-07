@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .error_evidence import notify_browser_error
 
 import logging
 import json
@@ -7,11 +8,11 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 
 
-from .browser_runtime import detect_browser
+from .browser_runtime import detect_browser, validate_native_chrome_executable, validate_service_browser
 from .capsolver import CapSolverClient, CapSolverError, CapSolverResult
 from .captcha_budget import CaptchaBudgetError, CaptchaBudgetStore
 from .captcha_solver import TwoCaptchaClient, TwoCaptchaError, TwoCaptchaResult
@@ -116,6 +117,29 @@ class BrowserSession:
         self._context: Any = None
         self._playwright: Any = None
         self._capsolver_cdp: Any = None
+        self._preview_callback: Callable[[], None] | None = None
+        self._service_owned = False
+
+    def preserve_for_service_lifetime(self) -> None:
+        """Prevent generic close/context-manager cleanup from ending production Chrome."""
+        self._service_owned = True
+
+    def shutdown_service_context(self) -> None:
+        """Explicit whole-service teardown; never call from account recovery."""
+        self.close(service_shutdown=True)
+
+    def set_preview_callback(self, callback: Callable[[], None] | None) -> None:
+        """Register an observational viewport publisher owned by the worker."""
+        self._preview_callback = callback
+
+    def _publish_preview(self) -> None:
+        if self._preview_callback is None:
+            return
+        try:
+            self._preview_callback()
+        except Exception:
+            # Preview telemetry must never change portal behavior.
+            pass
 
     def open(self) -> BrowserSession:
         if self._context is not None:
@@ -128,8 +152,10 @@ class BrowserSession:
                 raise RuntimeError(
                     "CBRS_CLOAK_PROXY_URL is not allowed with the production chrome backend."
                 )
+            validate_service_browser(self.settings)
             proxy = _playwright_proxy(self.settings.proxy_url)
             executable = detect_browser(self.settings)
+            validate_native_chrome_executable(executable.path)
 
             self._playwright = _acquire_sync_playwright()
             try:
@@ -190,10 +216,12 @@ class BrowserSession:
     def goto_index(self) -> None:
         if not self.page.url.startswith(self.settings.commerce_url):
             self.page.goto(self.settings.commerce_url, wait_until="domcontentloaded", timeout=60000)
+        self._publish_preview()
 
     def reload_current_page(self) -> None:
         """Reload the visible page after browser-owned authentication changes."""
         self.page.reload(wait_until="domcontentloaded", timeout=60000)
+        self._publish_preview()
 
     def has_login_cookie(self) -> bool:
         cookies = self.context.cookies(
@@ -220,6 +248,7 @@ class BrowserSession:
                 )
             self.page.wait_for_timeout(1000)
             waited_ms += 1000
+            self._publish_preview()
 
     def require_login_cookie(self) -> None:
         self.goto_index()
@@ -305,6 +334,7 @@ class BrowserSession:
         deadline = time.monotonic() + max(0, timeout_ms) / 1000
         while True:
             state = self.detect_commerce_auth_state()
+            self._publish_preview()
             if state is not CommerceAuthState.UNKNOWN:
                 return state
             if time.monotonic() >= deadline:
@@ -372,21 +402,27 @@ class BrowserSession:
                 context="auth",
             )
 
-        fetch_error: Exception | None = None
+        form_error: Exception | None = None
         try:
-            self._login_with_fetch(username, password)
-            if self.has_active_login():
-                return "browser_fetch"
-            fetch_error = RuntimeError("CBRS login completed without an active session.")
-        except (CredentialsRejectedError, SafetyStopException):
-            raise
-        except Exception as exc:
-            fetch_error = exc
-
-        try:
+            # The real form is the primary flow.  It enters through the
+            # protected-page gate, preserving the SPA navigation, browser
+            # cookies, Imperva context, and reCAPTCHA Enterprise execution
+            # that CBRS evaluates together.
             self._login_with_form(username, password)
             if self.has_active_login():
                 return "browser_form"
+            form_error = RuntimeError("CBRS login completed without an active session.")
+        except (CredentialsRejectedError, SafetyStopException):
+            raise
+        except Exception as exc:
+            form_error = exc
+
+        try:
+            # Keep the browser-origin fetch flow only as a bounded fallback
+            # when the login UI itself could not be rendered or operated.
+            self._login_with_fetch(username, password)
+            if self.has_active_login():
+                return "browser_fetch"
         except (CredentialsRejectedError, SafetyStopException):
             raise
         except Exception as exc:
@@ -400,7 +436,103 @@ class BrowserSession:
             StopReason.AUTH_REQUIRED,
             "Automatic CBRS login did not establish an active session.",
             context="auth",
-        ) from fetch_error
+        ) from form_error
+
+    def _open_login_form_from_protected_gate(self) -> None:
+        """Enter the login SPA through the protected commerce page.
+
+        CBRS can return its Spring whitelabel 400 when the encoded login URL is
+        loaded as a raw navigation.  Clicking the visible application link is
+        therefore the canonical route.  One protected-page reload is allowed
+        when the SPA redirects back before the form is ready.
+        """
+        email = self.page.locator(
+            "#email, input[type=email], input[name=email]"
+        ).first
+        for attempt in range(2):
+            self.page.goto(
+                self.settings.commerce_url,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            self._publish_preview()
+            state = self.wait_for_commerce_auth_state(timeout_ms=10000)
+            if state is CommerceAuthState.AUTHENTICATED_FORM:
+                return
+            if state is CommerceAuthState.CONFLICT:
+                raise SafetyStopException(
+                    StopReason.AUTH_REQUIRED,
+                    "CBRS rendered conflicting authentication components.",
+                    context="auth navigation",
+                )
+            if state is CommerceAuthState.LOGIN_GATE:
+                login_link = self.page.locator(
+                    "a[href^='/login/']",
+                    has_text=re.compile(r"iniciar sesi[oó]n", re.I),
+                ).first
+                login_link.click(timeout=10000)
+                self._publish_preview()
+                try:
+                    email.wait_for(state="visible", timeout=15000)
+                    return
+                except Exception:
+                    self._raise_if_login_error_page()
+                    if attempt == 0:
+                        continue
+            self._raise_if_login_error_page()
+
+        # Compatibility fallback for a portal deployment that omits the gate
+        # link but still exposes the ordinary login route.  Never navigate to
+        # the encoded /login/%2F... URL directly.
+        self.page.goto(
+            self._url("/login"),
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        self._publish_preview()
+        self._raise_if_login_error_page()
+        email.wait_for(state="visible", timeout=10000)
+
+    def has_visible_rejected_login(self) -> bool:
+        """Strict passive evidence, not an inference from an HTTP status/cookie.
+
+        Recovery may use this only with explicit per-account replacement scope.
+        Unknown DOM, a search error, or a hidden stale alert is insufficient.
+        """
+        if self.detect_commerce_auth_state() in {
+            CommerceAuthState.AUTHENTICATED_FORM, CommerceAuthState.CONFLICT
+        }:
+            return False
+        try:
+            return bool(self.page.evaluate("""() => {
+                const visible = e => !!e && e.getClientRects().length > 0 &&
+                  getComputedStyle(e).visibility !== 'hidden' &&
+                  getComputedStyle(e).display !== 'none';
+                const any = selector => [...document.querySelectorAll(selector)].some(visible);
+                return location.pathname.startsWith('/login') &&
+                  any('input[type="email"]') && any('input[type="password"]') &&
+                  [...document.querySelectorAll('button')].some(e => visible(e) && /iniciar sesi[oó]n/i.test(e.textContent)) &&
+                  [...document.querySelectorAll('[role="alert"]')].some(e => visible(e) &&
+                    /se ha detectado un problema,?\\s*refresque la p[aá]gina e intente nuevamente/i.test(e.textContent));
+            }"""))
+        except Exception:
+            return False
+
+    def _raise_if_login_error_page(self) -> None:
+        try:
+            body = self.page.locator("body").inner_text(timeout=1500).lower()
+        except Exception:
+            return
+        if (
+            "whitelabel error page" in body
+            or "se ha detectado un problema" in body
+            or ("bad request" in body and "status=400" in body)
+        ):
+            raise SafetyStopException(
+                StopReason.TEMPORARY_UNAVAILABLE,
+                "CBRS rejected the login page for this browser route.",
+                context="auth navigation",
+            )
 
     def prepare_interactive_login(self, username: str, password: str) -> None:
         """Open CBRS login and prefill credentials without submitting them.
@@ -411,23 +543,15 @@ class BrowserSession:
         still come only from the configured in-memory environment values.
         """
         self.open()
-        self.page.goto(
-            self._url("/login"),
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
+        self._open_login_form_from_protected_gate()
         email = self.page.locator("#email, input[type=email], input[name=email]").first
         password_input = self.page.locator(
             "#password, input[type=password], input[name=password]"
         ).first
-        try:
-            email.wait_for(state="visible", timeout=10000)
-        except Exception:
-            login_button = self.page.get_by_role("button", name=re.compile("iniciar sesi", re.I))
-            login_button.first.click(timeout=5000)
-            email.wait_for(state="visible", timeout=10000)
+        email.wait_for(state="visible", timeout=10000)
         email.fill(username)
         password_input.fill(password)
+        self._publish_preview()
 
     def login_with_visible_form(self, username: str, password: str) -> str:
         """Fill and submit CBRS's real login form in the visible browser."""
@@ -622,6 +746,7 @@ class BrowserSession:
             if provider == "capsolver" and isinstance(result, CapSolverResult):
                 self._apply_capsolver_browser_identity(result)
         except (TwoCaptchaError, CapSolverError, ValueError) as exc:
+            notify_browser_error(self, exc)
             code = exc.code if isinstance(exc, (TwoCaptchaError, CapSolverError)) else "INVALID_TASK_DATA"
             secondary_available = (
                 provider == "capsolver"
@@ -857,29 +982,27 @@ class BrowserSession:
         )
 
     def _login_with_form(self, username: str, password: str) -> None:
-        self.page.goto(
-            self._url("/login"),
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
+        self._open_login_form_from_protected_gate()
+        if (
+            self.detect_commerce_auth_state()
+            is CommerceAuthState.AUTHENTICATED_FORM
+        ):
+            return
         email = self.page.locator("#email, input[type=email], input[name=email]").first
         password_input = self.page.locator(
             "#password, input[type=password], input[name=password]"
         ).first
-        try:
-            email.wait_for(state="visible", timeout=10000)
-        except Exception:
-            login_button = self.page.get_by_role("button", name=re.compile("iniciar sesi", re.I))
-            login_button.first.click(timeout=5000)
-            email.wait_for(state="visible", timeout=10000)
+        email.wait_for(state="visible", timeout=10000)
         email.fill(username)
         password_input.fill(password)
+        self._publish_preview()
         submit = self.page.locator("button[type=submit]").first
         with self.page.expect_response(
             lambda response: "/api/v1/auth/login" in response.url,
             timeout=45000,
         ) as response_info:
             submit.click()
+        self._publish_preview()
         response = response_info.value
         try:
             body_text = response.text()
@@ -1012,7 +1135,9 @@ class BrowserSession:
     def export_cookies(self) -> list[dict[str, Any]]:
         return self.context.cookies([self.settings.base_url])
 
-    def close(self) -> None:
+    def close(self, *, service_shutdown: bool = False) -> None:
+        if self._service_owned and not service_shutdown:
+            return
         try:
             if self._capsolver_cdp is not None:
                 try:
