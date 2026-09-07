@@ -12,12 +12,18 @@ def finish_for_review(store, job_id, reason):
                       ('browser_operation:' + job_id, core.utc_now())).fetchone():
             return False
         changed = db.execute("""UPDATE jobs SET status='failed',error_code=?,
-            error_message='Review required; search will not be replayed',finished_at=?,updated_at=?,
+            error_message=CASE WHEN ?='document_retrieval_deferred'
+                THEN 'Automatic document recovery pending; accepted search preserved'
+                ELSE 'Search outcome could not be confirmed. No PDF or empty result can be certified; search was not replayed.' END,finished_at=?,updated_at=?,
             current_account_id=NULL,worker_owner=NULL,lease_expires_at=NULL
             WHERE job_id=? AND status IN ('running','waiting_capacity','queued')""",
-            (reason,core.utc_now(),core.utc_now(),job_id)).rowcount
+            (reason,reason,core.utc_now(),core.utc_now(),job_id)).rowcount
         if changed:
-            store._add_event_db(db,job_id,'job_requires_review',{'reason':reason,'replayed':False})
+            db.execute("""UPDATE jobs SET
+                completed_items=(SELECT COUNT(*) FROM job_items WHERE job_id=? AND status='completed'),
+                failed_items=(SELECT COUNT(*) FROM job_items WHERE job_id=? AND status='failed')
+                WHERE job_id=?""",(job_id,job_id,job_id))
+            store._add_event_db(db,job_id,'document_retry_pending' if reason == 'document_retrieval_deferred' else 'job_requires_review',{'reason':reason,'replayed':False})
     return bool(changed)
 
 def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobStore, pool_store: AccountPoolStore, run_id: str, browser_pool: _PersistentAccountBrowsers, preflight_runner: Callable[..., Any], proxy_health_runner: Callable[..., Any], endurance_plan: Any | None=None) -> str:
@@ -37,14 +43,49 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
         # including document work. Saved receipts remain available after expiry.
         excluded.update(a.account_id for a in config.accounts
                         if (quota_policy.quota_hold(store.path, a.account_id) or {}).get('blocked'))
-        if checkpoint['incomplete_receipt'] or checkpoint['uncertain']:
-            reason = 'search_outcome_unknown' if checkpoint['uncertain'] else 'search_receipt_incomplete'
-            if finish_for_review(store, job.job_id, reason):
-                return 'failed'
-            store.set_waiting(job.job_id, 'waiting_capacity', reason=reason)
+        if checkpoint['incomplete_receipt']:
+            store.set_waiting(job.job_id, 'waiting_capacity', reason='search_receipt_incomplete')
             return 'waiting_capacity'
+        if checkpoint['uncertain']:
+            with store.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                in_flight = db.execute('SELECT 1 FROM leases WHERE lease_name=? AND expires_at>=?',
+                    ('browser_operation:'+job.job_id,core.utc_now())).fetchone()
+                excluded.update(row[0] for row in db.execute(
+                    "SELECT account_id FROM job_attempts WHERE job_id=? AND safety_stop='search_outcome_unknown'",(job.job_id,)))
+                if not in_flight:
+                    db.execute('INSERT OR IGNORE INTO search_retry_clearance VALUES (?,?)',(job.job_id,core.utc_now()))
+            if in_flight:
+                store.set_waiting(job.job_id,'waiting_capacity',reason='awaiting_previous_operation')
+                return 'waiting_capacity'
         if checkpoint['saved']:
             if checkpoint['result_count'] == 0:
+                return store.finalize_job(job.job_id)
+            # Try purely local materialization before any account admission.
+            # No portal calls, quota consumption, auth or proxy changes here.
+            class LocalOnly:
+                def get_image_refs(self, ticket):
+                    raise RuntimeError('Document pages not cached yet')
+                def download_image(self, ref, path):
+                    raise RuntimeError('Document page not cached yet')
+            for item in store.items(job.job_id, public=False):
+                if item['status'] == 'completed':
+                    continue
+                sample = (int(job.input.get('sample_pages') or 0) or None) if job.source == 'endurance' else None
+                try:
+                    path = core._expected_artifact_path(settings.output_dir,job.job_id,item,sample_pages=sample)
+                    if path.exists():
+                        pages = int(item.get('expected_pages') or 1)
+                        digest,size = core.validate_pdf(path,expected_pages=pages)
+                    else:
+                        path,pages,digest,size = core.download_job_item(LocalOnly(),item,job_id=job.job_id,
+                            output_root=settings.output_dir,sample_pages=sample)
+                    store.complete_item(str(item['item_id']),expected_pages=pages,output_path=path,sha256=digest,bytes_count=size)
+                except Exception:
+                    # Missing cache is not proof of a portal failure.
+                    continue
+            cached_items = store.items(job.job_id,public=False)
+            if cached_items and all(i['status']=='completed' for i in cached_items):
                 return store.finalize_job(job.job_id)
             if not checkpoint['account_id']:
                 store.set_waiting(job.job_id, 'waiting_capacity', reason='search_owner_unknown')
@@ -61,7 +102,7 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                 status = 'waiting_captcha' if target_state == core.CAPTCHA_PENDING_STATUS else 'waiting_capacity'
             else:
                 status = core._unavailable_job_status(pool_store, run_id, config, excluded)
-            store.set_waiting(job.job_id, status, reason=status)
+            store.set_waiting(job.job_id, status, reason='waiting_authenticated_alternate' if checkpoint['uncertain'] else status)
             pool_store.update_run(run_id, status=status, next_cycle_at=core.next_quota_reset_at() if status == 'waiting_capacity' else '', blocked_reason=status)
             return status
         excluded.add(account.account_id)
@@ -150,6 +191,9 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                         store.fail_item(str(item['item_id']), code='download_failed', message=str(exc))
                 if attempt_id:
                     store.finish_attempt(attempt_id, status='completed')
+                if any(i['status'] != 'completed' for i in store.items(job.job_id, public=False)):
+                    if finish_for_review(store, job.job_id, 'document_retrieval_deferred'):
+                        return 'failed'
                 return store.finalize_job(job.job_id)
         except core.CredentialsRejectedError as exc:
             browser_pool.discard(account.account_id, status='credentials_invalid')
@@ -173,9 +217,7 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
             safe_error = core._redact_known_values(str(exc), username, password)
             if attempt_id and (not store.search_checkpoint(job.job_id)['saved']):
                 store.finish_attempt(attempt_id, status='failed', safety_stop='search_outcome_unknown', error=safe_error)
-                if finish_for_review(store, job.job_id, 'search_outcome_unknown'):
-                    return 'failed'
-                store.set_waiting(job.job_id, 'waiting_capacity', reason='search_outcome_unknown')
+                store.set_waiting(job.job_id, 'waiting_capacity', reason='waiting_authenticated_alternate')
                 return 'waiting_capacity'
             if attempt_id:
                 store.finish_attempt(attempt_id, status='failed', error=safe_error)

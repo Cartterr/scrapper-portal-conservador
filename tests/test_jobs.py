@@ -40,6 +40,27 @@ from cbrs.pdf import create_pdf
 from cbrs.safety import SafetyStopException, StopReason
 
 
+def test_authorized_alternate_never_reuses_uncertain_account_or_live_operation(tmp_path):
+    store=JobStore(tmp_path/'pool.sqlite3')
+    pool=AccountPoolStore(store.path)
+    pool.create_run(run_id='r',dry_run=False,config=_config(),dashboard_url=None)
+    job,_=store.create_job(kind='text',input_data={'text':'Authorized'})
+    args=dict(job_id=job['job_id'],account_id='a1',quota_date=_today(),quota=20,run_id='r',consume_quota=True)
+    first=store.begin_attempt(**args)
+    store.finish_attempt(first,status='failed',safety_stop='search_outcome_unknown')
+    assert store.begin_attempt(**{**args,'account_id':'a2'}) is None
+    with store.connect() as db:
+        db.execute('INSERT INTO search_retry_clearance VALUES (?,?)',(job['job_id'],utc_now()))
+    assert store.begin_attempt(**args) is None
+    store.acquire_lease('browser_operation:'+job['job_id'],'owner')
+    assert store.begin_attempt(**{**args,'account_id':'a2'}) is None
+    store.release_lease('browser_operation:'+job['job_id'],'owner')
+    second=store.begin_attempt(**{**args,'account_id':'a2'})
+    assert second
+    store.add_results(job['job_id'],[],attempt_id=second)
+    assert store.begin_attempt(**{**args,'account_id':'a3'}) is None
+
+
 def test_search_receipt_is_atomic_and_empty_results_are_final(tmp_path, monkeypatch):
     store = JobStore(tmp_path / "pool.sqlite3")
     pool = AccountPoolStore(store.path)
@@ -1421,9 +1442,9 @@ def test_worker_restart_registers_an_atomically_published_pdf_without_redownload
     completed = store.get_job(job["job_id"])
     assert completed["status"] == "completed"
     assert completed["account_id"] == "a1"
-    assert len(completed["attempts"]) == 2
+    assert len(completed["attempts"]) == 1
     assert completed["attempts"][0]["account_id"] == "a1"
-    assert [entry["status"] for entry in completed["attempts"]] == ["search_completed", "completed"]
+    assert [entry["status"] for entry in completed["attempts"]] == ["search_completed"]
     assert completed["attempts"][0]["reason"] == "search_completed"
     assert final_path.read_bytes() == original
     assert len(store.artifacts(job_id=job["job_id"])) == 1
@@ -1461,7 +1482,8 @@ def test_worker_preserves_successful_pdfs_and_finishes_partial(tmp_path, monkeyp
     )
 
     saved = store.get_job(job["job_id"])
-    assert saved["status"] == "partial"
+    assert saved["status"] == "failed"
+    assert saved["error_code"] == "document_retrieval_deferred"
     assert saved["completed_items"] == 1
     assert saved["failed_items"] == 1
     assert len(store.artifacts(job_id=job["job_id"])) == 1
@@ -1530,8 +1552,8 @@ def test_worker_holds_unknown_search_outcome_after_browser_context_failure(
         proxy_health_runner=_gate,
     )
 
-    assert store.get_job(job["job_id"])["status"] == "failed"
-    assert store.get_job(job["job_id"])["error_code"] == "search_outcome_unknown"
+    assert store.get_job(job["job_id"])["status"] == "waiting_capacity"
+    assert store.get_job(job["job_id"])["error_code"] == "waiting_authenticated_alternate"
     with store.connect() as db:
         accounts = [
             row["account_id"]

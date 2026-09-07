@@ -661,6 +661,12 @@ class JobStore:
                     FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS archived_jobs (
+                    job_id TEXT PRIMARY KEY, archived_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS search_retry_clearance (
+                    job_id TEXT PRIMARY KEY, authorized_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS artifacts (
                     artifact_id TEXT PRIMARY KEY,
                     job_id TEXT NOT NULL,
@@ -931,7 +937,7 @@ class JobStore:
         limit = max(1, min(int(limit), 1000))
         with self.connect() as db:
             rows = db.execute(
-                "SELECT * FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?", (limit,)
+                "SELECT * FROM jobs WHERE job_id NOT IN (SELECT job_id FROM archived_jobs) ORDER BY created_at DESC, rowid DESC LIMIT ?", (limit,)
             ).fetchall()
             return [self._job_payload(db, row) for row in rows]
 
@@ -1353,10 +1359,14 @@ class JobStore:
                 ).fetchone()
                 prior_search = db.execute(
                     "SELECT 1 FROM job_attempts WHERE job_id = ? AND "
-                    "(status = 'search_completed' OR safety_stop = 'search_outcome_unknown' "
+                    "(status = 'search_completed' OR (safety_stop = 'search_outcome_unknown' "
+                    "AND (account_id = ? OR NOT EXISTS (SELECT 1 FROM search_retry_clearance WHERE job_id=?))) "
                     "OR (status = 'running' AND quota_consumed = 1))",
-                    (job_id,),
+                    (job_id, account_id, job_id),
                 ).fetchone()
+                if db.execute('SELECT 1 FROM leases WHERE lease_name=? AND expires_at>=?',
+                              ('browser_operation:'+job_id,utc_now())).fetchone():
+                    return None
                 if checkpoint is None or checkpoint["result_count"] is not None or prior_search:
                     return None
                 usage = self._account_usage_db(db, account_id, quota_date)
@@ -2888,7 +2898,22 @@ def download_job_item(
     job_dir.mkdir(parents=True, exist_ok=True)
     image_dir.mkdir(parents=True, exist_ok=True)
 
-    _ticket_info, refs = scraper.get_image_refs(str(ticket))
+    manifest = image_dir / "manifest.json"
+    refs = None
+    if manifest.exists():
+        try:
+            cached = json.loads(manifest.read_text(encoding="utf-8"))
+            if cached.get("ticket") == str(ticket) and cached.get("sample_pages") == sample_pages:
+                refs = cached["refs"]
+        except (ValueError, KeyError):
+            pass
+    if refs is None:
+        _ticket_info, refs = scraper.get_image_refs(str(ticket))
+        if sample_pages is not None:
+            refs = refs[:sample_pages]
+        manifest_tmp = manifest.with_suffix('.tmp')
+        manifest_tmp.write_text(json.dumps({'ticket': str(ticket), 'sample_pages': sample_pages, 'refs': refs}), encoding='utf-8')
+        os.replace(manifest_tmp, manifest)
     if not refs:
         raise RuntimeError("No image references returned for this inscription.")
     if sample_pages is not None:
@@ -2901,24 +2926,30 @@ def download_job_item(
             page = int(ref["pageNumber"])
             data_ref = str(ref["dataRef"])
             image_path = image_dir / f"page_{page:05d}.jpg"
-            images.append(scraper.download_image(data_ref, image_path))
+            from PIL import Image
+            valid = False
+            if image_path.exists():
+                try:
+                    with Image.open(image_path) as image:
+                        image.verify()
+                    valid = True
+                except (OSError, ValueError):
+                    pass
+            if not valid:
+                pending = image_path.with_suffix('.download.jpg')
+                scraper.download_image(data_ref, pending)
+                with Image.open(pending) as image:
+                    image.verify()
+                os.replace(pending, image_path)
+            images.append(image_path)
         create_pdf(images, temp_path)
         sha256, size = validate_pdf(temp_path, expected_pages=len(refs))
         os.replace(temp_path, final_path)
         return final_path, len(refs), sha256, size
     finally:
         temp_path.unlink(missing_ok=True)
-        for image in images:
-            image.unlink(missing_ok=True)
-        if image_dir.exists():
-            for leftover in image_dir.iterdir():
-                if leftover.is_file():
-                    leftover.unlink(missing_ok=True)
-        try:
-            image_dir.rmdir()
-            image_dir.parent.rmdir()
-        except OSError:
-            pass
+        # Durable, private cache: retain validated pages across failed assembly,
+        # process restarts and later document-only retries. Never expose refs.
 
 
 def run_job_worker(

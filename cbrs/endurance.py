@@ -132,8 +132,6 @@ class EnduranceController:
             state = db.execute(
                 "SELECT * FROM endurance_state WHERE name = 'default'"
             ).fetchone()
-            if state and bool(state["paused"]) and not force:
-                return None
             if db.execute(
                 """
                 SELECT 1 FROM jobs WHERE source = 'endurance'
@@ -141,6 +139,36 @@ class EnduranceController:
                 LIMIT 1
                 """
             ).fetchone():
+                return None
+            # Accepted searches are final; revive only their document stage.
+            # Keep the endurance slot reserved until the artifacts are finished.
+            pending = db.execute("""SELECT job_id,updated_at FROM jobs
+                WHERE source='endurance' AND status='failed'
+                  AND error_code='document_retrieval_deferred' AND result_count>0
+                ORDER BY created_at LIMIT 1""").fetchone()
+            if pending:
+                db.execute("""CREATE TABLE IF NOT EXISTS document_recovery_budget
+                    (job_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0)""")
+                prior_failures = db.execute("""SELECT COUNT(*) FROM job_events WHERE job_id=?
+                    AND event IN ('document_retry_pending','job_requires_review')
+                    AND json_extract(data_json,'$.reason')='document_retrieval_deferred'""",(pending['job_id'],)).fetchone()[0]
+                db.execute('INSERT OR IGNORE INTO document_recovery_budget(job_id,attempts) VALUES (?,?)',
+                           (pending['job_id'],max(0,prior_failures-1)))
+                attempts = db.execute('SELECT attempts FROM document_recovery_budget WHERE job_id=?',(pending['job_id'],)).fetchone()[0]
+                if attempts >= 3:
+                    db.execute("""UPDATE jobs SET error_code='document_recovery_exhausted',
+                        error_message='Document recovery failed after 3 retries. Accepted search retained; cached pages are incomplete or retrieval/assembly failed.',
+                        finished_at=?,updated_at=? WHERE job_id=? AND status='failed'""",
+                        (utc_now(),utc_now(),pending['job_id']))
+                    return None
+                due = datetime.fromisoformat(str(pending['updated_at'])) + timedelta(seconds=120)
+                if datetime.now(timezone.utc) >= due:
+                    db.execute('UPDATE document_recovery_budget SET attempts=attempts+1 WHERE job_id=?',(pending['job_id'],))
+                    db.execute("""UPDATE jobs SET status='queued',finished_at=NULL,
+                        worker_owner=NULL,lease_expires_at=NULL,next_run_at=NULL,updated_at=?
+                        WHERE job_id=? AND status='failed'""", (utc_now(),pending['job_id']))
+                return None
+            if state and bool(state["paused"]) and not force:
                 return None
             last = db.execute(
                 """

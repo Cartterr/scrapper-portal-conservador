@@ -1551,7 +1551,7 @@
         ['failed','waiting_capacity'].includes(job.status) && ['search_outcome_unknown','search_receipt_incomplete'].includes(job.error_code));
       pendingEvidence.hidden = !uncertainJob;
       pendingEvidence.style.display = uncertainJob ? 'grid' : 'none';
-      pendingEvidence.innerHTML = uncertainJob ? `<strong>Trabajo pendiente de revisión: resultado de búsqueda no confirmado</strong><span>El navegador sigue conectado. No se repetirá esta consulta automáticamente para evitar duplicados. Requiere verificar el resultado o descartar el trabajo.</span><a href="/api/jobs/${encodeURIComponent(uncertainJob.job_id)}">Ver evidencia del trabajo</a>` : '';
+      pendingEvidence.innerHTML = uncertainJob ? `<strong>Error de búsqueda: resultado no confirmado</strong><span>El trabajo terminó sin evidencia suficiente para certificar un PDF o un resultado vacío. No se repite la búsqueda ni se solicita revisión manual. Las sesiones se conservan.</span><a href="/api/jobs/${encodeURIComponent(uncertainJob.job_id)}">Ver diagnóstico</a>` : '';
       document.getElementById("accounts").innerHTML = accounts.map((account, index) => {
         const pct = account.daily_quota ? Math.min(100, (account.used_today / account.daily_quota) * 100) : 0;
         const route = account.egress_shared
@@ -1992,7 +1992,7 @@
           <td>${escapeHtml(job.kind)}${job.source === "endurance" ? " · endurance" : ""}</td>
           <td>${account}</td>
           <td>${documentNumber}</td>
-          <td><span class="status ${escapeHtml(job.status)}">${escapeHtml(job.error_code === 'document_retrieval_deferred' ? 'Documento pendiente' : ['search_outcome_unknown','search_receipt_incomplete'].includes(job.error_code) ? 'Revisión requerida' : label(job.status))}</span></td>
+          <td><span class="status ${job.status === 'failed' && job.error_code !== 'document_retrieval_deferred' ? 'credentials_invalid' : escapeHtml(job.status)}" title="${escapeHtml(job.error_message || job.error_code || '')}">${escapeHtml(job.error_code === 'document_retrieval_deferred' ? 'Recuperando documento' : ['search_outcome_unknown','search_receipt_incomplete'].includes(job.error_code) ? 'Error: búsqueda no confirmada' : job.error_code === 'document_recovery_exhausted' ? 'Error: documento no recuperado' : label(job.status))}</span></td>
           <td>${reason}</td>
           <td>${job.result_count ?? "-"}</td>
           <td>${job.completed_items ?? 0}</td>
