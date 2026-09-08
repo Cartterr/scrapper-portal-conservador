@@ -38,7 +38,10 @@ def account_window_db(db, account_id, *, now=None):
     if end is not None and now >= end:
         start = end = None
         used, sources = 0, {}
-    reserved = db.execute("SELECT COUNT(*) FROM job_attempts WHERE account_id=? AND quota_consumed=1 AND status='running'", (account_id,)).fetchone()[0]
+    reserved = db.execute("""SELECT COUNT(*) FROM job_attempts WHERE account_id=? AND quota_consumed=1
+        AND (status='running' OR (safety_stop='search_outcome_unknown'
+        AND julianday(COALESCE(finished_at,started_at))>julianday(?)))""",
+        (account_id,(now-timedelta(hours=24)).isoformat())).fetchone()[0]
     return {'used':used,'reserved':reserved,'source_used':sources,
             'started_at':start.isoformat() if start else None,
             'resets_at':end.isoformat() if end else None,'policy':'first_success_24h'}
@@ -227,7 +230,8 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
     origin = urlsplit(browser.settings.commerce_url)
     current = urlsplit(page.url)
     if (current.scheme, current.netloc, current.path) != (origin.scheme, origin.netloc, origin.path):
-        raise RuntimeError("Protected search route is not open; no automatic navigation performed")
+        raise SafetyStopException(StopReason.SEARCH_NOT_SUBMITTED,
+            "Protected search route is not open; no request submitted", context='commerce form search')
     values = {"foja": str(foja), "numero": str(numero), "ano": str(ano)}
 
     def matches(response):
@@ -269,10 +273,13 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
         form.get_by_role('button', name='Buscar', exact=True).click(timeout=10000)
         import time
         deadline = time.monotonic() + 90
+        submission_deadline = time.monotonic() + 15
         while not observed:
             if not submitted and runtime_module('runtime_observation').visible_login_gate(page):
                 raise SafetyStopException(StopReason.AUTH_REQUIRED,
                     'Session expired before any commerce search request', context='commerce form search')
+            if not submitted and time.monotonic() >= submission_deadline:
+                raise TimeoutError('Portal did not submit a commerce request within 15 seconds')
             if time.monotonic() >= deadline:
                 raise TimeoutError('Commerce search response was not observed; no automatic replay')
             page.wait_for_timeout(100)
@@ -309,6 +316,10 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
             notify_browser_error(browser, auth)
             raise auth from exc
         notify_browser_error(browser, exc)
+        if not submitted and not isinstance(exc, SafetyStopException):
+            raise SafetyStopException(StopReason.SEARCH_NOT_SUBMITTED,
+                'Form could not submit a commerce request; alternate account required',
+                context='commerce form search') from exc
         # In particular, a timeout never causes another click or API replay.
         raise
     finally:

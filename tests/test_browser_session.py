@@ -368,7 +368,7 @@ def test_browser_session_rejects_stale_login_cookie(tmp_path: Path) -> None:
     session.has_login_cookie = lambda: True
     session.goto_index = lambda: None
     session.wait_for_commerce_auth_state = (
-        lambda: CommerceAuthState.AUTHENTICATED_FORM
+        lambda: CommerceAuthState.LOGIN_GATE
     )
     session.fetch_json = lambda *args, **kwargs: BrowserFetchResponse(
         status=401,
@@ -386,9 +386,8 @@ def test_browser_session_accepts_cookie_after_successful_auth_refresh(tmp_path: 
     session.has_login_cookie = lambda: True
     origin_loaded = []
     session.goto_index = lambda: origin_loaded.append(True)
-    session.wait_for_commerce_auth_state = (
-        lambda: CommerceAuthState.AUTHENTICATED_FORM
-    )
+    states = iter([CommerceAuthState.LOGIN_GATE, CommerceAuthState.AUTHENTICATED_FORM])
+    session.wait_for_commerce_auth_state = lambda: next(states)
     session.fetch_json = lambda *args, **kwargs: BrowserFetchResponse(
         status=200,
         headers={},
@@ -404,6 +403,16 @@ def test_browser_session_accepts_cookie_after_successful_auth_refresh(tmp_path: 
     assert origin_loaded == [True]
     assert captured["token"] == "fresh.jwt.token"
     assert captured["reloaded"] is True
+
+
+def test_protected_form_check_never_refreshes_or_navigates(tmp_path):
+    session = BrowserSession(load_settings({}, root=tmp_path))
+    session._context = SimpleNamespace()
+    session.detect_commerce_auth_state = lambda: CommerceAuthState.AUTHENTICATED_FORM
+    session.goto_index = lambda: pytest.fail('Proven form must not navigate')
+    session.fetch_json = lambda *a, **kw: pytest.fail('Proven form must not refresh')
+    session.reload_current_page = lambda: pytest.fail('Proven form must not reload')
+    assert session.has_active_login()
 
 
 def test_browser_session_detects_explicit_commerce_login_gate(tmp_path: Path) -> None:
@@ -518,6 +527,37 @@ def test_ensure_authenticated_reuses_a_valid_persistent_session(tmp_path: Path) 
     )
 
     assert session.ensure_authenticated(None, None) == "refreshed"
+
+
+def test_forced_authentication_cannot_short_circuit_on_stale_protected_dom(tmp_path):
+    session = BrowserSession(load_settings({}, root=tmp_path))
+    calls = []
+    session.open = lambda: None
+    session.has_active_login = lambda: True
+    session._login_with_form = lambda u, p, **kw: calls.append(kw)
+    assert session.ensure_authenticated('test-user', 'test-password', force=True) == 'browser_form'
+    assert calls == [{'force': True}]
+
+
+def test_refreshed_auth_updates_cookie_and_native_storage_together(tmp_path):
+    session = BrowserSession(load_settings({}, root=tmp_path))
+    cookies, evaluations = [], []
+    page = SimpleNamespace(url=session.settings.commerce_url,
+        evaluate=lambda js, arg: evaluations.append((js, arg)))
+    session._context = SimpleNamespace(pages=[page], add_cookies=lambda c: cookies.extend(c))
+    session.set_auth_cookie('test-token')
+    assert cookies[0]['value'] == '"test-token"'
+    assert len(evaluations) == 1 and evaluations[0][1] == 'test-token'
+    assert 'localStorage.setItem' in evaluations[0][0]
+
+
+def test_fetch_login_adopts_returned_access_token_without_an_extra_refresh(tmp_path):
+    session = BrowserSession(load_settings({}, root=tmp_path))
+    tokens = []
+    session.fetch_json = lambda *a, **kw: BrowserFetchResponse(200, {}, '{"token":"new-token"}')
+    session.set_auth_cookie = tokens.append
+    assert session._fetch_login('test', 'test', 'captcha').status == 200
+    assert tokens == ['new-token']
 
 
 def test_ensure_authenticated_uses_visible_form_first_and_confirms_refresh(

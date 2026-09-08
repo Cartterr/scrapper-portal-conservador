@@ -68,6 +68,12 @@ def capture_error(store, account_id, browser, error) -> None:
         with store.connect() as db:
             db.execute("INSERT INTO attempt_error_evidence VALUES(?,?,?,?,?,?)",
                        (evidence_id, attempt_id, captured_at, capture_status, reason, http_status))
+            context = getattr(error, "context", None)
+            if context in {"auth refresh", "ticket validation", "image reference lookup", "image download", "commerce form search"}:
+                job = db.execute("SELECT job_id FROM job_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+                if job:
+                    store._add_event_db(db, job["job_id"], "portal_operation_error",
+                        {"operation": context, "reason": reason, "http_status": http_status})
         error._cbrs_error_captured = True
     except Exception:
         pass

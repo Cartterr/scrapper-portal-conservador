@@ -35,6 +35,13 @@ def settle_owner_attempts(store, settings, job_id):
 
 def finish_for_review(store, job_id, reason):
     """End only this job, retaining ambiguous receipts and live operations."""
+    if reason == 'search_outcome_unknown':
+        with store.connect() as db:
+            if db.execute('SELECT 1 FROM leases WHERE lease_name=? AND expires_at>=?',
+                          ('browser_operation:'+job_id,core.utc_now())).fetchone():
+                return False
+        store.set_waiting(job_id, 'waiting_capacity', reason='waiting_authenticated_alternate')
+        return False
     with store.connect() as db:
         db.execute('BEGIN IMMEDIATE')
         if db.execute('SELECT 1 FROM leases WHERE lease_name=? AND expires_at>=?',
@@ -62,7 +69,7 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
     settle_owner_attempts(store, settings, job.job_id)
     with store.connect() as db:
         excluded.update(row[0] for row in db.execute(
-            "SELECT account_id FROM job_attempts WHERE job_id=? AND safety_stop='auth_required'",
+            "SELECT account_id FROM job_attempts WHERE job_id=? AND safety_stop='search_outcome_unknown'",
             (job.job_id,)))
     while True:
         if store.cancel_requested(job.job_id):
@@ -81,13 +88,17 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
             store.set_waiting(job.job_id, 'waiting_capacity', reason='search_receipt_incomplete')
             return 'waiting_capacity'
         if checkpoint['uncertain']:
-            # The owner cannot execute another search while the prior outcome
-            # is unresolved. Do not dispatch doomed commands to each sibling,
-            # or turn local precondition refusals into new uncertain attempts.
-            if finish_for_review(store, job.job_id, 'search_outcome_unknown'):
-                return 'failed'
-            store.set_waiting(job.job_id,'waiting_capacity',reason='awaiting_previous_operation')
-            return 'waiting_capacity'
+            from .owner_protocol import command_path
+            import sqlite3
+            command_db = command_path(settings)
+            pending = False
+            if command_db.exists():
+                with sqlite3.connect(f'{command_db.as_uri()}?mode=ro', uri=True) as db:
+                    pending = db.execute("SELECT 1 FROM owner_commands WHERE job_id=? AND operation IN ('search_fna','search_text') AND state IN ('queued','running')", (job.job_id,)).fetchone() is not None
+            if pending or not store.authorize_alternate_search(job.job_id):
+                store.set_waiting(job.job_id,'waiting_capacity',reason='awaiting_previous_operation')
+                return 'waiting_capacity'
+            continue
         if checkpoint['saved']:
             if checkpoint['result_count'] == 0:
                 return store.finalize_job(job.job_id)
@@ -132,7 +143,7 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                 status = 'waiting_captcha' if target_state == core.CAPTCHA_PENDING_STATUS else 'waiting_capacity'
             else:
                 status = core._unavailable_job_status(pool_store, run_id, config, excluded)
-            store.set_waiting(job.job_id, status, reason='waiting_authenticated_alternate' if checkpoint['uncertain'] else status)
+            store.set_waiting(job.job_id, status, reason='waiting_authenticated_alternate' if excluded and not checkpoint['saved'] else status)
             pool_store.update_run(run_id, status=status, next_cycle_at=core.next_quota_reset_at() if status == 'waiting_capacity' else '', blocked_reason=status)
             return status
         excluded.add(account.account_id)
@@ -166,8 +177,8 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                             raise core.SafetyStopException(core.StopReason.DAILY_LIMIT, 'Portal quota hold remains active')
                         results = core._search_job(scraper, job)
                     except core.SafetyStopException as exc:
-                        if exc.reason == core.StopReason.AUTH_REQUIRED:
-                            store.finish_attempt(attempt_id, status='auth_expired', safety_stop=exc.reason.value, error=str(exc))
+                        if exc.reason in {core.StopReason.AUTH_REQUIRED, core.StopReason.SEARCH_NOT_SUBMITTED}:
+                            store.finish_attempt(attempt_id, status='auth_expired' if exc.reason == core.StopReason.AUTH_REQUIRED else 'not_submitted', safety_stop=exc.reason.value, error=str(exc))
                             attempt_id = None
                             store.add_event('account_login_pending', job_id=job.job_id,
                                 account_id=account.account_id, data={'search_submitted': False})
@@ -247,8 +258,9 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
             safe_error = core._redact_known_values(str(exc), username, password)
             if attempt_id and (not store.search_checkpoint(job.job_id)['saved']):
                 store.finish_attempt(attempt_id, status='failed', safety_stop='search_outcome_unknown', error=safe_error)
-                store.set_waiting(job.job_id, 'waiting_capacity', reason='waiting_authenticated_alternate')
-                return 'waiting_capacity'
+                store.add_event('account_search_unconfirmed', job_id=job.job_id,
+                    account_id=account.account_id, data={'alternate_account_requested': True})
+                continue
             if attempt_id:
                 store.finish_attempt(attempt_id, status='failed', error=safe_error)
             connection_failure = core._looks_like_connection_failure(exc)

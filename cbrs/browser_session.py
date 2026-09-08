@@ -346,12 +346,18 @@ class BrowserSession:
         return self.detect_commerce_auth_state() is CommerceAuthState.LOGIN_GATE
 
     def has_active_login(self) -> bool:
+        # A live protected form is the strongest browser-side admission signal.
+        # Do not refresh cookies or reload this proven context merely to check it.
+        if self._context is not None and self.detect_commerce_auth_state() is CommerceAuthState.AUTHENTICATED_FORM:
+            return True
         if not self.has_login_cookie():
             return False
         # A newly opened persistent context starts on about:blank even when its
         # profile contains valid auth cookies.  Refresh is a browser-origin
         # request, so establish the CBRS origin before evaluating fetch().
         self.goto_index()
+        if self.wait_for_commerce_auth_state() is CommerceAuthState.AUTHENTICATED_FORM:
+            return True
         response = self.fetch_json(
             "/api/v1/auth/refresh",
             headers={"Accept": "application/json", "Content-Type": "application/json"},
@@ -408,7 +414,13 @@ class BrowserSession:
             # protected-page gate, preserving the SPA navigation, browser
             # cookies, Imperva context, and reCAPTCHA Enterprise execution
             # that CBRS evaluates together.
-            self._login_with_form(username, password)
+            if force:
+                # A server-side authentication refusal overrides a stale
+                # protected DOM. Actually visit the login form on this same
+                # browser/route; do not report the old form as a fresh login.
+                self._login_with_form(username, password, force=True)
+            else:
+                self._login_with_form(username, password)
             if self.has_active_login():
                 return "browser_form"
             form_error = RuntimeError("CBRS login completed without an active session.")
@@ -971,7 +983,7 @@ class BrowserSession:
         password: str,
         recaptcha_token: str,
     ) -> BrowserFetchResponse:
-        return self.fetch_json(
+        response = self.fetch_json(
             "/api/v1/auth/login",
             headers={
                 "Accept": "application/json, text/plain, */*",
@@ -980,10 +992,22 @@ class BrowserSession:
             },
             body={"email": username, "password": password},
         )
+        try:
+            token = (json.loads(response.body_text or '{}').get('token')
+                     if response.status == 200 and classify_response(response.status, response.headers, response.body_text) is None else None)
+        except (ValueError, AttributeError):
+            token = None
+        if isinstance(token, str) and token:
+            self.set_auth_cookie(token)
+        return response
 
-    def _login_with_form(self, username: str, password: str) -> None:
-        self._open_login_form_from_protected_gate()
+    def _login_with_form(self, username: str, password: str, *, force: bool = False) -> None:
+        if force:
+            self.page.goto(self._url('/login'), wait_until='domcontentloaded', timeout=60000)
+        else:
+            self._open_login_form_from_protected_gate()
         if (
+            not force and
             self.detect_commerce_auth_state()
             is CommerceAuthState.AUTHENTICATED_FORM
         ):
@@ -1132,6 +1156,11 @@ class BrowserSession:
                 }
             ]
         )
+        # Match the native portal's refresh contract: its auth interceptor reads
+        # localStorage, while document/image requests also use the access cookie.
+        # Keeping only one updated leaves the SPA using a stale token.
+        if urlparse(self.page.url).netloc == urlparse(self.settings.base_url).netloc:
+            self.page.evaluate("token => localStorage.setItem('auth_cbrs_token', JSON.stringify(token))", token)
 
     def export_cookies(self) -> list[dict[str, Any]]:
         return self.context.cookies([self.settings.base_url])

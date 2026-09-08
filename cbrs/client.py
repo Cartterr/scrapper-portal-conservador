@@ -50,6 +50,28 @@ class BrowserOriginClient:
         if self._jwt and not force and self._jwt_is_fresh():
             return self._jwt
 
+        # The native portal may already have refreshed its access cookie while
+        # submitting the form. Do not force a second refresh with an expired
+        # refresh cookie: that can return 401 despite a valid accepted search.
+        # Only reuse a non-expiring-soon token from this browser's scoped jar.
+        if not force:
+            export = getattr(self.browser, "export_cookies", None)
+            for cookie in export() if callable(export) else []:
+                if cookie.get("name") != "auth_cbrs_token":
+                    continue
+                token = cookie.get("value", "")
+                if token.startswith('"'):
+                    try:
+                        token = json.loads(token)
+                    except ValueError:
+                        continue
+                if not isinstance(token, str):
+                    continue
+                expires = _jwt_expires_at(token)
+                if expires is not None and expires > time.time() + 60:
+                    self._jwt, self._jwt_expires_at = token, expires
+                    return token
+
         self._pace("auth refresh")
         response = self.browser.fetch_json(
             "/api/v1/auth/refresh",

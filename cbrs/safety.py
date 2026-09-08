@@ -13,6 +13,7 @@ class StopReason(str, Enum):
     RATE_LIMIT = "rate_limit"
     WAF_CHALLENGE = "waf_challenge"
     AUTH_REQUIRED = "auth_required"
+    SEARCH_NOT_SUBMITTED = "search_not_submitted"
     EGRESS_PREFLIGHT = "egress_preflight_failed"
     PROXY_HEALTH = "proxy_health_failed"
     TEMPORARY_UNAVAILABLE = "temporary_unavailable"

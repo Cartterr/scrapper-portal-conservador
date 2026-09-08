@@ -71,7 +71,8 @@ def test_uncertain_job_never_dispatches_owner_precondition_refusals(tmp_path, mo
     job,_=store.create_job(kind='text',input_data={'text':'test'})
     attempt=store.begin_attempt(job_id=job['job_id'],account_id='a1',quota_date=_today(),quota=20,run_id='r',consume_quota=True)
     store.finish_attempt(attempt,status='failed',safety_stop='search_outcome_unknown')
-    monkeypatch.setattr(store,'select_account',lambda **kw:pytest.fail('Must not dispatch to another owner account'))
+    selections=[]
+    monkeypatch.setattr(store,'select_account',lambda **kw: selections.append(kw) or None)
     args=dict(settings=settings,config=config,store=store,pool_store=pool,run_id='r',
               browser_pool=None,preflight_runner=None,proxy_health_runner=None)
     obj=SimpleNamespace(job_id=job['job_id'],input={},source='production')
@@ -79,11 +80,18 @@ def test_uncertain_job_never_dispatches_owner_precondition_refusals(tmp_path, mo
     store.acquire_lease(lease,'owner')
     assert process_job(obj,**args)=='waiting_capacity'
     store.release_lease(lease,'owner')
-    assert process_job(obj,**args)=='failed'
-    assert store.get_job(job['job_id'])['error_code']=='search_outcome_unknown'
+    from cbrs.owner_protocol import OwnerCommands, command_path
+    commands = OwnerCommands(command_path(settings))
+    queued = commands.submit('worker','a1','search_text',{'texto':'test'},job_id=job['job_id'])
+    assert process_job(obj,**args)=='waiting_capacity'
+    assert selections == []
+    commands.cancel_queued(queued)
+    assert process_job(obj,**args)=='waiting_capacity'
+    assert selections and 'a1' in selections[0]['excluded']
+    assert store.get_job(job['job_id'])['finished_at'] is None
     with store.connect() as db:
         assert db.execute('SELECT COUNT(*) FROM job_attempts WHERE job_id=?',(job['job_id'],)).fetchone()[0]==1
-        assert not db.execute('SELECT 1 FROM search_retry_clearance WHERE job_id=?',(job['job_id'],)).fetchone()
+        assert db.execute('SELECT 1 FROM search_retry_clearance WHERE job_id=?',(job['job_id'],)).fetchone()
 
 
 def test_search_receipt_is_atomic_and_empty_results_are_final(tmp_path, monkeypatch):
@@ -1595,9 +1603,12 @@ def test_worker_fails_over_after_account_captcha(tmp_path, monkeypatch):
     assert sum(store.usage_by_account(_today()).values()) == 1
 
 
-def test_worker_holds_unknown_search_outcome_after_browser_context_failure(
+@pytest.mark.parametrize('failure', [RuntimeError('Navigation context destroyed'),
+    SafetyStopException(StopReason.SEARCH_NOT_SUBMITTED, 'No POST observed')])
+def test_worker_immediately_fails_over_after_search_failure(
     tmp_path,
     monkeypatch,
+    failure,
 ):
     class FlakyBrowserScraper(FakeScraper):
         search_calls = 0
@@ -1605,7 +1616,7 @@ def test_worker_holds_unknown_search_outcome_after_browser_context_failure(
         def search_by_text(self, query):
             type(self).search_calls += 1
             if type(self).search_calls == 1:
-                raise RuntimeError("Target page, context or browser has been closed")
+                raise failure
             return []
 
     settings = _settings(tmp_path)
@@ -1627,8 +1638,7 @@ def test_worker_holds_unknown_search_outcome_after_browser_context_failure(
         proxy_health_runner=_gate,
     )
 
-    assert store.get_job(job["job_id"])["status"] == "waiting_capacity"
-    assert store.get_job(job["job_id"])["error_code"] == "waiting_authenticated_alternate"
+    assert store.get_job(job["job_id"])["status"] == "completed"
     with store.connect() as db:
         accounts = [
             row["account_id"]
@@ -1637,9 +1647,70 @@ def test_worker_holds_unknown_search_outcome_after_browser_context_failure(
                 (job["job_id"],),
             ).fetchall()
         ]
-    assert accounts == ["a1"]
-    assert FlakyBrowserScraper.search_calls == 1
-    assert store.search_checkpoint(job["job_id"])["uncertain"]
+    assert accounts == ["a1", "a2"]
+    assert FlakyBrowserScraper.search_calls == 2
+    assert store.search_checkpoint(job["job_id"])["saved"]
+    from cbrs.form_search import account_window
+    assert account_window(store.path, 'a1')['reserved'] == (0 if isinstance(failure, SafetyStopException) else 1)
+
+
+def test_all_uncertain_accounts_remain_pending_without_repeating_any(tmp_path, monkeypatch):
+    class AlwaysUncertain(FakeScraper):
+        calls = 0
+        def search_by_text(self, query):
+            type(self).calls += 1
+            raise RuntimeError('Response lost after submission')
+    settings, config = _settings(tmp_path), _config()
+    _credentials(monkeypatch, config)
+    store = JobStore(tmp_path / 'pool.sqlite3')
+    pool = AccountPoolStore(store.path)
+    job, _ = store.create_job(kind='text', input_data={'text': 'Authorized'})
+    run_job_worker(settings=settings, config=config, store=store, pool_store=pool,
+        once=True, scraper_factory=AlwaysUncertain, preflight_runner=_gate, proxy_health_runner=_gate)
+    result = store.get_job(job['job_id'])
+    assert result['status'] == 'waiting_capacity' and result['finished_at'] is None
+    assert AlwaysUncertain.calls == 3
+    from cbrs.form_search import account_window
+    assert all(account_window(store.path,a)['reserved'] == 1 for a in ['a1','a2','a3'])
+
+
+def test_real_chrome_navigation_failover_produces_valid_pdf(tmp_path, monkeypatch):
+    from playwright.sync_api import sync_playwright
+    from cbrs.form_search import search_fna_form
+    settings, config = _settings(tmp_path), _config()
+    _credentials(monkeypatch, config)
+    store = JobStore(tmp_path / 'pool.sqlite3')
+    pool = AccountPoolStore(store.path)
+    job, _ = store.create_job(kind='fna', input_data={'foja':1,'numero':2,'year':2026})
+    posted = []
+    with sync_playwright() as pw:
+        chrome = pw.chromium.launch(channel='chrome', headless=True)
+        class RoutedScraper(FakeScraper):
+            def search_by_fna(self, foja, numero, ano):
+                page = chrome.new_page()
+                handler = "location.href='/loading'" if self.account_id == 'a1' else "fetch('/api/v1/comercio/indice/texto',{method:'POST',body:JSON.stringify({foja:'1',numero:'2',ano:'2026'})})"
+                html = '<section aria-label="Búsqueda por foja, número y año"><input id="input-fojas"><input id="input-numero"><input id="input-ano"><button onclick="'+handler+'">Buscar</button></section>'
+                def serve(route):
+                    if route.request.method == 'POST':
+                        posted.append(self.account_id)
+                        route.fulfill(content_type='application/json',body=json.dumps([{'ticket':'local-ticket','foja':1,'numero':2,'ano':2026}]))
+                    else:
+                        route.fulfill(content_type='text/html; charset=utf-8',body=html if route.request.url.endswith('/protected') else '<p>Loading</p>')
+                page.route('http://localhost:19998/**',serve)
+                page.goto('http://localhost:19998/protected')
+                browser = SimpleNamespace(page=page,settings=SimpleNamespace(commerce_url=page.url))
+                return search_fna_form(browser,foja,numero,ano,client=None,pace=lambda _:None)
+        try:
+            run_job_worker(settings=settings,config=config,store=store,pool_store=pool,
+                once=True,scraper_factory=RoutedScraper,preflight_runner=_gate,proxy_health_runner=_gate)
+            result = store.get_job(job['job_id'])
+            assert result['status'] == 'completed' and result['completed_items'] == 1
+            assert [a['account_id'] for a in result['attempts']] == ['a1','a2']
+            assert posted == ['a2']
+            artifact = store.artifacts(job_id=job['job_id'])[0]
+            assert artifact['page_count'] == 2
+        finally:
+            chrome.close()  # Isolated synthetic test; no production context.
 
 
 def test_worker_waits_when_all_accounts_require_captcha(tmp_path, monkeypatch):

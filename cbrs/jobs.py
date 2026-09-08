@@ -1137,7 +1137,8 @@ class JobStore:
                 "AND status = 'search_completed' ORDER BY started_at LIMIT 1", (job_id,)
             ).fetchone()
             uncertain = db.execute(
-                "SELECT 1 FROM job_attempts WHERE job_id = ? AND safety_stop = 'search_outcome_unknown'",
+                "SELECT 1 FROM job_attempts WHERE job_id = ? AND safety_stop = 'search_outcome_unknown' "
+                "AND NOT EXISTS (SELECT 1 FROM search_retry_clearance WHERE job_id=job_attempts.job_id)",
                 (job_id,),
             ).fetchone()
             return {
@@ -1147,6 +1148,31 @@ class JobStore:
                 "incomplete_receipt": receipt is not None and row["result_count"] is None,
                 "uncertain": uncertain is not None and row["result_count"] is None,
             }
+
+    def authorize_alternate_search(self, job_id: str) -> bool:
+        """Allow a different account only after the previous owner is finished.
+
+        Retain uncertainty and its quota reservation. Never clear receipts or
+        authorize the same account again; begin_attempt enforces that boundary.
+        """
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT result_count,cancel_requested FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+            if not row or row['result_count'] is not None or row['cancel_requested']:
+                return False
+            if db.execute("SELECT 1 FROM job_attempts WHERE job_id=? AND (status='search_completed' OR (status='running' AND quota_consumed=1))", (job_id,)).fetchone():
+                return False
+            if db.execute('SELECT 1 FROM leases WHERE lease_name=? AND expires_at>=?',
+                          ('browser_operation:'+job_id, utc_now())).fetchone():
+                return False
+            # Older versions released these ambiguous reservations. Restore the
+            # conservative hold when admitting their explicitly requested retry.
+            db.execute("UPDATE job_attempts SET quota_consumed=1 WHERE job_id=? AND safety_stop='search_outcome_unknown'", (job_id,))
+            changed = db.execute('INSERT OR IGNORE INTO search_retry_clearance VALUES (?,?)', (job_id,utc_now())).rowcount
+            if changed:
+                self._add_event_db(db, job_id, 'alternate_search_authorized',
+                    {'same_account_retry': False, 'uncertainty_retained': True})
+            return True
 
     def add_results(
         self, job_id: str, results: list[dict[str, Any]], *, attempt_id: str | None = None,
@@ -1402,8 +1428,9 @@ class JobStore:
                 attempt
                 and int(attempt["quota_consumed"] or 0)
                 and status not in QUOTA_SUCCESS_ATTEMPT_STATUSES
+                and safety_stop != 'search_outcome_unknown'
             )
-            if release_quota and db.execute(
+            if attempt and (release_quota or safety_stop == 'search_outcome_unknown') and db.execute(
                 "SELECT 1 FROM leases WHERE lease_name=? AND expires_at>=?",
                 ("browser_operation:" + attempt["job_id"], utc_now()),
             ).fetchone():

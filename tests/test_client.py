@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import base64
+import json
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,6 +11,37 @@ from cbrs.browser_session import BrowserFetchResponse, RecaptchaSolution
 from cbrs.client import BrowserOriginClient
 from cbrs.config import load_settings
 from cbrs.safety import SafetyStopException, StopReason
+
+
+@pytest.mark.parametrize("quoted", [False, True])
+def test_document_client_reuses_portal_access_cookie_without_refresh(tmp_path, quoted):
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": time.time() + 3600}).encode()).decode().rstrip('=')
+    token = f"header.{payload}.signature"
+    browser = SimpleNamespace(
+        require_login_cookie=lambda: None,
+        export_cookies=lambda: [{"name": "auth_cbrs_token", "value": json.dumps(token) if quoted else token}],
+        fetch_json=lambda *a, **k: pytest.fail('A valid native access token must not force refresh'),
+    )
+    client = BrowserOriginClient(browser, load_settings({}, root=tmp_path))
+    assert client.ensure_auth() == token
+
+
+@pytest.mark.parametrize("value", ['bad-token', '"bad-token"', '"unterminated', 'expired'])
+def test_invalid_or_expired_native_token_still_requires_refresh(tmp_path, value):
+    if value == 'expired':
+        payload = base64.urlsafe_b64encode(json.dumps({"exp": 1}).encode()).decode().rstrip('=')
+        value = f"header.{payload}.signature"
+    calls = []
+    browser = SimpleNamespace(
+        require_login_cookie=lambda: None,
+        export_cookies=lambda: [{"name": "auth_cbrs_token", "value": value}],
+        fetch_json=lambda *a, **k: calls.append('refresh') or BrowserFetchResponse(200, {}, '{"token":"new-token"}'),
+        set_auth_cookie=lambda token: None,
+    )
+    client = BrowserOriginClient(browser, load_settings({}, root=tmp_path))
+    client._pace = lambda _: None
+    assert client.ensure_auth() == 'new-token'
+    assert calls == ['refresh']
 
 
 class FakeBrowser:

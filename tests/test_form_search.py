@@ -157,6 +157,27 @@ def test_chrome():
         browser.close()
 
 
+def test_navigation_before_commerce_post_is_safe_to_fail_over(test_chrome):
+    page = test_chrome.new_page()
+    requests = []
+    try:
+        html = HTML.replace('submitSearch()', "location.href='/loading'", 1)
+        def serve(route):
+            if route.request.method == 'POST':
+                requests.append(route.request.url)
+            route.fulfill(body=html if route.request.url.endswith('/protected') else '<p>Loading</p>',
+                          content_type='text/html; charset=utf-8')
+        page.route('http://localhost:19999/**', serve)
+        page.goto('http://localhost:19999/protected')
+        browser = SimpleNamespace(page=page, settings=SimpleNamespace(commerce_url=page.url))
+        with pytest.raises(SafetyStopException) as exc:
+            search_fna_form(browser, 1, 2, 2000, client=None, pace=lambda _: None)
+        assert exc.value.reason is StopReason.SEARCH_NOT_SUBMITTED
+        assert requests == []
+    finally:
+        page.close()
+
+
 @pytest.mark.parametrize('status,body,expected', [
     (200, [{'ticket': 'test-ticket', 'foja': 9441}], 'success'),
     (200, [], 'success'),

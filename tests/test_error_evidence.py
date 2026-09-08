@@ -57,6 +57,18 @@ def test_missing_browser_records_unavailable_without_throwing(runtime):
     assert store.get_job(job)["attempts"][0]["error_evidence"][0]["capture_status"] == "unavailable"
 
 
+def test_operation_diagnostics_allowlist_excludes_credentials(runtime):
+    from cbrs.safety import SafetyStopException, StopReason
+    store, job = runtime
+    for context in ('auth refresh', 'SECRET-token'):
+        capture_error(store, 'a1', SimpleNamespace(page=Page()),
+            SafetyStopException(StopReason.AUTH_REQUIRED, 'SECRET-body', status=401, context=context))
+    events = store.recent_events(job_id=job)
+    assert 'SECRET' not in str(events)
+    diagnostic = [e for e in events if e['event'] == 'portal_operation_error']
+    assert len(diagnostic) == 1
+
+
 def test_capture_is_bounded_and_does_not_attach_other_accounts(runtime):
     store, job = runtime
     page = Page()

@@ -1211,6 +1211,7 @@
     const stopReasonLabels = {
       auth_expired: "sesión vencida",
       auth_required: "sesión requerida",
+      search_not_submitted: "búsqueda no enviada; cambiando de cuenta",
       owner_precondition_refused: "intento no enviado: validación interna",
       search_outcome_unknown: "respuesta de búsqueda no confirmada",
       waiting_authenticated_alternate: "esperando otra cuenta autenticada",
@@ -2008,7 +2009,7 @@
           <td>${escapeHtml(job.kind)}${job.source === "endurance" ? " · endurance" : ""}</td>
           <td>${account}</td>
           <td>${documentNumber}</td>
-          <td><span class="status ${job.status === 'failed' && job.error_code !== 'document_retrieval_deferred' ? 'credentials_invalid' : escapeHtml(job.status)}" title="${escapeHtml(job.error_message || job.error_code || '')}">${escapeHtml(job.error_code === 'document_retrieval_deferred' ? 'Recuperando documento' : ['search_outcome_unknown','search_receipt_incomplete'].includes(job.error_code) ? 'Error: búsqueda no confirmada' : job.error_code === 'document_recovery_exhausted' ? 'Error: documento no recuperado' : label(job.status))}</span></td>
+          <td><span class="status ${job.status === 'failed' && job.error_code !== 'document_retrieval_deferred' ? 'credentials_invalid' : escapeHtml(job.status)}" title="${escapeHtml(job.error_message || job.error_code || '')}">${escapeHtml(job.error_code === 'document_retrieval_deferred' ? 'Recuperando documento' : job.error_code === 'waiting_authenticated_alternate' ? 'Esperando cuenta disponible' : ['search_outcome_unknown','search_receipt_incomplete','awaiting_previous_operation'].includes(job.error_code) ? 'Confirmación pendiente' : job.error_code === 'document_recovery_exhausted' ? 'Error: documento no recuperado' : label(job.status))}</span></td>
           <td>${reason}</td>
           <td>${job.result_count ?? "-"}</td>
           <td>${job.completed_items ?? 0}</td>
