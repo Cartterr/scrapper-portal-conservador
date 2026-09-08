@@ -2,7 +2,7 @@
 Description=CBRS local account-configuration request watcher
 
 [Path]
-PathExists=/var/lib/cbrs/control/account-configuration.json
+PathExists=@REPO_ROOT@/.cbrs/runtime/control/account-configuration.json
 Unit=cbrs-configuration-apply.service
 
 [Install]

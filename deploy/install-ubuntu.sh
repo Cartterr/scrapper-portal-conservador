@@ -10,9 +10,11 @@ if [[ ! -f /etc/os-release ]] || ! grep -qi '^ID=ubuntu' /etc/os-release; then
   exit 1
 fi
 
-APP_DIR="/opt/cbrs"
 PYTHON_BIN="${CBRS_PYTHON_BIN:-python3.14}"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+APP_DIR="${SOURCE_DIR}"
+STATE_DIR="${APP_DIR}/.cbrs/runtime"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -40,11 +42,11 @@ if ! getent group cbrs >/dev/null; then
   groupadd --system cbrs
 fi
 if ! id cbrs >/dev/null 2>&1; then
-  useradd --system --gid cbrs --home-dir /var/lib/cbrs --shell /usr/sbin/nologin cbrs
+  useradd --system --gid cbrs --home-dir "${STATE_DIR}" --shell /usr/sbin/nologin cbrs
 fi
 
-install -d -o cbrs -g cbrs -m 0750 /var/lib/cbrs /var/lib/cbrs/outputs /var/lib/cbrs/control /var/log/cbrs /srv/cbrs-backup
-install -d -o root -g cbrs -m 0750 /etc/cbrs
+install -d -o cbrs -g cbrs -m 0750 "${STATE_DIR}" "${STATE_DIR}"/outputs "${STATE_DIR}"/control "${STATE_DIR}/logs" "${STATE_DIR}/backup/restic"
+install -d -o root -g cbrs -m 0750 "${STATE_DIR}/secrets"
 install -d -o root -g root -m 0755 "${APP_DIR}"
 
 if [[ "${SOURCE_DIR}" != "${APP_DIR}" ]]; then
@@ -71,21 +73,16 @@ fi
 "${APP_DIR}/.venv/bin/python" -m pip install -r "${APP_DIR}/requirements.txt"
 "${APP_DIR}/.venv/bin/python" -m playwright install-deps chromium
 
-if [[ ! -f /etc/cbrs/cbrs.env ]]; then
-  install -o root -g cbrs -m 0640 "${APP_DIR}/deploy/cbrs.env.example" /etc/cbrs/cbrs.env
+if [[ ! -f "${APP_DIR}/.env" ]]; then
+  install -o root -g cbrs -m 0640 "${APP_DIR}/deploy/cbrs.env.example" "${APP_DIR}/.env"
 fi
-if [[ ! -f /var/lib/cbrs/account-pool.json ]]; then
+if [[ ! -f "${STATE_DIR}"/account-pool.json ]]; then
   install -o cbrs -g cbrs -m 0640 \
-    "${APP_DIR}/deploy/account-pool.json.example" /var/lib/cbrs/account-pool.json
+    "${APP_DIR}/deploy/account-pool.json.example" "${STATE_DIR}"/account-pool.json
 fi
 
-for unit in cbrs-display.service cbrs-x11vnc.service cbrs-novnc.service \
-            cbrs-worker.service cbrs-dashboard.service cbrs-backup.service \
-            cbrs-backup.timer cbrs-worker-resume.path cbrs-worker-resume.service \
-            cbrs-configuration-apply.path cbrs-configuration-apply.service; do
-  install -o root -g root -m 0644 "${APP_DIR}/deploy/${unit}" "/etc/systemd/system/${unit}"
-done
+"${APP_DIR}/.venv/bin/python" "${APP_DIR}/deploy/render_units.py"
 systemctl daemon-reload
 
-echo "Ubuntu runtime installed. Complete /etc/cbrs/cbrs.env and"
-echo "/var/lib/cbrs/account-pool.json, run the documented preflight, then enable services."
+echo "Ubuntu runtime installed. Complete ${APP_DIR}/.env and"
+echo "${STATE_DIR}/account-pool.json, run the documented preflight, then enable services."

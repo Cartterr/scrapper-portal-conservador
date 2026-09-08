@@ -98,8 +98,8 @@ def test_protected_configuration_preserves_special_characters(tmp_path: Path) ->
     parsed = dotenv_values(env_path)
 
     assert parsed["CBRS_ACCOUNT_1_PASSWORD"] == _payload()["accounts"][0]["password"]
-    assert parsed["RESTIC_REPOSITORY"] == "/srv/secondary/restic"
-    assert parsed["CBRS_HEADLESS"] == "1"
+    assert "RESTIC_REPOSITORY" not in parsed
+    assert parsed["CBRS_HEADLESS"] == "0"
     assert validated["accounts"][0]["proxy_provider"] == "2captcha_dedicated_isp"
     assert validated["accounts"][0]["proxy_brand"] == "2Captcha"
 
@@ -138,7 +138,7 @@ def test_account_update_preserves_blank_existing_secrets(
         '{"accounts":[{"id":"ejecutivo_1","username_env":"CBRS_ACCOUNT_1_USERNAME","password_env":"CBRS_ACCOUNT_1_PASSWORD","proxy_url_env":"CBRS_ACCOUNT_1_PROXY_URL","daily_quota":20}]}',
         encoding="utf-8",
     )
-    password_path = Path("/etc/cbrs/restic-password")
+    password_path = tmp_path / "secrets/restic-password"
     # Exercise only the account merge, avoiding a dependency on host root paths.
     original_read_text = Path.read_text
 
@@ -227,7 +227,7 @@ def test_native_windows_installer_is_repeatable_and_does_not_start_traffic() -> 
     )
 
     assert "restic.restic" in source
-    assert "C:\\ProgramData\\CBRS\\bin\\restic.exe" in source
+    assert ".cbrs\\runtime\\bin\\restic.exe" in source
     assert "Merge-DotEnvTemplate" in source
     assert "Set-CbrsSecretAcl" in source
     assert "Disable-ScheduledTask" in source

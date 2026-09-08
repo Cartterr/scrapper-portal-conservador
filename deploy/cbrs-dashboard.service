@@ -7,18 +7,19 @@ After=network.target cbrs-novnc.service
 Type=simple
 User=cbrs
 Group=cbrs
-WorkingDirectory=/opt/cbrs
-EnvironmentFile=/etc/cbrs/cbrs.env
-Environment=HOME=/var/lib/cbrs
+WorkingDirectory=@REPO_ROOT@
+EnvironmentFile=@REPO_ROOT@/.env
+Environment=HOME=@REPO_ROOT@/.cbrs/runtime
+Environment=CBRS_NOVNC_URL=http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale
 UMask=0027
-ExecStart=/opt/cbrs/.venv/bin/python -m cbrs jobs dashboard --config /var/lib/cbrs/account-pool.json --host 127.0.0.1 --port 8765
+ExecStart=@REPO_ROOT@/.venv/bin/python @REPO_ROOT@/deploy/run_with_env.py @REPO_ROOT@/.env -- @REPO_ROOT@/.venv/bin/python -m cbrs jobs dashboard --host 127.0.0.1 --port 8765
 Restart=on-failure
 RestartSec=10
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/cbrs /var/log/cbrs
+ReadWritePaths=@REPO_ROOT@/.cbrs/runtime @REPO_ROOT@/.cbrs/runtime/logs
 
 [Install]
 WantedBy=multi-user.target

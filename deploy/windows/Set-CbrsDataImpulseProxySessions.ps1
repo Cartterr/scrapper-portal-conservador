@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$EnvFile = 'C:\ProgramData\CBRS\cbrs.env',
-    [string]$PoolConfig = 'G:\CBRS\account-pool.json',
+    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
+    [string]$EnvFile = (Join-Path $RepoRoot '.env'),
+    [string]$PoolConfig = (Join-Path $RepoRoot '.cbrs\runtime\account-pool.json'),
     [string]$LocalEnvFile = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path '.env'),
     [ValidateSet('residential', 'mobile')][string]$Network = 'residential'
 )
@@ -114,7 +115,7 @@ if (@($routes.Login | Select-Object -Unique).Count -ne 1 -or @($routes.Password 
 }
 
 $timestamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
-$rollbackParent = [IO.Path]::GetFullPath('C:\ProgramData\CBRS\rollback')
+$rollbackParent = [IO.Path]::GetFullPath((Join-Path $RepoRoot '.cbrs\runtime\rollback'))
 $rollbackRoot = [IO.Path]::GetFullPath((Join-Path $rollbackParent "dataimpulse-runtime-$timestamp"))
 if (-not $rollbackRoot.StartsWith($rollbackParent, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'Rollback path escaped the protected CBRS directory.'

@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
-    [string]$EnvFile = 'C:\ProgramData\CBRS\cbrs.env',
+    [string]$EnvFile = (Join-Path $RepoRoot '.env'),
     [switch]$AcknowledgeAuthorizedLiveTraffic
 )
 
@@ -30,12 +30,12 @@ if ($existingOwners.Count -gt 0) {
     Write-Warning 'Existing CBRS worker/browser preserved. Start deferred; no process was stopped or restarted.'
     return
 }
-$readiness = Join-Path 'G:\CBRS' 'readiness\pre-live.json'
-$operationalReadiness = Join-Path 'G:\CBRS' 'readiness\operational.json'
+$readiness = Join-Path (Join-Path $RepoRoot '.cbrs\runtime') 'readiness\pre-live.json'
+$operationalReadiness = Join-Path (Join-Path $RepoRoot '.cbrs\runtime') 'readiness\operational.json'
 New-Item -ItemType Directory -Path (Split-Path -Parent $readiness) -Force | Out-Null
 & $python $runner $EnvFile -- $python -m cbrs jobs recover
 if ($LASTEXITCODE -ne 0) { throw 'Expired worker-state recovery failed. No task was started.' }
-& $python $runner $EnvFile -- $python -m cbrs readiness --target windows --env-file $EnvFile --config 'G:\CBRS\account-pool.json' --json-report $readiness
+& $python $runner $EnvFile -- $python -m cbrs readiness --target windows --env-file $EnvFile --config (Join-Path $RepoRoot '.cbrs\runtime\account-pool.json') --json-report $readiness
 if ($LASTEXITCODE -ne 0) { throw 'Native readiness failed. No task was started.' }
 
 $persistentTaskSettings = New-ScheduledTaskSettingsSet `
@@ -217,7 +217,7 @@ try {
     }
 
     if ($browserRuntimeReady) {
-        & $python $runner $EnvFile -- $python -m cbrs readiness --target windows --require-active-runtime --env-file $EnvFile --config 'G:\CBRS\account-pool.json' --json-report $operationalReadiness
+        & $python $runner $EnvFile -- $python -m cbrs readiness --target windows --require-active-runtime --env-file $EnvFile --config (Join-Path $RepoRoot '.cbrs\runtime\account-pool.json') --json-report $operationalReadiness
         if ($LASTEXITCODE -ne 0) {
             throw 'Operational readiness failed after startup.'
         }

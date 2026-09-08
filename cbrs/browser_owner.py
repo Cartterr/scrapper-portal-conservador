@@ -172,6 +172,10 @@ class BrowserOwner:
         from .runtime_updates import RuntimeUpdates
         if not self.store.acquire_lease(OWNER_LEASE, self.identity):
             raise RuntimeError("Another browser owner is active")
+        from .runtime_updates import _atomic_json
+        _atomic_json(self.commands.path.parent / 'capabilities.json', {
+            'owner': self.identity, 'retain_production_on_recovery': True,
+        })
         updates = RuntimeUpdates(Path(__file__).parent, self.commands.path.parent / "runtime-updates", owner=self.identity)
         self.commands.recover_owner_crash()
         self.commands.clear_stop()
@@ -197,6 +201,8 @@ class BrowserOwner:
 
 def main():
     import argparse
+    from .paths import prepare_environment
+    os.environ.update(prepare_environment(dict(os.environ)))
     from .config import SETTINGS
     from .account_pool import load_account_pool_config
     from .jobs import default_job_store

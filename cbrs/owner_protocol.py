@@ -16,6 +16,17 @@ OWNER_LEASE = "browser_owner"
 OPERATIONS = {"ensure", "search_fna", "search_text", "image_refs", "download_image", "recover_route"}
 
 
+def owner_preserves_recovery_contexts(settings, store):
+    """Fail closed for older owners; never trust a previous owner's marker."""
+    try:
+        lease = store.active_lease(OWNER_LEASE)
+        marker = json.loads((command_path(settings).parent / 'capabilities.json').read_text())
+        return bool(lease and marker.get('owner') == lease['owner']
+                    and marker.get('retain_production_on_recovery') is True)
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+
+
 class OwnerCommands:
     def __init__(self, path):
         self.path = Path(path)

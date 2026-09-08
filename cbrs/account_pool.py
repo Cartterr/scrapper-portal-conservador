@@ -31,7 +31,7 @@ from .validation import (
     write_validation_report,
 )
 
-DEFAULT_ACCOUNT_POOL_CONFIG = ".cbrs/account-pool.json"
+DEFAULT_ACCOUNT_POOL_CONFIG = ".cbrs/runtime/account-pool.json"
 DEFAULT_DAILY_QUOTA_PER_ACCOUNT = 20
 DEFAULT_INTERVAL_MINUTES = 5.0
 DEFAULT_DASHBOARD_HOST = "127.0.0.1"

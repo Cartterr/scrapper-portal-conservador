@@ -1,0 +1,8 @@
+[Unit]
+Description=CBRS non-destructive Linux worker watchdog
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=@REPO_ROOT@
+ExecStart=@REPO_ROOT@/.venv/bin/python @REPO_ROOT@/deploy/linux_control.py watchdog

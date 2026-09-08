@@ -2,7 +2,7 @@
 Description=CBRS local worker resume request watcher
 
 [Path]
-PathExists=/var/lib/cbrs/control/resume.request
+PathExists=@REPO_ROOT@/.cbrs/runtime/control/resume.request
 Unit=cbrs-worker-resume.service
 
 [Install]

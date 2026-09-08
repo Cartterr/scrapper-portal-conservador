@@ -7,9 +7,14 @@ import argparse
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 from dotenv import dotenv_values
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+from cbrs.paths import prepare_environment
 
 
 ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -32,6 +37,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("environment file contains an invalid key")
         if value is not None:
             environment[key] = str(value)
+    environment = prepare_environment(environment, REPO_ROOT)
+    os.chdir(REPO_ROOT)
     if os.name == "nt":
         return subprocess.run(command, env=environment, check=False).returncode
     os.execvpe(command[0], command, environment)

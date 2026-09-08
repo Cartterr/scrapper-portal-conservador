@@ -35,7 +35,6 @@ fi
 "${ROOT_DIR}/.venv/bin/python" -m pip install -r "${ROOT_DIR}/requirements.txt"
 "${ROOT_DIR}/.venv/bin/python" -m playwright install-deps chromium
 
-# The dashboard is rendered by the native Windows browser in development so it
-# can use the host monitor refresh rate. Ubuntu still owns every CBRS process.
-# deploy/windows/Start-CbrsWslHidden.vbs is the login-only host bridge.
-echo "WSL2 runtime ready. Install the Windows login bridge to open the native dashboard viewer."
+# The overview can be viewed from any host browser; all service logic is Linux.
+echo "Dependencies ready. Run sudo deploy/install-ubuntu.sh for systemd units."
+echo "On Windows, deploy/install-wsl-host.ps1 installs the logon keepalive only."

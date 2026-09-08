@@ -83,6 +83,40 @@ def test_confirmed_generic_modal_one_reload_then_quota_stop(test_chrome):
         page.close()
 
 
+def test_auth_redirect_before_post_is_not_an_uncertain_search(test_chrome):
+    from cbrs.runtime_observation import visible_login_gate
+    page = test_chrome.new_page()
+    login = '<form><input type="email"><input type="password"><button>Iniciar sesión</button></form>'
+    form = '''<section aria-label="Búsqueda por foja, número y año">
+    <input id="input-fojas"><input id="input-numero"><input id="input-ano">
+    <button onclick="location.href='/login'">Buscar</button></section>'''
+    posts = []
+    def serve(route):
+        if route.request.method == 'POST':
+            posts.append(route.request.url)
+        route.fulfill(body=login if route.request.url.endswith('/login') else form,
+                      content_type='text/html; charset=utf-8')
+    try:
+        page.route('**/*', serve)
+        page.goto('http://127.0.0.1:19999/protected')
+        browser = SimpleNamespace(page=page, settings=SimpleNamespace(commerce_url=page.url))
+        with pytest.raises(SafetyStopException) as exc:
+            search_fna_form(browser, 1, 2, 2000, client=None, pace=lambda _: None)
+        assert exc.value.reason == StopReason.AUTH_REQUIRED
+        assert visible_login_gate(page)
+        assert posts == []
+    finally:
+        page.close()
+
+
+def test_login_observation_during_navigation_is_unknown():
+    from cbrs.runtime_observation import visible_login_gate
+    class Navigating:
+        def evaluate(self, _script):
+            raise RuntimeError('Execution context was destroyed')
+    assert visible_login_gate(Navigating()) is False
+
+
 HTML = '''<section aria-label="Búsqueda por foja, número y año">
 <input id="input-fojas"><input id="input-numero"><input id="input-ano">
 <button onclick="submitSearch()">Buscar</button><button>Limpiar</button></section>

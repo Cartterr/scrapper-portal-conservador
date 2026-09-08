@@ -1210,28 +1210,7 @@ def _with_captcha_phases(
 
 
 def _request_worker_resume(settings: Settings) -> None:
-    """Start the fixed native task or signal the legacy systemd path unit.
-
-    Both routes accept no command or user-provided executable input.
-    """
-    native_state_root = settings.profile_dir.parent
-    if os.name == "nt" and native_state_root.drive.upper() == "G:":
-        present = subprocess.run(
-            ["schtasks.exe", "/Query", "/TN", "CBRS Worker"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if present.returncode == 0:
-            result = subprocess.run(
-                ["schtasks.exe", "/Run", "/TN", "CBRS Worker"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if result.returncode != 0:
-                raise RuntimeError("The native CBRS Worker task could not be started.")
-            return
+    """Signal the fixed Linux service without accepting executable input."""
     _write_control_request(settings, "resume.request", "resume\n")
 
 

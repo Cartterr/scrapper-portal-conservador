@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .config import SETTINGS, Settings
+from .paths import runtime_environment
 from .safety import redact, redact_text
 
 BACKUP_MAX_AGE_HOURS = 36
@@ -28,7 +29,7 @@ def run_backup(
     command_runner: Callable[..., Any] = subprocess.run,
 ) -> dict[str, Any]:
     """Create a consistent SQLite snapshot and append it to encrypted restic storage."""
-    runtime_env = dict(os.environ if env is None else env)
+    runtime_env = {**os.environ, **runtime_environment()} if env is None else dict(env)
     repository_configured = bool(runtime_env.get("RESTIC_REPOSITORY"))
     state_dir = settings.profile_dir.parent / "backup"
     snapshot_dir = state_dir / "snapshot"
@@ -113,7 +114,7 @@ def backup_health(settings: Settings = SETTINGS) -> dict[str, Any]:
         "last_restore_verified_at": None,
         "restored_pdf_count": None,
     }
-    repository = os.environ.get("RESTIC_REPOSITORY", "")
+    repository = runtime_environment()["RESTIC_REPOSITORY"]
     repository_path = Path(repository).expanduser() if repository else None
     if repository_path and repository_path.is_absolute() and repository_path.exists():
         repository_disk = shutil.disk_usage(repository_path)
@@ -177,7 +178,7 @@ def verify_backup_restore(
     command_runner: Callable[..., Any] = subprocess.run,
 ) -> dict[str, Any]:
     """Restore the latest encrypted snapshot into a temporary directory and validate it."""
-    runtime_env = dict(os.environ if env is None else env)
+    runtime_env = {**os.environ, **runtime_environment()} if env is None else dict(env)
     state_dir = settings.profile_dir.parent / "backup"
     status_path = state_dir / "restore-status.json"
     state_dir.mkdir(parents=True, exist_ok=True)

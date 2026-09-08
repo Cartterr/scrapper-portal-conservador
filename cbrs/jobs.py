@@ -464,6 +464,10 @@ class _PersistentAccountBrowsers:
         if current is None:
             return False
         browser = getattr(current.scraper, "browser", current.scraper)
+        if getattr(browser, 'is_remote', False):
+            from .owner_protocol import owner_preserves_recovery_contexts
+            if not owner_preserves_recovery_contexts(current.settings, self.store):
+                return False  # Keep normal same-browser login retries enabled.
         detector = getattr(browser, "has_visible_rejected_login", None)
         try:
             return bool(callable(detector) and detector())
@@ -474,28 +478,11 @@ class _PersistentAccountBrowsers:
         """Keep the exact proven browser; retain the older failed context open."""
         previous = self._entries.get(account_id)
         if previous is not None:
-            # Recheck immediately before cleanup. Only an explicitly scoped
-            # account with the complete visible failed-login signature qualifies.
-            # Never close an accepted candidate to reopen it or touch a sibling.
-            cleanup = self.can_replace_rejected_login(account_id)
-            if cleanup:
-                new_browser = getattr(entry.scraper, "browser", entry.scraper)
-                try:
-                    cleanup = new_browser.detect_commerce_auth_state() == CommerceAuthState.AUTHENTICATED_FORM
-                except Exception:
-                    cleanup = False
-            if cleanup and entry.authenticated_once:
-                try:
-                    old_browser = getattr(previous.scraper, "browser", previous.scraper)
-                    old_browser.shutdown_service_context()
-                    if hasattr(previous.manager, "__exit__"):
-                        previous.manager.__exit__(None, None, None)
-                    self.store.add_event("rejected_login_context_closed", account_id=account_id,
-                        data={"reason": "explicit_account_scope_after_candidate_authenticated"})
-                except Exception:
-                    self._retained_entries.append((account_id, previous))
-            else:
-                self._retained_entries.append((account_id, previous))
+            # Candidate authorization is NOT authorization to close the old
+            # production context, even after a later visible login rejection.
+            # Keep both exact instances; only explicit owner shutdown may close
+            # retained production contexts. No DOM uncertainty can weaken this.
+            self._retained_entries.append((account_id, previous))
         self._entries[account_id] = entry
         self._known_accounts[account_id] = (entry.settings, entry.username, entry.password)
         browser = getattr(entry.scraper, "browser", entry.scraper)
@@ -3642,6 +3629,11 @@ def _rotate_dataimpulse_route(
     written to the candidate ledger with its own failure class.
     """
     if os.environ.get("CBRS_BROWSER_OWNER_MODE") == "external" and not _owner_execution:
+        from .owner_protocol import owner_preserves_recovery_contexts
+        if not owner_preserves_recovery_contexts(settings, store):
+            store.add_event('dataimpulse_rotation_skipped', account_id=account.account_id,
+                level='warning', data={'reason': 'owner_preservation_upgrade_required'})
+            return False
         entry = browser_pool._entries.get(account.account_id)
         if entry is None or not getattr(getattr(entry.scraper, "browser", None), "is_remote", False):
             return False

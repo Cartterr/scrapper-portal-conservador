@@ -2,10 +2,16 @@
 
 ## Plataforma objetivo y configuración
 
-El objetivo de alojamiento es Linux/WSL. `.env.example` contiene rutas Linux;
-`deploy/cbrs-native.env.example` se conserva para la instalación Windows activa.
-Cambiar la plantilla no migra servicios ni sesiones existentes. No eliminar el
-entorno nativo, las tareas programadas ni Restic antes de una migración validada.
+El alojamiento activo es Linux nativo dentro de Ubuntu/WSL2, administrado por
+systemd. Chrome corre en Xvfb (sin ventanas Windows), con previews y recuperación
+noVNC en el overview. Ver [operación Linux](docs/linux-service.md).
+Los directorios son automáticos:
+todo el estado de la aplicación vive en `.cbrs/runtime/` dentro del repositorio.
+`.env` y sus ejemplos contienen opciones y credenciales, no rutas de directorios.
+Ver [ubicaciones, operación y límites del backup local](docs/repository-runtime.md).
+Los archivos de despliegue Windows anteriores son compatibilidad de rollback,
+no servicios activos. No ejecutar los instaladores nativos Windows sobre la
+instalación Linux. El único puente activo del host mantiene WSL iniciado.
 
 ## Chrome independiente del worker
 

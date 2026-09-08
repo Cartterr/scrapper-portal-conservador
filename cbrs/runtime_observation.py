@@ -8,6 +8,15 @@ PREVIEW_INTERVAL_SECONDS = 2.0
 
 
 def visible_login_gate(page):
+    # Navigation can destroy the current JS execution context between samples.
+    # That is unknown DOM, not a failed search or evidence of authentication.
+    try:
+        return _visible_login_gate(page)
+    except Exception:
+        return False
+
+
+def _visible_login_gate(page):
     """Recognize both current query-string and historical path login links."""
     if page is None:
         return False
@@ -25,7 +34,12 @@ def visible_login_gate(page):
         });
         const form=[...document.querySelectorAll('section[aria-label="Búsqueda por foja, número y año"]')]
             .some(s=>visible(s)&&['#input-fojas','#input-numero','#input-ano'].every(q=>visible(s.querySelector(q))));
-        return gate && !form;
+        const loginRoute=location.pathname==='/login'||location.pathname.startsWith('/login/');
+        const loginForm=loginRoute && [...document.querySelectorAll('form')].some(f=>
+            visible(f) && visible(f.querySelector('input[type="email"]')) &&
+            visible(f.querySelector('input[type="password"]')) &&
+            [...f.querySelectorAll('button')].some(b=>visible(b)&&text(b)==='Iniciar sesión'));
+        return (gate || loginForm) && !form;
     }""") is True
 
 
@@ -73,7 +87,7 @@ def sample_auth(self, *, account_ids=None):
                 pass
         rejected_login = False
         rejection_detector = getattr(browser, "has_visible_rejected_login", None)
-        if state is CommerceAuthState.UNKNOWN and callable(rejection_detector):
+        if state in {CommerceAuthState.UNKNOWN, CommerceAuthState.LOGIN_GATE} and callable(rejection_detector):
             try:
                 rejected_login = bool(rejection_detector())
             except Exception:

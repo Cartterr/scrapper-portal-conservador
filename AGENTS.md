@@ -1,14 +1,32 @@
 # Non-negotiable CBRS browser preservation rules
 
-## Explicit failed-login replacement exception
+## Current platform override: Linux/WSL
 
-The user authorized replacement/cleanup for the failing middle account only.
+The user authorized the Linux migration and the required Chrome/service restarts.
+The active repository is `/opt/scrapper-portal-conservador` in Ubuntu-24.04 WSL2.
+Use its Linux `.venv` and systemd services. The Windows checkout and disabled
+native scheduled tasks are rollback copies, not the active service. The only
+Windows host bridge is `CBRS WSL Host`, which keeps the distribution alive.
+Use `systemctl restart cbrs-worker` for worker-only maintenance; never restart
+`cbrs-browser-owner` or `cbrs-display` during ordinary worker changes. Preserve
+authenticated Chrome and exact proxy routes as below. Older Windows-specific
+runbook commands do not apply to the active Linux service.
+
+## Failed-login candidate recovery: no production cleanup
+
+The user revoked the old failed-login production-context cleanup exception.
+Candidate recovery never closes an existing production browser, including a
+previously authenticated context now showing a rejected login. Retain the old
+context inactive and adopt the exact successful candidate without reopening it.
+Candidate authorization now covers the two failing accounts, ejecutivo_2 and
+ejecutivo_3. Do not expand it to healthy siblings. The user authorized the
+owner restart required to activate this preservation fix on 2026-09-08.
 Use `CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS` with explicit account IDs; never
 enable a wildcard or expand it to healthy siblings. The complete visible login
 form plus the specified rejection alert is required; unknown DOM, an HTTP 400
 alone, or an authenticated search error is not permission. Keep the failed
-context until a replacement proves the protected form, then close only that
-failed context. Keep the exact successful candidate alive. Existing rotation
+context even after a replacement proves the protected form. Keep the exact
+successful candidate alive. Existing rotation
 budgets, uniqueness checks, country checks and terminal-error stops still apply.
 This exception does not authorize stopping the shared worker or healthy browsers.
 

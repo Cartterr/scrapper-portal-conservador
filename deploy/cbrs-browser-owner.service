@@ -1,0 +1,24 @@
+[Unit]
+Description=CBRS independent Linux Chrome owner
+Wants=network-online.target
+Requires=cbrs-display.service
+After=network-online.target cbrs-display.service
+
+[Service]
+Type=simple
+User=cbrs
+Group=cbrs
+WorkingDirectory=@REPO_ROOT@
+Environment=DISPLAY=:99
+Environment=HOME=@REPO_ROOT@/.cbrs/runtime
+UMask=0077
+ExecStartPre=@REPO_ROOT@/.venv/bin/python @REPO_ROOT@/deploy/linux_control.py recover-absent
+ExecStart=@REPO_ROOT@/.venv/bin/python @REPO_ROOT@/deploy/run_with_env.py @REPO_ROOT@/.env -- @REPO_ROOT@/.venv/bin/python -m cbrs.browser_owner run
+ExecStop=@REPO_ROOT@/.venv/bin/python @REPO_ROOT@/deploy/linux_control.py drain-owner
+TimeoutStopSec=180
+KillMode=process
+SendSIGKILL=no
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

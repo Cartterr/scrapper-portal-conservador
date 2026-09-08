@@ -243,6 +243,17 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
             return False
 
     submitted = False
+    observed = []
+    def request_sent(request):
+        nonlocal submitted
+        url = urlsplit(request.url)
+        if (url.scheme, url.netloc, url.path) == (origin.scheme, origin.netloc, '/api/v1/comercio/indice/texto') and request.method == 'POST':
+            submitted = True
+    def response_received(response):
+        if matches(response):
+            observed.append(response)
+    page.on('request', request_sent)
+    page.on('response', response_received)
     try:
         form = page.locator('section[aria-label="Búsqueda por foja, número y año"]')
         form.wait_for(state='visible', timeout=10000)
@@ -252,11 +263,20 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
             if field.input_value() != str(value):
                 raise RuntimeError("Search field read-back mismatch")
         pace("commerce form search")
-        # Arm the listener BEFORE the single click. Ignore recientes and unrelated requests.
-        with page.expect_response(matches, timeout=90000) as pending:
-            submitted = True
-            form.get_by_role('button', name='Buscar', exact=True).click(timeout=10000)
-        response = pending.value
+        # Listeners are armed before the single click. A click is not evidence
+        # that a search request left the browser: expired sessions redirect
+        # during the application's auth check, before its commerce POST.
+        form.get_by_role('button', name='Buscar', exact=True).click(timeout=10000)
+        import time
+        deadline = time.monotonic() + 90
+        while not observed:
+            if not submitted and runtime_module('runtime_observation').visible_login_gate(page):
+                raise SafetyStopException(StopReason.AUTH_REQUIRED,
+                    'Session expired before any commerce search request', context='commerce form search')
+            if time.monotonic() >= deadline:
+                raise TimeoutError('Commerce search response was not observed; no automatic replay')
+            page.wait_for_timeout(100)
+        response = observed[0]
         captured = SimpleNamespace(status=response.status, headers=response.all_headers(), body_text=response.text())
         try:
             ensure_safe_response(captured.status, captured.headers, captured.body_text, context="commerce form search")
@@ -291,3 +311,6 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
         notify_browser_error(browser, exc)
         # In particular, a timeout never causes another click or API replay.
         raise
+    finally:
+        page.remove_listener('request', request_sent)
+        page.remove_listener('response', response_received)

@@ -4,7 +4,7 @@ param(
     [ValidatePattern('^[A-Za-z0-9_]+$')]
     [string]$Account,
     [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
-    [string]$EnvFile = 'C:\ProgramData\CBRS\cbrs.env',
+    [string]$EnvFile = (Join-Path $RepoRoot '.env'),
     [int]$TimeoutSeconds = 900,
     [switch]$AcknowledgeAuthorizedLiveTraffic
 )

@@ -1107,7 +1107,8 @@ def cmd_readiness(args: argparse.Namespace) -> int:
         write_readiness_report,
     )
 
-    repo_root = Path.cwd().resolve()
+    from .paths import REPO_ROOT
+    repo_root = REPO_ROOT
     env_file = Path(args.env_file) if args.env_file else None
     pool_config_path = Path(args.config)
     report = build_readiness_report(

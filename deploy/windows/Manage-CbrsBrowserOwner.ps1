@@ -1,9 +1,9 @@
 [CmdletBinding()]
 param(
     [ValidateSet('Install','Start','RestartWorker','Status')][string]$Action = 'Status',
-    [string]$RepoRoot,
-    [string]$EnvFile = 'C:\ProgramData\CBRS\cbrs.env',
-    [string]$OwnerRoot = 'G:\CBRS\browser-owner',
+    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
+    [string]$EnvFile = (Join-Path $RepoRoot '.env'),
+    [string]$OwnerRoot = (Join-Path $RepoRoot '.cbrs\runtime\browser-owner'),
     [string]$OwnerTask = 'CBRS User Browser Owner',
     [string]$WorkerTask = 'CBRS User Worker'
 )

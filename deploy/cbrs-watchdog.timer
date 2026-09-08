@@ -1,0 +1,7 @@
+[Unit]
+Description=Check the CBRS worker without restarting Chrome
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=30
+[Install]
+WantedBy=timers.target

@@ -4,7 +4,7 @@ param(
     [ValidateSet('worker', 'dashboard', 'backup', 'owner')]
     [string]$Role,
     [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
-    [string]$EnvFile = 'C:\ProgramData\CBRS\cbrs.env'
+    [string]$EnvFile = (Join-Path $RepoRoot '.env')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -61,5 +61,8 @@ if ($Role -eq 'worker') {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-& $python $runner $EnvFile -- $python @arguments
+$logDirectory = Join-Path $RepoRoot '.cbrs\runtime\logs'
+New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+$roleLog = Join-Path $logDirectory ($Role + '-service.log')
+& $python $runner $EnvFile -- $python @arguments >> $roleLog 2>&1
 exit $LASTEXITCODE

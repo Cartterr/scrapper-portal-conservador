@@ -7,15 +7,14 @@ Wants=network-online.target
 Type=oneshot
 User=cbrs
 Group=cbrs
-WorkingDirectory=/opt/cbrs
-EnvironmentFile=/etc/cbrs/cbrs.env
-Environment=HOME=/var/lib/cbrs
+WorkingDirectory=@REPO_ROOT@
+EnvironmentFile=@REPO_ROOT@/.env
+Environment=HOME=@REPO_ROOT@/.cbrs/runtime
 UMask=0027
-ExecStart=/opt/cbrs/.venv/bin/python -m cbrs jobs backup
+ExecStart=@REPO_ROOT@/.venv/bin/python -m cbrs jobs backup
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-# Production uses /srv. This WSL workstation keeps its secondary encrypted
-# repository on the dedicated E: volume mounted at /mnt/e.
-ReadWritePaths=/var/lib/cbrs /var/log/cbrs -/srv/cbrs-backup -/mnt/e/cbrs-backup
+# The backup is repository-local; see the disaster-recovery limitation in docs.
+ReadWritePaths=@REPO_ROOT@/.cbrs/runtime

@@ -1,8 +1,9 @@
 [CmdletBinding()]
 param(
+    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
     [ValidateSet('capsolver')]
     [string]$Provider = 'capsolver',
-    [string]$EnvFile = 'C:\ProgramData\CBRS\cbrs.env'
+    [string]$EnvFile = (Join-Path $RepoRoot '.env')
 )
 
 $ErrorActionPreference = 'Stop'

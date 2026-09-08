@@ -72,7 +72,8 @@ def load_readiness_environment(path: Path | None) -> dict[str, str]:
 
 
 def settings_for_readiness(*, env_file: Path | None, root: Path) -> Settings:
-    return load_settings(load_readiness_environment(env_file), root=root)
+    from .paths import runtime_environment
+    return load_settings({**load_readiness_environment(env_file), **runtime_environment(root)}, root=root)
 
 
 def build_readiness_report(
@@ -445,9 +446,9 @@ def build_readiness_report(
 
     if target == "ubuntu":
         expected_paths = {
-            "profile parent": Path("/var/lib/cbrs"),
-            "output": Path("/var/lib/cbrs/outputs"),
-            "log": Path("/var/log/cbrs"),
+            "profile parent": repo_root / ".cbrs/runtime",
+            "output": repo_root / ".cbrs/runtime/outputs",
+            "log": repo_root / ".cbrs/runtime/logs",
         }
         actual_paths = {
             "profile parent": settings.profile_dir.parent,
@@ -794,6 +795,9 @@ def _build_windows_readiness_report(
 
     environment = load_readiness_environment(env_file)
     settings_environment = dict(environment)
+    from .paths import runtime_environment
+    environment.update(runtime_environment(repo_root))
+    settings_environment.update(runtime_environment(repo_root))
     configured_solver_mode = environment.get("CBRS_CAPTCHA_SOLVER_MODE", "browser")
     configured_solver_key = environment.get("CBRS_2CAPTCHA_API_KEY", "").strip()
     configured_capsolver_key = environment.get("CBRS_CAPSOLVER_API_KEY", "").strip()
@@ -869,19 +873,18 @@ def _build_windows_readiness_report(
         else "set CBRS_CAPTCHA_SOLVER_MODE to a supported manual mode",
     )
     state_root = settings.profile_dir.parent
-    output_drive = settings.output_dir.drive.upper()
     repository = Path(environment.get("RESTIC_REPOSITORY", ""))
     storage_ok = (
-        state_root.drive.upper() == "G:"
-        and output_drive == "G:"
-        and repository.drive.upper() == "E:"
+        state_root.resolve().is_relative_to(repo_root.resolve())
+        and settings.output_dir.resolve().is_relative_to(repo_root.resolve())
+        and repository.resolve().is_relative_to(repo_root.resolve())
     )
     add(
         "storage_layout",
         "pass" if storage_ok else "fail",
-        "primary state is on G: and encrypted backup repository is on E:"
+        "primary state and encrypted backup repository are repository-local"
         if storage_ok
-        else "expected primary storage on G: and restic repository on E:",
+        else "expected primary storage and restic repository inside this repository",
     )
     configured_restic = environment.get("CBRS_RESTIC_EXECUTABLE_PATH", "").strip()
     restic_executable = configured_restic or shutil.which("restic")

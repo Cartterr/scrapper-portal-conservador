@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$EnvFile = 'C:\ProgramData\CBRS\cbrs.env'
+    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
+    [string]$EnvFile = (Join-Path $RepoRoot '.env')
 )
 
 $ErrorActionPreference = 'Stop'

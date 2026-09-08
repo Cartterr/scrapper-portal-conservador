@@ -7,6 +7,7 @@ from typing import Mapping
 from urllib.parse import urlparse
 
 from dotenv import dotenv_values
+from .paths import REPO_ROOT, PATH_KEYS, runtime_environment
 
 from .dataimpulse import (
     DEFAULT_DATAIMPULSE_COUNTRY,
@@ -233,14 +234,18 @@ def load_settings(
     *,
     root: Path | None = None,
 ) -> Settings:
-    root = (root or Path.cwd()).resolve()
+    root = (root or REPO_ROOT).resolve()
+    production = env is None
     env = dict(_merged_env(root / ".env") if env is None else env)
+    if production:
+        env = {key: value for key, value in env.items() if key not in PATH_KEYS}
+        env.update(runtime_environment(root))
     request_delay = max(_request_delay_seconds(env), MIN_SAFE_DELAY_SECONDS)
     browser_backend = env.get("CBRS_BROWSER_BACKEND", DEFAULT_BROWSER_BACKEND).strip().lower()
     default_profile_dir = (
-        ".cbrs/cloak-profile"
+        ".cbrs/runtime/cloak-profile"
         if browser_backend == "cloak"
-        else ".cbrs/chrome-profile"
+        else ".cbrs/runtime/chrome-profile"
     )
 
     captcha_solver_mode = env.get(
@@ -449,7 +454,7 @@ def load_settings(
         ),
         cloak_cache_dir=_path(
             env.get("CBRS_CLOAK_CACHE_DIR"),
-            default=".cbrs/cloak-cache",
+            default=".cbrs/runtime/cache/cloak",
             root=root,
         ),
         cloak_fingerprint_seed=_empty_to_none(env.get("CBRS_CLOAK_FINGERPRINT_SEED")),
@@ -495,14 +500,14 @@ def load_settings(
         capsolver_poll_seconds=capsolver_poll_seconds,
         captcha_state_path=_path(
             env.get("CBRS_CAPTCHA_STATE_PATH"),
-            default=".cbrs/pool/pool.sqlite3",
+            default=".cbrs/runtime/pool/pool.sqlite3",
             root=root,
         ),
         account_id=None,
         proxy_recheck_seconds=proxy_recheck_seconds,
         allow_cloak_auto_update=_bool(env.get("CBRS_ALLOW_CLOAK_AUTO_UPDATE")),
-        output_dir=_path(env.get("CBRS_OUTPUT_DIR"), default="outputs", root=root),
-        log_dir=_path(env.get("CBRS_LOG_DIR"), default=".cbrs/logs", root=root),
+        output_dir=_path(env.get("CBRS_OUTPUT_DIR"), default=".cbrs/runtime/outputs", root=root),
+        log_dir=_path(env.get("CBRS_LOG_DIR"), default=".cbrs/runtime/logs", root=root),
         request_delay_seconds=request_delay,
         use_curl_cffi_for_images=_bool(env.get("CBRS_USE_CURL_CFFI_FOR_IMAGES")),
         curl_cffi_impersonate=env.get("CBRS_CURL_CFFI_IMPERSONATE", "chrome120"),

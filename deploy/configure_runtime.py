@@ -19,6 +19,11 @@ from urllib.parse import urlparse
 
 from dotenv import dotenv_values
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+from cbrs.paths import PATH_KEYS, runtime_environment
+STATE_ROOT = REPO_ROOT / ".cbrs/runtime"
+
 
 ACCOUNT_ENV_PATTERN = re.compile(
     r"^CBRS_ACCOUNT_\d+_(?:USERNAME|PASSWORD|PROXY_URL)$"
@@ -136,7 +141,7 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             if proxy_url_env in proxy_references:
                 raise ValueError("proxy environment references must be unique")
             proxy_references.add(proxy_url_env)
-        profile_dir = f"/var/lib/cbrs/accounts/{account_id}/chrome-profile"
+        profile_dir = f"{account_id}/chrome-profile"
         if profile_dir in profile_dirs:
             raise ValueError("profile directories must be unique")
         profile_dirs.add(profile_dir)
@@ -182,14 +187,14 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     raw_backup = payload.get("backup")
     if not isinstance(raw_backup, Mapping):
         raise ValueError("backup configuration is required")
-    repository = _single_line(raw_backup.get("repository"), "restic repository")
+    repository = str(STATE_ROOT / "backup/restic")
     restic_password = _single_line(raw_backup.get("password"), "restic password")
     password_file = _single_line(
-        raw_backup.get("password_file") or "/etc/cbrs/restic-password",
+        str(STATE_ROOT / "secrets/restic-password"),
         "restic password file",
     )
-    if not password_file.startswith("/"):
-        raise ValueError("restic password file must be an absolute Ubuntu path")
+    if not Path(password_file).is_absolute():
+        raise ValueError("restic password file must be absolute")
 
     return {
         "accounts": accounts,
@@ -228,8 +233,8 @@ def build_environment(
     environment.update(
         {
             "CBRS_BROWSER_BACKEND": "chrome",
-            "CBRS_BROWSER_EXECUTABLE_PATH": "/usr/bin/google-chrome-stable",
-            "CBRS_HEADLESS": "1",
+            "CBRS_BROWSER_OWNER_MODE": "external",
+            "CBRS_HEADLESS": environment.get("CBRS_HEADLESS", "0"),
             "CBRS_WINDOW_MODE": "normal",
             "CBRS_EGRESS_MODE": (
                 (
@@ -245,9 +250,6 @@ def build_environment(
                 else "dedicated_static_isp"
             ),
             "CBRS_EXPECTED_EGRESS_COUNTRY": "CL",
-            "CBRS_PROFILE_DIR": "/var/lib/cbrs/chrome-profile",
-            "CBRS_OUTPUT_DIR": "/var/lib/cbrs/outputs",
-            "CBRS_LOG_DIR": "/var/log/cbrs",
             "CBRS_NOVNC_URL": "http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale",
             "DISPLAY": ":99",
         }
@@ -257,10 +259,7 @@ def build_environment(
         environment[account["password_env"]] = account["password"]
         if account["proxy_url_env"]:
             environment[account["proxy_url_env"]] = account["proxy_url"]
-    backup = validated["backup"]
-    environment["RESTIC_REPOSITORY"] = backup["repository"]
-    environment["RESTIC_PASSWORD_FILE"] = backup["password_file"]
-    return environment
+    return {key: value for key, value in environment.items() if key not in PATH_KEYS}
 
 
 def build_pool_config(validated: Mapping[str, Any]) -> dict[str, Any]:
@@ -336,7 +335,8 @@ def apply_configuration(
 
     service = pwd.getpwnam("cbrs")
     validated = validate_payload(payload)
-    env_path = etc_dir / "cbrs.env"
+    state_dir = app_dir.resolve() / ".cbrs/runtime"
+    env_path = app_dir / ".env"
     template_path = app_dir / "deploy" / "cbrs.env.example"
     environment = build_environment(
         template_path=template_path,
@@ -344,7 +344,7 @@ def apply_configuration(
         validated=validated,
     )
     pool = build_pool_config(validated)
-    password_path = Path(validated["backup"]["password_file"])
+    password_path = state_dir / "secrets/restic-password"
 
     _atomic_write(
         env_path,
@@ -368,8 +368,8 @@ def apply_configuration(
         gid=service.pw_gid,
     )
 
-    repository = validated["backup"]["repository"]
-    if repository.startswith("/"):
+    repository = str(state_dir / "backup/restic")
+    if Path(repository).is_absolute():
         repository_path = Path(repository)
         repository_path.mkdir(parents=True, exist_ok=True)
         try:
@@ -450,8 +450,8 @@ def build_account_update_payload(
                 or prior.get("dataimpulse_port"),
             }
         )
-    repository = existing_environment.get("RESTIC_REPOSITORY") or ""
-    password_file = existing_environment.get("RESTIC_PASSWORD_FILE") or "/etc/cbrs/restic-password"
+    repository = str(state_dir / "backup/restic")
+    password_file = str(state_dir / "secrets/restic-password")
     try:
         restic_password = Path(password_file).read_text(encoding="utf-8").rstrip("\r\n")
     except OSError as exc:
@@ -481,14 +481,14 @@ def apply_account_update_request(
         raise ValueError("account configuration request must be an object")
     validated = build_account_update_payload(
         update,
-        existing_env_path=etc_dir / "cbrs.env",
+        existing_env_path=app_dir / ".env",
         state_dir=state_dir,
     )
     result = apply_configuration(
         payload={
             "accounts": validated["accounts"],
             "backup": {
-                "repository": dotenv_values(etc_dir / "cbrs.env").get("RESTIC_REPOSITORY") or "",
+                "repository": str(state_dir / "backup/restic"),
                 "password": Path(validated["backup"]["password_file"]).read_text(encoding="utf-8").rstrip("\r\n"),
                 "password_file": validated["backup"]["password_file"],
             },
@@ -503,13 +503,13 @@ def apply_account_update_request(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--app-dir", type=Path, default=Path("/opt/cbrs"))
-    parser.add_argument("--etc-dir", type=Path, default=Path("/etc/cbrs"))
-    parser.add_argument("--state-dir", type=Path, default=Path("/var/lib/cbrs"))
+    parser.add_argument("--app-dir", type=Path, default=REPO_ROOT)
+    parser.add_argument("--etc-dir", type=Path, default=REPO_ROOT)
+    parser.add_argument("--state-dir", type=Path, default=STATE_ROOT)
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--update-accounts-only", action="store_true")
     parser.add_argument(
-        "--request-file", type=Path, default=Path("/var/lib/cbrs/control/account-configuration.json")
+        "--request-file", type=Path, default=STATE_ROOT / "control/account-configuration.json"
     )
     args = parser.parse_args(argv)
     if args.update_accounts_only:

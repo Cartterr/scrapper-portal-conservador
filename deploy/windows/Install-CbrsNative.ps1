@@ -1,9 +1,9 @@
 [CmdletBinding()]
 param(
     [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
-    [string]$StateRoot = 'G:\CBRS',
-    [string]$BackupRepository = 'E:\CBRS-backup\restic',
-    [string]$EnvFile = 'C:\ProgramData\CBRS\cbrs.env',
+    [string]$StateRoot = (Join-Path $RepoRoot '.cbrs\runtime'),
+    [string]$BackupRepository = (Join-Path $RepoRoot '.cbrs\runtime\backup\restic'),
+    [string]$EnvFile = (Join-Path $RepoRoot '.env'),
     [switch]$InstallDevelopmentRequirements,
     [switch]$PlanOnly
 )
@@ -106,7 +106,7 @@ function Set-CbrsSecretAcl {
 
 if ($PlanOnly) {
     Write-Host 'Plan de instalacion CBRS nativa (sin cambios):'
-    Write-Host '1. Validar Windows, winget y discos G: (estado) y E: (backup).'
+    Write-Host '1. Validar Windows, winget y espacio disponible en el repositorio.'
     Write-Host '2. Instalar o reutilizar Python 3.14, Google Chrome y restic.'
     Write-Host '3. Crear el entorno Python e instalar requirements.txt.'
     Write-Host '4. Crear templates DataImpulse Mobile para tres cuentas aisladas.'
@@ -121,8 +121,6 @@ $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Run this installer from an elevated native Windows PowerShell session.'
 }
-if ([IO.Path]::GetPathRoot($StateRoot) -ne 'G:\') { throw 'StateRoot must be on G:\.' }
-if ([IO.Path]::GetPathRoot($BackupRepository) -ne 'E:\') { throw 'BackupRepository must be on E:\.' }
 if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
     throw 'winget is required to install native dependencies.'
 }
@@ -183,12 +181,15 @@ foreach ($path in @(
     (Join-Path $StateRoot 'logs'),
     (Join-Path $StateRoot 'readiness'),
     (Join-Path $StateRoot 'install'),
+    (Join-Path $StateRoot 'secrets'),
+    (Join-Path $StateRoot 'tmp'),
+    (Join-Path $StateRoot 'cache'),
     $BackupRepository,
-    'C:\ProgramData\CBRS\bin',
+    (Join-Path $RepoRoot '.cbrs\runtime\bin'),
     (Split-Path -Parent $EnvFile)
 )) { New-Item -ItemType Directory -Path $path -Force | Out-Null }
 
-$stableResticExecutable = 'C:\ProgramData\CBRS\bin\restic.exe'
+$stableResticExecutable = (Join-Path $RepoRoot '.cbrs\runtime\bin\restic.exe')
 if ($resticExecutable -ne $stableResticExecutable) {
     Copy-Item -LiteralPath $resticExecutable -Destination $stableResticExecutable -Force
 }
@@ -219,15 +220,9 @@ if (-not (Test-Path -LiteralPath $enduranceTarget)) {
     Copy-Item -LiteralPath (Join-Path $RepoRoot 'deploy\endurance-plan.json.example') -Destination $enduranceTarget
 }
 Merge-DotEnvTemplate -TemplatePath (Join-Path $RepoRoot 'deploy\cbrs-native.env.example') -TargetPath $EnvFile
-Set-DotEnvValue -TargetPath $EnvFile -Key 'CBRS_PROFILE_DIR' -Value (Join-Path $StateRoot 'chrome-profile')
-Set-DotEnvValue -TargetPath $EnvFile -Key 'CBRS_OUTPUT_DIR' -Value (Join-Path $StateRoot 'outputs')
-Set-DotEnvValue -TargetPath $EnvFile -Key 'CBRS_LOG_DIR' -Value (Join-Path $StateRoot 'logs')
-Set-DotEnvValue -TargetPath $EnvFile -Key 'CBRS_CAPTCHA_STATE_PATH' -Value (Join-Path $StateRoot 'pool\pool.sqlite3')
-Set-DotEnvValue -TargetPath $EnvFile -Key 'RESTIC_REPOSITORY' -Value $BackupRepository
-Set-DotEnvValue -TargetPath $EnvFile -Key 'CBRS_RESTIC_EXECUTABLE_PATH' -Value $resticExecutable
 Set-CbrsSecretAcl -Path $EnvFile
 
-$resticPasswordFile = 'C:\ProgramData\CBRS\restic-password'
+$resticPasswordFile = (Join-Path $RepoRoot '.cbrs\runtime\secrets\restic-password')
 if (-not (Test-Path -LiteralPath $resticPasswordFile)) {
     $randomBytes = [byte[]]::new(48)
     $randomGenerator = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -244,7 +239,6 @@ if (-not (Test-Path -LiteralPath $resticPasswordFile)) {
     [Array]::Clear($randomBytes, 0, $randomBytes.Length)
 }
 Set-CbrsSecretAcl -Path $resticPasswordFile
-Set-DotEnvValue -TargetPath $EnvFile -Key 'RESTIC_PASSWORD_FILE' -Value $resticPasswordFile
 Set-CbrsSecretAcl -Path $EnvFile
 
 $previousErrorPreference = $ErrorActionPreference
@@ -356,4 +350,4 @@ $installStatus = [ordered]@{
 $installStatus | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $StateRoot 'install\status.json') -Encoding utf8
 
 Write-Host 'Native CBRS runtime installed. Tasks remain disabled and no live CBRS traffic was started.'
-Write-Host 'Complete the three account/proxy values in C:\ProgramData\CBRS\cbrs.env, then run readiness.'
+Write-Host 'Complete the account/proxy values in the repository .env, then run readiness. Directories are automatic.'

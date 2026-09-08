@@ -1,8 +1,9 @@
 [CmdletBinding()]
 param(
-    [string]$EnvFile = 'C:\ProgramData\CBRS\cbrs.env',
-    [string]$PoolConfig = 'G:\CBRS\account-pool.json',
-    [string]$StateRoot = 'G:\CBRS',
+    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
+    [string]$EnvFile = (Join-Path $RepoRoot '.env'),
+    [string]$PoolConfig = (Join-Path $RepoRoot '.cbrs\runtime\account-pool.json'),
+    [string]$StateRoot = (Join-Path $RepoRoot '.cbrs\runtime'),
     [string]$SessionFile,
     [string]$AccountId,
     [switch]$RotateCurrentSessions
@@ -162,9 +163,9 @@ if ($proxyEnvNames.Count -ne $expectedSessionCount -or @($proxyEnvNames | Where-
 }
 
 $timestamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
-$rollbackRoot = Join-Path 'C:\ProgramData\CBRS\rollback' "proxy-migration-$timestamp"
+$rollbackRoot = Join-Path (Join-Path $RepoRoot '.cbrs\runtime\rollback') "proxy-migration-$timestamp"
 $resolvedRollbackRoot = [IO.Path]::GetFullPath($rollbackRoot)
-$allowedRollbackParent = [IO.Path]::GetFullPath('C:\ProgramData\CBRS\rollback')
+$allowedRollbackParent = [IO.Path]::GetFullPath((Join-Path $RepoRoot '.cbrs\runtime\rollback'))
 if (-not $resolvedRollbackRoot.StartsWith($allowedRollbackParent, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Rollback path escaped the protected CBRS directory."
 }
