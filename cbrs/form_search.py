@@ -163,6 +163,10 @@ def claim_dialog_reload(browser):
 
 
 def search_fna_form(browser, foja, numero, ano, *, client, pace):
+    from .runtime_updates import runtime_module
+    if runtime_module('runtime_observation').visible_login_gate(browser.page):
+        raise SafetyStopException(StopReason.AUTH_REQUIRED,
+            'Visible login gate before quota admission', context='commerce form search')
     path = browser_quota_path(browser)
     account_id = getattr(browser.settings, 'account_id', None)
     previous_hold = quota_hold(path, account_id) if path else None
@@ -188,6 +192,15 @@ def search_fna_form(browser, foja, numero, ano, *, client, pace):
                 clear_quota_hold(path, account_id)
             return result
         except SafetyStopException as exc:
+            if exc.reason == StopReason.AUTH_REQUIRED and due_probe and path:
+                # Admission reserved a probe, but the refreshed page never
+                # submitted it. Preserve the historical hold and restore its
+                # eligibility, without overwriting a newer concurrent check.
+                with quota_db(path) as db:
+                    db.execute('UPDATE portal_quota_holds SET next_check_at=?,probe_count=? '
+                        'WHERE account_id=? AND probe_count=?',
+                        (previous_hold['next_check_at'], previous_hold['probe_count'],
+                         account_id, previous_hold['probe_count'] + 1))
             if exc.reason == StopReason.DAILY_LIMIT:
                 if path:
                     record_quota_hold(path, account_id)
@@ -207,6 +220,10 @@ def search_fna_form(browser, foja, numero, ano, *, client, pace):
 
 def _search_fna_once(browser, foja, numero, ano, *, client, pace):
     page = browser.page
+    from .runtime_updates import runtime_module
+    if runtime_module('runtime_observation').visible_login_gate(page):
+        raise SafetyStopException(StopReason.AUTH_REQUIRED,
+            'Visible login gate before search submission', context='commerce form search')
     origin = urlsplit(browser.settings.commerce_url)
     current = urlsplit(page.url)
     if (current.scheme, current.netloc, current.path) != (origin.scheme, origin.netloc, origin.path):
@@ -225,6 +242,7 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
         except Exception:
             return False
 
+    submitted = False
     try:
         form = page.locator('section[aria-label="Búsqueda por foja, número y año"]')
         form.wait_for(state='visible', timeout=10000)
@@ -236,6 +254,7 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
         pace("commerce form search")
         # Arm the listener BEFORE the single click. Ignore recientes and unrelated requests.
         with page.expect_response(matches, timeout=90000) as pending:
+            submitted = True
             form.get_by_role('button', name='Buscar', exact=True).click(timeout=10000)
         response = pending.value
         captured = SimpleNamespace(status=response.status, headers=response.all_headers(), body_text=response.text())
@@ -264,6 +283,11 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
             raise RuntimeError("Search response did not contain a result list")
         return result
     except Exception as exc:
+        if not submitted and runtime_module('runtime_observation').visible_login_gate(page):
+            auth = SafetyStopException(StopReason.AUTH_REQUIRED,
+                'Refreshed page rendered login gate before search submission', context='commerce form search')
+            notify_browser_error(browser, auth)
+            raise auth from exc
         notify_browser_error(browser, exc)
         # In particular, a timeout never causes another click or API replay.
         raise

@@ -101,8 +101,8 @@ DataImpulse documenta los
 y su [taxonomía de errores](https://docs.dataimpulse.com/errors). La modalidad
 normal no requiere automatizar el dashboard: seleccionar otro puerto sticky
 controla la recuperación. `gw.dataimpulse.com` permanece visible al rotar: el
-puerto identifica la sesión peer y otro puerto obtiene otra salida. Las credenciales administrativas opcionales
-`DATAIMPULSE_EMAIL`/`DATAIMPULSE_PASSWORD` no son credenciales proxy ni una API.
+puerto identifica la sesión peer y otro puerto obtiene otra salida. Las credenciales
+administrativas del panel no son usadas por el runtime y no pertenecen al entorno.
 
 ## Configuración y secretos
 

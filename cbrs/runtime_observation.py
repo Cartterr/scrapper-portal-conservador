@@ -7,6 +7,28 @@ from cbrs.jobs import _browser_engine
 PREVIEW_INTERVAL_SECONDS = 2.0
 
 
+def visible_login_gate(page):
+    """Recognize both current query-string and historical path login links."""
+    if page is None:
+        return False
+    return page.evaluate("""() => {
+        const visible=e=>e && e.getClientRects().length>0 && getComputedStyle(e).visibility!=='hidden';
+        const text=e=>(e?.textContent||'').replace(/\\s+/g,' ').trim();
+        const gate=[...document.querySelectorAll('div.m3-card-outlined')].some(card=> {
+            const h=card.querySelector('h2.m3-title-large');
+            const a=[...card.querySelectorAll('a[href]')].find(a=> {
+                const u=new URL(a.getAttribute('href'),location.href);
+                return u.origin===location.origin && (u.pathname==='/login'||u.pathname.startsWith('/login/'));
+            });
+            return visible(card)&&visible(h)&&visible(a)&&text(h)==='Para acceder debe iniciar sesión'
+                &&text(a)==='Iniciar sesión'&&!!card.querySelector('a[href="/crear-cuenta"]');
+        });
+        const form=[...document.querySelectorAll('section[aria-label="Búsqueda por foja, número y año"]')]
+            .some(s=>visible(s)&&['#input-fojas','#input-numero','#input-ano'].every(q=>visible(s.querySelector(q))));
+        return gate && !form;
+    }""") is True
+
+
 def preview_interval(configured):
     return max(1.0, min(float(configured), float(PREVIEW_INTERVAL_SECONDS), 30.0))
 
@@ -43,6 +65,12 @@ def sample_auth(self, *, account_ids=None):
             )
         except Exception:
             state = CommerceAuthState.UNKNOWN
+        if state is CommerceAuthState.UNKNOWN:
+            try:
+                if visible_login_gate(browser.page):
+                    state = CommerceAuthState.LOGIN_GATE
+            except Exception:
+                pass
         rejected_login = False
         rejection_detector = getattr(browser, "has_visible_rejected_login", None)
         if state is CommerceAuthState.UNKNOWN and callable(rejection_detector):

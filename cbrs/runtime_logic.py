@@ -4,6 +4,35 @@ from cbrs import jobs as core
 from .runtime_updates import runtime_module
 
 
+def settle_owner_attempts(store, settings, job_id):
+    """Resolve the narrow reply-before-lease-release race from durable receipts."""
+    from .owner_protocol import command_path
+    import sqlite3
+    import json
+    path = command_path(settings)
+    if not path.exists():
+        return
+    with store.connect() as db:
+        if db.execute('SELECT 1 FROM leases WHERE lease_name=? AND expires_at>=?',
+                      ('browser_operation:'+job_id,core.utc_now())).fetchone():
+            return
+        rows = db.execute("SELECT attempt_id,account_id FROM job_attempts WHERE job_id=? AND status='running' AND quota_consumed=1",
+                          (job_id,)).fetchall()
+    with sqlite3.connect(f'{path.as_uri()}?mode=ro', uri=True) as db:
+        for row in rows:
+            command = db.execute("SELECT state,error FROM owner_commands WHERE job_id=? AND account=? AND operation IN ('search_fna','search_text') ORDER BY created DESC LIMIT 1",
+                                 (job_id,row['account_id'])).fetchone()
+            if not command or command[0] not in {'failed','uncertain','cancelled'}:
+                continue
+            try:
+                error = json.loads(command[1] or '{}')
+            except ValueError:
+                error = {}
+            reason = error.get('reason') if isinstance(error,dict) else None
+            reason = reason if command[0]=='failed' and reason in {r.value for r in core.StopReason} else 'search_outcome_unknown'
+            store.finish_attempt(row['attempt_id'],status='safety_stop' if reason!='search_outcome_unknown' else 'failed',safety_stop=reason)
+
+
 def finish_for_review(store, job_id, reason):
     """End only this job, retaining ambiguous receipts and live operations."""
     with store.connect() as db:
@@ -30,6 +59,11 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
     target_account_id = str(job.input.get('target_account_id') or '') if job.source == 'captcha_validation' else ''
     excluded: set[str] = {account.account_id for account in config.accounts if account.account_id != target_account_id} if target_account_id else set()
     quota_date = core.local_today()
+    settle_owner_attempts(store, settings, job.job_id)
+    with store.connect() as db:
+        excluded.update(row[0] for row in db.execute(
+            "SELECT account_id FROM job_attempts WHERE job_id=? AND safety_stop='auth_required'",
+            (job.job_id,)))
     while True:
         if store.cancel_requested(job.job_id):
             return store.finalize_job(job.job_id)
@@ -47,17 +81,13 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
             store.set_waiting(job.job_id, 'waiting_capacity', reason='search_receipt_incomplete')
             return 'waiting_capacity'
         if checkpoint['uncertain']:
-            with store.connect() as db:
-                db.execute('BEGIN IMMEDIATE')
-                in_flight = db.execute('SELECT 1 FROM leases WHERE lease_name=? AND expires_at>=?',
-                    ('browser_operation:'+job.job_id,core.utc_now())).fetchone()
-                excluded.update(row[0] for row in db.execute(
-                    "SELECT account_id FROM job_attempts WHERE job_id=? AND safety_stop='search_outcome_unknown'",(job.job_id,)))
-                if not in_flight:
-                    db.execute('INSERT OR IGNORE INTO search_retry_clearance VALUES (?,?)',(job.job_id,core.utc_now()))
-            if in_flight:
-                store.set_waiting(job.job_id,'waiting_capacity',reason='awaiting_previous_operation')
-                return 'waiting_capacity'
+            # The owner cannot execute another search while the prior outcome
+            # is unresolved. Do not dispatch doomed commands to each sibling,
+            # or turn local precondition refusals into new uncertain attempts.
+            if finish_for_review(store, job.job_id, 'search_outcome_unknown'):
+                return 'failed'
+            store.set_waiting(job.job_id,'waiting_capacity',reason='awaiting_previous_operation')
+            return 'waiting_capacity'
         if checkpoint['saved']:
             if checkpoint['result_count'] == 0:
                 return store.finalize_job(job.job_id)
@@ -138,12 +168,12 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                     except core.SafetyStopException as exc:
                         if exc.reason == core.StopReason.AUTH_REQUIRED:
                             store.finish_attempt(attempt_id, status='auth_expired', safety_stop=exc.reason.value, error=str(exc))
-                            with browser_pool.session(account.account_id, runtime_settings, username, password, force=True) as scraper:
-                                pass
-                            attempt_id = store.begin_attempt(job_id=job.job_id, account_id=account.account_id, quota_date=quota_date, quota=config.quota_for(account), run_id=run_id, consume_quota=True)
-                            if not attempt_id:
-                                continue
-                            results = core._search_job(scraper, job)
+                            attempt_id = None
+                            store.add_event('account_login_pending', job_id=job.job_id,
+                                account_id=account.account_id, data={'search_submitted': False})
+                            # The normal reconciliation loop owns bounded login
+                            # recovery. Give another account this job immediately.
+                            continue
                         else:
                             raise
                     store.clear_external_outage_backoff()

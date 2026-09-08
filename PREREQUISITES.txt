@@ -18,8 +18,6 @@ Cuentas y acceso
 - Una identidad CBRS, un perfil Chrome y un puerto proxy exclusivo por cuenta.
 - Chrome normal instalado es el navegador productivo probado; Playwright lo
   controla con perfiles persistentes y CBRS_HEADLESS=1 por defecto.
-- GoLogin y Dolphin Anty son herramientas diagnosticas opcionales. No son
-  requisitos, no son instalados y no deben poseer los perfiles del worker.
 
 DataImpulse Mobile
 ------------------

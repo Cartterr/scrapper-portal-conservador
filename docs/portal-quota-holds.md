@@ -12,6 +12,22 @@ Calendar usage records are retained for historical reporting, not admission.
 This is the service's configured policy, not a claim about CBRS reset semantics.
 Portal exhaustion holds continue to override local available capacity separately.
 
+An explicit login gate is authentication evidence, never quota exhaustion.
+The passive policy accepts both `/login?nextUrl=...` and historical `/login/...`
+links with the complete visible login card. FNA checks before admission and
+again on a pre-submission form failure, including delayed SPA rendering after
+refresh. Such failures end the attempt as `auth_required`, release its local
+reservation, and try another account for the same job. That job does not select
+the expired account again; the normal bounded background login loop handles it.
+If a due quota probe only refreshed into a login gate, its prior check deadline
+is restored without deleting the historical quota evidence.
+
+Owner replies can precede operation-lease release. At the next job cycle,
+terminal owner receipts settle leftover running attempts only after the lease
+has gone. Genuine unknown search outcomes remain distinguished from explicit
+authentication failures. The overview labels historical quota evidence with its
+detection time and presents a visible login gate as login pending.
+
 The portal's visible daily-limit message overrides local remaining-credit
 estimates. A `portal_quota_holds` row in the durable pool SQLite database holds
 that account's searches across midnight, service maintenance and PC restarts.

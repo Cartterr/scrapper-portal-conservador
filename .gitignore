@@ -16,3 +16,6 @@ __pycache__/
 .pytest_tmp/
 .playwright-mcp/
 .codex_tmp_*
+# Local diagnostics, incident repairs, and document previews.
+/tmp/
+/=

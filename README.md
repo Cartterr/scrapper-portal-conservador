@@ -1,5 +1,12 @@
 # Plataforma de Consulta Documental CBRS
 
+## Plataforma objetivo y configuración
+
+El objetivo de alojamiento es Linux/WSL. `.env.example` contiene rutas Linux;
+`deploy/cbrs-native.env.example` se conserva para la instalación Windows activa.
+Cambiar la plantilla no migra servicios ni sesiones existentes. No eliminar el
+entorno nativo, las tareas programadas ni Restic antes de una migración validada.
+
 ## Chrome independiente del worker
 
 La arquitectura opcional `CBRS_BROWSER_OWNER_MODE=external` conserva Chrome en un
@@ -108,9 +115,8 @@ El runtime de producción usa **DataImpulse Mobile Proxy** como proveedor
 de egreso primario: tres rutas sticky de Chile, un puerto distinto por cuenta y una
 duración de sesión de 120 minutos. Las URLs autenticadas se construyen solo en
 memoria desde `DATAIMPULSE_PROXY_LOGIN` y `DATAIMPULSE_PROXY_PASSWORD`; nunca se
-guardan en el pool ni se muestran en el dashboard. `DATAIMPULSE_EMAIL` y
-`DATAIMPULSE_PASSWORD`, si se configuran, son credenciales administrativas del
-panel y no credenciales proxy ni una API de rotación.
+guardan en el pool ni se muestran en el dashboard. El runtime no usa credenciales
+administrativas del panel; no deben guardarse en los archivos de entorno.
 
 Las credenciales proxy deben pertenecer al plan móvil; las credenciales del plan
 residencial o del dashboard no son intercambiables. Aunque el dashboard y Chrome

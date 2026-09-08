@@ -61,6 +61,31 @@ def test_authorized_alternate_never_reuses_uncertain_account_or_live_operation(t
     assert store.begin_attempt(**{**args,'account_id':'a3'}) is None
 
 
+def test_uncertain_job_never_dispatches_owner_precondition_refusals(tmp_path, monkeypatch):
+    from cbrs.runtime_logic import process_job
+    from types import SimpleNamespace
+    settings,config=_settings(tmp_path),_config()
+    store=JobStore(tmp_path/'pool.sqlite3')
+    pool=AccountPoolStore(store.path)
+    pool.create_run(run_id='r',dry_run=False,config=config,dashboard_url=None)
+    job,_=store.create_job(kind='text',input_data={'text':'test'})
+    attempt=store.begin_attempt(job_id=job['job_id'],account_id='a1',quota_date=_today(),quota=20,run_id='r',consume_quota=True)
+    store.finish_attempt(attempt,status='failed',safety_stop='search_outcome_unknown')
+    monkeypatch.setattr(store,'select_account',lambda **kw:pytest.fail('Must not dispatch to another owner account'))
+    args=dict(settings=settings,config=config,store=store,pool_store=pool,run_id='r',
+              browser_pool=None,preflight_runner=None,proxy_health_runner=None)
+    obj=SimpleNamespace(job_id=job['job_id'],input={},source='production')
+    lease='browser_operation:'+job['job_id']
+    store.acquire_lease(lease,'owner')
+    assert process_job(obj,**args)=='waiting_capacity'
+    store.release_lease(lease,'owner')
+    assert process_job(obj,**args)=='failed'
+    assert store.get_job(job['job_id'])['error_code']=='search_outcome_unknown'
+    with store.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM job_attempts WHERE job_id=?',(job['job_id'],)).fetchone()[0]==1
+        assert not db.execute('SELECT 1 FROM search_retry_clearance WHERE job_id=?',(job['job_id'],)).fetchone()
+
+
 def test_search_receipt_is_atomic_and_empty_results_are_final(tmp_path, monkeypatch):
     store = JobStore(tmp_path / "pool.sqlite3")
     pool = AccountPoolStore(store.path)
@@ -148,6 +173,56 @@ def test_portal_quota_hold_excludes_search_and_dashboard_credit(tmp_path, monkey
     assert account['used_today'] == 0
     assert account['remaining_today'] == payload['pool']['remaining_today'] == 0
     assert account['status'] == 'portal_quota_exhausted'
+
+
+def test_expired_login_hands_job_to_next_account_without_waiting(tmp_path, monkeypatch):
+    settings, config = _settings(tmp_path), _config()
+    _credentials(monkeypatch, config)
+    store = JobStore(tmp_path / 'pool.sqlite3')
+    pool = AccountPoolStore(store.path)
+    job, _ = store.create_job(kind='text', input_data={'text':'Authorized'})
+    searches = []
+    class Expired(FakeScraper):
+        def search_by_text(self, query):
+            searches.append(self.account_id)
+            if self.account_id == 'a1':
+                raise SafetyStopException(StopReason.AUTH_REQUIRED, 'Visible login gate')
+            return []
+    run_job_worker(settings=settings, config=config, store=store, pool_store=pool,
+        once=True, scraper_factory=Expired, preflight_runner=_gate, proxy_health_runner=_gate)
+    assert searches == ['a1', 'a2']
+    assert store.get_job(job['job_id'])['status'] == 'completed'
+    with store.connect() as db:
+        rows = db.execute('SELECT status,safety_stop FROM job_attempts WHERE job_id=? ORDER BY started_at,rowid',
+                          (job['job_id'],)).fetchall()
+    assert rows[0]['status'] == 'auth_expired'
+    assert rows[0]['safety_stop'] == 'auth_required'
+    assert not any(r['status']=='running' for r in rows)
+
+
+def test_finished_owner_reply_settles_only_after_operation_lease(tmp_path):
+    from cbrs.runtime_logic import settle_owner_attempts
+    from cbrs.owner_protocol import OwnerCommands,command_path
+    settings,config=_settings(tmp_path),_config()
+    store=JobStore(tmp_path/'pool.sqlite3')
+    pool=AccountPoolStore(store.path)
+    pool.create_run(run_id='r',dry_run=False,config=config,dashboard_url=None)
+    job,_=store.create_job(kind='text',input_data={'text':'test'})
+    attempt=store.begin_attempt(job_id=job['job_id'],account_id='a1',quota_date=_today(),quota=20,run_id='r',consume_quota=True)
+    commands=OwnerCommands(command_path(settings))
+    identity=commands.submit('w','a1','search_text',{},job_id=job['job_id'])
+    commands.claim('w')
+    commands.finish(identity,error={'reason':'auth_required'})
+    lease='browser_operation:'+job['job_id']
+    store.acquire_lease(lease,'owner')
+    settle_owner_attempts(store,settings,job['job_id'])
+    with store.connect() as db:
+        assert db.execute('SELECT status FROM job_attempts WHERE attempt_id=?',(attempt,)).fetchone()[0]=='running'
+    store.release_lease(lease,'owner')
+    settle_owner_attempts(store,settings,job['job_id'])
+    with store.connect() as db:
+        row=db.execute('SELECT status,safety_stop,quota_consumed FROM job_attempts WHERE attempt_id=?',(attempt,)).fetchone()
+    assert tuple(row)==('safety_stop','auth_required',0)
 
 
 def _settings(tmp_path: Path):

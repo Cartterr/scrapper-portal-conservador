@@ -50,3 +50,26 @@ def test_hold_survives_midnight_restart_and_only_one_due_probe(tmp_path):
     assert quota_hold(path, 'a3', now=deadline)['probe_count'] == 1
     clear_quota_hold(path, 'a3')
     assert quota_hold(path, 'a3') is None
+
+
+def test_login_after_probe_refresh_restores_probe_eligibility(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from cbrs import form_search as policy, runtime_observation
+    from cbrs.safety import SafetyStopException, StopReason
+    import pytest
+    path = tmp_path / 'quota.sqlite3'
+    past = (datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()
+    with policy.quota_db(path) as db:
+        db.execute('INSERT INTO portal_quota_holds VALUES(?,?,?,?,?,0)',('a3',past,None,past,'test'))
+    page = SimpleNamespace(evaluate=lambda _:None,reload=lambda **kw:None)
+    browser = SimpleNamespace(settings=SimpleNamespace(account_id='a3'),quota_store_path=path,page=page)
+    monkeypatch.setattr(runtime_observation,'visible_login_gate',lambda _:False)
+    monkeypatch.setattr(policy,'notify_browser_error',lambda *a:None)
+    def expired(*a,**kw):
+        raise SafetyStopException(StopReason.AUTH_REQUIRED,'Login gate')
+    monkeypatch.setattr(policy,'_search_fna_once',expired)
+    with pytest.raises(SafetyStopException):
+        policy.search_fna_form(browser,1,2,2000,client=None,pace=None)
+    hold=quota_hold(path,'a3')
+    assert hold['probe_count']==0 and hold['next_check_at']==past
+    assert hold['evidence']=='test'

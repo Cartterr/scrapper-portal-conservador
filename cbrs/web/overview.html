@@ -842,6 +842,7 @@
       <div>
         <h1>Pool de Consultas CBRS</h1>
         <div id="accountSummary" class="muted">Cuentas autorizadas · capacidad controlada</div>
+        <small id="overviewFreshness" class="muted" role="status">Comprobando datos actuales…</small>
       </div>
     </div>
     <div class="header-actions">
@@ -1144,7 +1145,7 @@
       stale: "sin latido",
       stopped: "detenido",
       waiting: "en espera",
-      waiting_capacity: "sin capacidad",
+      waiting_capacity: "esperando cuenta disponible",
       waiting_captcha: "esperando captcha",
       // Recovery route states
       configured: "configurada",
@@ -1210,6 +1211,9 @@
     const stopReasonLabels = {
       auth_expired: "sesión vencida",
       auth_required: "sesión requerida",
+      owner_precondition_refused: "intento no enviado: validación interna",
+      search_outcome_unknown: "respuesta de búsqueda no confirmada",
+      waiting_authenticated_alternate: "esperando otra cuenta autenticada",
       captcha_pending: "captcha pendiente",
       captcha_rejected: "captcha pendiente",
       credentials_invalid: "credenciales inválidas",
@@ -1386,11 +1390,21 @@
       }, delay);
     }
     async function refresh() {
-      const response = await fetch("/api/status");
-      current = await response.json();
-      render();
-      refreshBrowserPreviews().catch(console.error);
-      if (!previewRefreshTimer) schedulePreviewRefresh();
+      const freshness = document.getElementById("overviewFreshness");
+      try {
+        const response = await fetch("/api/status", { cache: "no-store", signal: AbortSignal.timeout(10000) });
+        if (!response.ok) throw new Error("Status unavailable");
+        current = await response.json();
+        render();
+        freshness.textContent = `Datos actualizados: ${new Date().toLocaleTimeString()}`;
+        freshness.style.color = "";
+        refreshBrowserPreviews().catch(console.error);
+        if (!previewRefreshTimer) schedulePreviewRefresh();
+      } catch (error) {
+        freshness.textContent = "Vista sin actualizar · el estado mostrado puede ser anterior. Reintentando…";
+        freshness.style.color = "var(--bad)";
+        throw error;
+      }
     }
     function renderStopButton(status) {
       const button = document.getElementById("stopButton");
@@ -1710,10 +1724,12 @@
           ${account.resume_at ? `<span>Habilitación prevista: ${escapeHtml(localTime(account.resume_at))}</span>` : ''}
           <small>Es una pausa temporal, no la renovación de cupo. Al vencer, la cuenta vuelve a ser elegible según el estado del servicio y la cola; no garantiza una ejecución inmediata.</small>
         </div>` : '';
-        const eligibilityLabel = quotaHold ? (quotaHold.blocked ? "Agotado en CBRS" : "Pendiente de comprobar") : phaseLabel || label(account.status);
+        const loginPending = account.browser_status === 'login_gate_visible';
+        const eligibilityLabel = loginPending ? "Login pendiente" : quotaHold ? (quotaHold.blocked ? "Límite previo · en espera" : "Pendiente de comprobar") : phaseLabel || label(account.status);
         const quotaView = quotaHold ? `<div class="quota-hold" role="status">
-          <strong>Cupo agotado en CBRS</strong>
-          <span>Consultas detenidas; navegador y sesión conservados.</span>
+          <strong>${loginPending ? 'Inicio de sesión pendiente' : 'Límite previo de CBRS · por comprobar'}</strong>
+          <span>${loginPending ? 'La sesión expiró. Recuperación automática; otros usuarios pueden atender la cola.' : 'Consultas en espera de comprobación; navegador conservado.'}</span>
+          <small>Límite registrado: ${escapeHtml(localTime(quotaHold.detected_at))}. No se deduce del estado de login actual.</small>
           <span>Próxima comprobación estimada: <b>${escapeHtml(new Date(quotaHold.next_check_at).toLocaleString('es-CL', {timeZone:'America/Santiago'}))}</b> (Chile)</span>
           <b data-quota-countdown="${escapeHtml(quotaHold.next_check_at)}">${escapeHtml(quotaCountdownText(quotaHold.next_check_at))}</b>
           <small>No es una hora de reinicio confirmada por el portal. El saldo solo se confirma tras una consulta aceptada.</small>
@@ -2326,8 +2342,12 @@
       document.getElementById("documentFoja").focus();
       setControlFeedback("Ejemplo comprobado cargado. Elige agregarlo a la cola o descargarlo ahora.");
     });
+    let requestSubmitting = false;
+    let pendingSubmission = null;
     document.getElementById("requestComposer").addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (requestSubmitting) return;
+      const form = event.currentTarget;
       const action = event.submitter?.dataset.requestAction || "queue";
       const input = document.getElementById("jobText");
       let payload;
@@ -2348,9 +2368,16 @@
         }
         payload = { kind: "fna", foja, numero, year };
       }
-      const submit = event.submitter;
-      submit.disabled = true;
+      const signature = JSON.stringify({ action, payload });
+      if (!pendingSubmission || pendingSubmission.signature !== signature) {
+        pendingSubmission = { signature, key: crypto.randomUUID() };
+      }
+      payload.idempotency_key = pendingSubmission.key;
+      const submits = [...form.querySelectorAll('[data-request-action]')];
+      requestSubmitting = true;
+      submits.forEach(button => { button.disabled = true; });
       const instant = action === "instant";
+      let created = null;
       setControlFeedback(instant ? "Priorizando la descarga y preparando el worker…" : "Agregando solicitud a la cola…");
       try {
         const response = await fetch(instant ? "/api/jobs/instant" : "/api/jobs", {
@@ -2358,9 +2385,20 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
-        if (!response.ok) throw new Error(`job request failed: ${response.status}`);
-        const created = await response.json();
-        event.currentTarget.reset();
+        if (!response.ok) {
+          const details = await response.json().catch(() => ({}));
+          const reason = details.error?.code || details.error || details.code;
+          const message = {
+            production_queue_limit_reached: "La cola está llena. Espera a que termine una solicitud.",
+            instant_jobs_disabled: "La descarga inmediata está desactivada. Puedes agregar la solicitud a la cola.",
+            invalid_request: "Revisa los datos de la solicitud.",
+          }[reason];
+          throw new Error(message || "No se pudo confirmar la solicitud. Revisa Solicitudes recientes antes de volver a enviarla.");
+        }
+        created = await response.json();
+        if (!created.job_id) { created = null; throw new Error("Respuesta sin confirmación de solicitud."); }
+        pendingSubmission = null;
+        form.reset();
         const workerMessage = instant
           ? (created.worker_requested ? " El worker se está iniciando." : " El worker ya estaba activo.")
           : "";
@@ -2368,9 +2406,16 @@
         await refresh();
         document.getElementById("jobsPanel").scrollIntoView({ behavior: "smooth", block: "start" });
       } catch (error) {
-        setControlFeedback(instant ? "No se pudo iniciar la descarga. Revisa las cuentas, cupo y estado de seguridad." : "No se pudo agregar la solicitud. Revisa que el dashboard de jobs esté activo.", true);
+        if (created) {
+          setControlFeedback(`Solicitud ${shortJobId(created.job_id)} recibida correctamente. La vista no pudo actualizarse; no necesitas enviarla otra vez.`);
+        } else {
+          setControlFeedback(error.message?.startsWith("La ") || error.message?.startsWith("Revisa ")
+            ? error.message
+            : "No se pudo confirmar la solicitud. Revisa Solicitudes recientes; si reintentas sin cambiar los datos, se reutilizará la misma solicitud.", true);
+        }
       } finally {
-        submit.disabled = false;
+        requestSubmitting = false;
+        submits.forEach(button => { button.disabled = false; });
       }
     });
     document.getElementById("accounts").addEventListener("click", (event) => {

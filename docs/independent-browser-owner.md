@@ -32,6 +32,15 @@ and timeout quota release. Stale queued commands are cancelled; interrupted
 running commands become uncertain and are never automatically replayed.
 An OS process-lifetime lock prevents duplicate owners despite expired heartbeats.
 
+Worker dispatch must enforce the same unresolved-outcome guard as the owner.
+When a job has `search_outcome_unknown`, keep it pending while an operation lease
+is active; after the lease ends, finalize it for review without dispatching more
+search commands to sibling accounts. Other queued jobs can proceed. Explicit
+pre-submission `auth_required` failures still permit account handoff. Do not
+insert automatic retry clearances to bypass the owner's unresolved-outcome guard.
+`owner_precondition_refused` in reviewed historical attempts denotes a local
+refusal before portal interaction, not CBRS rejection or consumed quota.
+
 The queue contains private queries/results/tickets, not credentials. Restrict its
 directory to the authorized Windows user, SYSTEM and Administrators. Local code
 releases remain trusted executable code, not a sandbox; no network RPC/upload

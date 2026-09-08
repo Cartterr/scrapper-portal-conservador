@@ -28,6 +28,31 @@ def test_visible_modal_signature(test_chrome, message, hidden, expected):
         page.close()
 
 
+@pytest.mark.parametrize('href', ['/login?nextUrl=/protected', '/login/encoded', '/login'])
+def test_current_login_gate_stops_before_search(test_chrome, href):
+    from cbrs.runtime_observation import visible_login_gate
+    page = test_chrome.new_page()
+    try:
+        page.goto('about:blank')
+        page.set_content(f'''<div class="m3-card-outlined"><h2 class="m3-title-large">Para acceder debe iniciar sesión</h2>
+            <a href="{href}">Iniciar sesión</a><a href="/crear-cuenta">Registro</a></div>''')
+        # Give relative URLs a normal same-origin base without network traffic.
+        page.route('http://localhost:19999/**', lambda r: r.fulfill(body=page.content()))
+        html = page.content()
+        page.unroute('http://localhost:19999/**')
+        page.route('http://localhost:19999/**', lambda r: r.fulfill(body=html, content_type='text/html; charset=utf-8'))
+        page.goto('http://localhost:19999/protected')
+        assert visible_login_gate(page)
+        browser = SimpleNamespace(page=page, settings=SimpleNamespace(commerce_url=page.url))
+        with pytest.raises(SafetyStopException) as exc:
+            search_fna_form(browser,1,2,2000,client=None,pace=lambda _:pytest.fail('No search'))
+        assert exc.value.reason == StopReason.AUTH_REQUIRED
+        page.locator('div').evaluate('(e)=>e.style.display="none"')
+        assert not visible_login_gate(page)
+    finally:
+        page.close()
+
+
 def test_confirmed_generic_modal_one_reload_then_quota_stop(test_chrome):
     page = test_chrome.new_page()
     submits, loads = [], []
@@ -72,6 +97,21 @@ async function submitSearch(){
  document.querySelector('#results').textContent=JSON.stringify(await res.json());
 }
 </script>'''
+
+
+def test_delayed_login_gate_after_refresh_is_not_unknown_search(test_chrome):
+    page=test_chrome.new_page()
+    try:
+        gate='<div class="m3-card-outlined"><h2 class="m3-title-large">Para acceder debe iniciar sesión</h2><a href="/login?nextUrl=/protected">Iniciar sesión</a><a href="/crear-cuenta">Registro</a></div>'
+        html='<script>setTimeout(()=>document.body.innerHTML='+json.dumps(gate)+',100)</script>'
+        page.route('http://localhost:19999/**',lambda r:r.fulfill(body=html,content_type='text/html; charset=utf-8'))
+        page.goto('http://localhost:19999/protected')
+        browser=SimpleNamespace(page=page,settings=SimpleNamespace(commerce_url=page.url))
+        with pytest.raises(SafetyStopException) as exc:
+            search_fna_form(browser,1,2,2000,client=None,pace=lambda _:pytest.fail('No submission'))
+        assert exc.value.reason==StopReason.AUTH_REQUIRED
+    finally:
+        page.close()
 
 
 @pytest.fixture(scope='module')
