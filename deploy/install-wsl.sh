@@ -35,6 +35,15 @@ fi
 "${ROOT_DIR}/.venv/bin/python" -m pip install -r "${ROOT_DIR}/requirements.txt"
 "${ROOT_DIR}/.venv/bin/python" -m playwright install-deps chromium
 
+sudo install -d -m 0755 /usr/local/bin
+WRAPPER_PATH="$(mktemp)"
+trap 'rm -f "${WRAPPER_PATH}"' EXIT
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' \
+  "cd '${ROOT_DIR}'" \
+  "exec '${ROOT_DIR}/.venv/bin/python' -m cbrs \"\$@\"" > "${WRAPPER_PATH}"
+sudo install -m 0755 "${WRAPPER_PATH}" /usr/local/bin/cbrs
+
 # The overview can be viewed from any host browser; all service logic is Linux.
 echo "Dependencies ready. Run sudo deploy/install-ubuntu.sh for systemd units."
 echo "On Windows, deploy/install-wsl-host.ps1 installs the logon keepalive only."
+echo "Global CLI ready: cbrs commands"

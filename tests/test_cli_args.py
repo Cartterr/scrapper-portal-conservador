@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from cbrs.cli import _runtime_headless, build_parser, cmd_pool, main, missing_fna_fields
+from cbrs.operator_cli import _display_value, cmd_services, render_overview
 
 
 def test_fna_requires_numero_and_ano() -> None:
@@ -509,3 +510,56 @@ def test_readiness_cli_can_require_active_native_runtime() -> None:
 
     assert args.target == "windows"
     assert args.require_active_runtime is True
+
+
+def test_operator_cli_parses_overview_services_and_config() -> None:
+    parser = build_parser()
+
+    overview = parser.parse_args(["overview", "--watch", "--interval", "5"])
+    service = parser.parse_args(["service", "logs", "worker", "--follow"])
+    setting = parser.parse_args(["config", "set", "CBRS_REQUEST_DELAY_SECONDS", "12"])
+
+    assert overview.watch is True and overview.interval == 5
+    assert service.service_action == "logs" and service.component == "worker"
+    assert setting.config_action == "set" and setting.key.startswith("CBRS_")
+
+
+def test_operator_config_redacts_secret_bearing_values() -> None:
+    assert _display_value("two_captcha_api_key", "very-secret") == "configurado"
+    assert _display_value("proxy_url", "http://user:pass@example.test") == "configurado"
+    assert _display_value("request_delay_seconds", 12) == "12"
+
+
+def test_compact_overview_contains_core_live_sections_without_secrets() -> None:
+    payload = {
+        "generated_at": "2026-09-09 12:00:00",
+        "services": {"worker": {"active": "active"}},
+        "jobs": {"queued": 2, "running": 1, "artifacts": 4},
+        "pool": {
+            "pool": {"used_today": 3, "daily_quota": 20, "remaining_today": 17},
+            "accounts": [{
+                "account_id": "ejecutivo_1", "status": "available",
+                "used_today": 3, "daily_quota": 20, "proxy_provider": "mobile",
+            }],
+        },
+        "recent_jobs": [{"job_id": "job-123", "status": "completed"}],
+    }
+
+    text = render_overview(payload, color=False)
+
+    assert "COLA" in text and "CUENTAS" in text and "TRABAJOS RECIENTES" in text
+    assert "ejecutivo_1" in text and "job-123" in text
+    assert "password" not in text.lower()
+
+
+def test_service_restart_refuses_session_owner_without_explicit_ack(capsys) -> None:
+    result = cmd_services(SimpleNamespace(
+        component="owner",
+        service_action="restart",
+        acknowledge_session_loss=False,
+        json=False,
+        no_color=True,
+    ))
+
+    assert result == 2
+    assert "protegen sesiones autenticadas" in capsys.readouterr().err

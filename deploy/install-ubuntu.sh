@@ -45,6 +45,13 @@ if ! id cbrs >/dev/null 2>&1; then
   useradd --system --gid cbrs --home-dir "${STATE_DIR}" --shell /usr/sbin/nologin cbrs
 fi
 
+# Let the interactive WSL operator inspect repository-local state without
+# running the whole console as root. A new shell is required after first install.
+OPERATOR_USER="${SUDO_USER:-}"
+if [[ -n "${OPERATOR_USER}" && "${OPERATOR_USER}" != "root" ]]; then
+  usermod -a -G cbrs "${OPERATOR_USER}"
+fi
+
 install -d -o cbrs -g cbrs -m 0750 "${STATE_DIR}" "${STATE_DIR}"/outputs "${STATE_DIR}"/control "${STATE_DIR}/logs" "${STATE_DIR}/backup/restic"
 install -d -o root -g cbrs -m 0750 "${STATE_DIR}/secrets"
 install -d -o root -g root -m 0755 "${APP_DIR}"
@@ -84,5 +91,35 @@ fi
 "${APP_DIR}/.venv/bin/python" "${APP_DIR}/deploy/render_units.py"
 systemctl daemon-reload
 
+# Stable global entrypoint: callers can use `cbrs` from any WSL directory while
+# Python imports and repository-relative configuration stay bound to this install.
+cat > /usr/local/bin/cbrs <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd '${APP_DIR}'
+exec '${APP_DIR}/.venv/bin/python' -m cbrs "\$@"
+EOF
+chmod 0755 /usr/local/bin/cbrs
+
+install -d -m 0755 /usr/local/share/bash-completion/completions
+cat > /usr/local/share/bash-completion/completions/cbrs <<'EOF'
+_cbrs_complete() {
+  local commands="overview service config accounts health commands doctor preflight readiness captcha-health init search download validate captcha-test soak pool jobs"
+  local services="owner worker dashboard display novnc backup watchdog all"
+  if [[ ${COMP_CWORD} -eq 1 ]]; then
+    COMPREPLY=( $(compgen -W "${commands}" -- "${COMP_WORDS[COMP_CWORD]}") )
+  elif [[ ${COMP_CWORD} -eq 2 && ${COMP_WORDS[1]} == service ]]; then
+    COMPREPLY=( $(compgen -W "status start stop restart logs" -- "${COMP_WORDS[COMP_CWORD]}") )
+  elif [[ ${COMP_CWORD} -eq 3 && ${COMP_WORDS[1]} == service ]]; then
+    COMPREPLY=( $(compgen -W "${services}" -- "${COMP_WORDS[COMP_CWORD]}") )
+  fi
+}
+complete -F _cbrs_complete cbrs
+EOF
+
 echo "Ubuntu runtime installed. Complete ${APP_DIR}/.env and"
 echo "${STATE_DIR}/account-pool.json, run the documented preflight, then enable services."
+echo "Global CLI installed: cbrs commands"
+if [[ -n "${OPERATOR_USER}" && "${OPERATOR_USER}" != "root" ]]; then
+  echo "Open a new WSL shell once so ${OPERATOR_USER} receives cbrs group access."
+fi

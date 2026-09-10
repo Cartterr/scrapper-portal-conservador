@@ -1138,6 +1138,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI colors in operator-oriented output",
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         help="Run browser headless after a persistent profile has been initialized",
@@ -1160,6 +1165,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    from .operator_cli import add_operator_parsers
+    add_operator_parsers(subparsers)
 
     init_parser = subparsers.add_parser("init", help="Open browser for manual login")
     init_parser.add_argument(
@@ -1624,6 +1632,24 @@ def main(argv: list[str] | None = None) -> int:
     validate_fna_args(args, parser)
 
     try:
+        if args.command == "overview":
+            from .operator_cli import cmd_overview
+            return cmd_overview(args)
+        if args.command == "service":
+            from .operator_cli import cmd_services
+            return cmd_services(args)
+        if args.command == "config":
+            from .operator_cli import cmd_config
+            return cmd_config(args)
+        if args.command == "accounts":
+            from .operator_cli import cmd_accounts
+            return cmd_accounts(args)
+        if args.command == "health":
+            from .operator_cli import cmd_health
+            return cmd_health(args)
+        if args.command == "commands":
+            from .operator_cli import cmd_commands
+            return cmd_commands(args)
         if args.command == "doctor":
             return cmd_doctor()
         if args.command == "captcha-health":

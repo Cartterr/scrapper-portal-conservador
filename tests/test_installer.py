@@ -16,6 +16,16 @@ from cbrs.readiness import REQUIRED_SOURCE_FILES
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_linux_installers_register_global_cbrs_cli() -> None:
+    ubuntu = (ROOT / "deploy" / "install-ubuntu.sh").read_text(encoding="utf-8")
+    wsl = (ROOT / "deploy" / "install-wsl.sh").read_text(encoding="utf-8")
+
+    for installer in (ubuntu, wsl):
+        assert "/usr/local/bin/cbrs" in installer
+        assert "-m cbrs" in installer
+    assert "bash-completion/completions/cbrs" in ubuntu
+
+
 def test_native_env_templates_keep_exact_key_parity() -> None:
     def keys(path: Path) -> set[str]:
         return {

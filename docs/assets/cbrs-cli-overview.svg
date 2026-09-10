@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="570" viewBox="0 0 1040 570" role="img" aria-labelledby="title desc">
+  <title id="title">Vista previa del panel CLI CBRS</title>
+  <desc id="desc">Terminal compacta con servicios, cola, cupos, cuentas y trabajos recientes.</desc>
+  <rect width="1040" height="570" rx="16" fill="#111827"/>
+  <rect width="1040" height="42" rx="16" fill="#1f2937"/>
+  <circle cx="24" cy="21" r="7" fill="#fb7185"/><circle cx="48" cy="21" r="7" fill="#fbbf24"/><circle cx="72" cy="21" r="7" fill="#34d399"/>
+  <text x="520" y="27" fill="#9ca3af" text-anchor="middle" font-family="monospace" font-size="14">Ubuntu-24.04 — cbrs overview --watch</text>
+  <g font-family="Consolas,DejaVu Sans Mono,monospace" font-size="17">
+    <text x="28" y="78" fill="#f9fafb" font-weight="bold">CBRS</text><text x="86" y="78" fill="#22d3ee">OPERADOR</text><text x="235" y="78" fill="#6b7280">2026-09-09 16:42:08</text>
+    <line x1="28" y1="94" x2="1010" y2="94" stroke="#374151"/>
+    <text x="28" y="124" fill="#9ca3af">OWNE</text><text x="83" y="124" fill="#34d399">active</text>
+    <text x="175" y="124" fill="#9ca3af">WORK</text><text x="230" y="124" fill="#34d399">active</text>
+    <text x="322" y="124" fill="#9ca3af">DASH</text><text x="377" y="124" fill="#34d399">active</text>
+    <text x="469" y="124" fill="#9ca3af">DISP</text><text x="524" y="124" fill="#34d399">active</text>
+    <text x="616" y="124" fill="#9ca3af">BACK</text><text x="671" y="124" fill="#34d399">active</text>
+    <text x="28" y="169" fill="#60a5fa">COLA</text><text x="91" y="169" fill="#d1d5db">pendientes</text><text x="205" y="169" fill="#fbbf24">2</text><text x="239" y="169" fill="#d1d5db">ejecutando</text><text x="364" y="169" fill="#22d3ee">1</text><text x="400" y="169" fill="#d1d5db">PDFs</text><text x="462" y="169" fill="#34d399">45</text>
+    <text x="28" y="201" fill="#60a5fa">CUPO</text><text x="91" y="201" fill="#d1d5db">usado 17/60</text><text x="235" y="201" fill="#d1d5db">disponible</text><text x="350" y="201" fill="#34d399">43</text>
+    <text x="28" y="248" fill="#60a5fa">CUENTAS</text><text x="208" y="248" fill="#9ca3af">ESTADO</text><text x="390" y="248" fill="#9ca3af">USO</text><text x="486" y="248" fill="#9ca3af">RUTA</text><text x="670" y="248" fill="#9ca3af">ÚLTIMO EVENTO</text>
+    <text x="48" y="280" fill="#f3f4f6">ejecutivo_1</text><text x="208" y="280" fill="#34d399">available</text><text x="390" y="280" fill="#f3f4f6">12/20</text><text x="486" y="280" fill="#f3f4f6">mobile</text><text x="670" y="280" fill="#d1d5db">PDF completado</text>
+    <text x="48" y="312" fill="#f3f4f6">ejecutivo_2</text><text x="208" y="312" fill="#fbbf24">cooldown</text><text x="390" y="312" fill="#f3f4f6">5/20</text><text x="486" y="312" fill="#f3f4f6">mobile</text><text x="670" y="312" fill="#d1d5db">espera controlada</text>
+    <text x="48" y="344" fill="#f3f4f6">ejecutivo_3</text><text x="208" y="344" fill="#34d399">available</text><text x="390" y="344" fill="#f3f4f6">0/20</text><text x="486" y="344" fill="#f3f4f6">mobile</text><text x="670" y="344" fill="#d1d5db">sesión protegida</text>
+    <text x="28" y="393" fill="#60a5fa">TRABAJOS RECIENTES</text><text x="310" y="393" fill="#9ca3af">ESTADO</text><text x="486" y="393" fill="#9ca3af">CUENTA</text><text x="670" y="393" fill="#9ca3af">ID</text>
+    <text x="48" y="425" fill="#34d399">completed</text><text x="310" y="425" fill="#f3f4f6">ejecutivo_1</text><text x="486" y="425" fill="#d1d5db">job-20260909T1938…</text>
+    <text x="48" y="457" fill="#22d3ee">running</text><text x="310" y="457" fill="#f3f4f6">ejecutivo_1</text><text x="486" y="457" fill="#d1d5db">job-20260909T1941…</text>
+    <text x="48" y="489" fill="#fbbf24">queued</text><text x="310" y="489" fill="#f3f4f6">-</text><text x="486" y="489" fill="#d1d5db">job-20260909T1942…</text>
+    <text x="28" y="538" fill="#6b7280">Actualización: cbrs overview --watch   Ayuda: cbrs commands</text>
+  </g>
+</svg>

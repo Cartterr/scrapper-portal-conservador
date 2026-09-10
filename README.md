@@ -1,5 +1,37 @@
 # Plataforma de Consulta Documental CBRS
 
+## Operación principal por CLI
+
+El servicio de `master` se puede operar completamente desde una terminal
+Ubuntu/WSL con el comando global `cbrs`. El panel compacto muestra en vivo los
+servicios, la cola, cupos, cuentas y trabajos recientes sin depender del
+overview web.
+
+![Vista previa del panel CLI CBRS](docs/assets/cbrs-cli-overview.svg)
+
+_Vista ilustrativa con identificadores y estados de ejemplo; la terminal real
+lee el estado local en cada actualización._
+
+Instalación inicial en el checkout activo:
+
+```bash
+cd /opt/scrapper-portal-conservador
+bash deploy/install-wsl.sh
+sudo bash deploy/install-ubuntu.sh
+# abrir una terminal WSL nueva
+cbrs config validate
+cbrs health
+cbrs overview --watch
+```
+
+- [Onboarding paso a paso para el operador](docs/cli-onboarding.md)
+- [Referencia completa y lista de todos los comandos](docs/cli-reference.md)
+
+`cbrs commands` muestra el mapa rápido desde cualquier directorio. El instalador
+registra `/usr/local/bin/cbrs` y el autocompletado Bash. La CLI usa exactamente
+el mismo runtime, cola, cuentas y controles del servicio. El overview web se
+mantiene disponible e intacto para diagnóstico.
+
 ## Plataforma objetivo y configuración
 
 El alojamiento activo es Linux nativo dentro de Ubuntu/WSL2, administrado por
