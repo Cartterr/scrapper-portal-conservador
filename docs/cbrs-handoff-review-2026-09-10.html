@@ -760,12 +760,33 @@ footer { border-top: 1px solid var(--rule); padding-top: 18px; font-size: 0.84re
       </table>
     </div>
     <ul class="plain">
-      <li><strong>Idle sessions recover on their own.</strong> <span class="mono">ejecutivo_1</span> and <span class="mono">ejecutivo_3</span> had been idle for about three hours with expired access tokens. Loading the page refreshed them (HTTP 200) and showed the logged-in search form, with no new login.</li>
+      <li><strong>Idle sessions recover on their own.</strong> <span class="mono">ejecutivo_1</span> and <span class="mono">ejecutivo_3</span> had been idle for about three hours with expired access tokens; loading the page refreshed them (HTTP 200) with no new login. A 10-hour idle test (below) confirmed the same over a longer gap.</li>
       <li><strong>Sessions survive closing Chrome.</strong> The tokens live in each account's saved profile, so the browser does not need to stay open; the profile folder does need to be kept.</li>
       <li><strong>Sessions are not tied to the exit IP.</strong> <span class="mono">ejecutivo_2</span>'s session was accepted through a different proxy exit from the one it logged in on, twice. A proxy port changing its exit (DataImpulse keeps one exit for up to 120 minutes) does not log the account out. Refreshing through a different exit was not tested.</li>
       <li><strong>To keep a login indefinitely</strong>, load the protected page (which refreshes the tokens) at least once every seven days per account, through that account's proxy, and never log in again while a session exists. Every few hours or once a day is ample and uses no searches.</li>
     </ul>
-    <p class="prose muted">Not yet known: whether the portal ends a session 14 days after login regardless of refreshes (the “stay signed in” marker suggests it might), whether idle periods longer than three hours behave the same, and whether logging in to the same account elsewhere ends the session here. A refresh token with a “family” identifier usually means that reusing an older copy revokes the whole login, so each profile should be used by one process at a time and never restored from an old copy.</p>
+    
+    <div class="section-head" style="margin-top:8px">
+      <h3 style="font-family:var(--font-body);font-size:0.95rem;letter-spacing:0.02em">10-hour monitoring, 11 Sep (04:24–14:24 UTC)</h3>
+      <p class="muted">Two accounts were loaded once an hour to keep them warm; one was left untouched as an idle control and checked only at the end. Each load refreshes the login, so this measures a repeated keep-alive, and separately whether an untouched session survives 10 hours.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Account</th><th>Regime</th><th class="num">Logged in</th><th>Refresh token</th><th>Result</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">ejecutivo_1</td><td>Hourly keep-alive</td><td class="num">11 / 11</td><td>Reset to 7 days each hour</td><td>Never dropped; refreshed cleanly every check.</td></tr>
+          <tr><td class="mono">ejecutivo_2</td><td>Hourly keep-alive</td><td class="num">9 / 11</td><td>Stayed valid throughout</td><td>Two loads failed (an “unknown” page, one 60 s timeout); each recovered by itself on the next check. The session was never lost.</td></tr>
+          <tr><td class="mono">ejecutivo_3</td><td>Idle control (untouched 10 h)</td><td class="num">1 / 1</td><td>Renewed on the single end check</td><td>Still logged in after 10 hours idle; the page silently obtained a new token on first load.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <ul class="plain">
+      <li><strong>An idle session survives 10 hours.</strong> <span class="mono">ejecutivo_3</span> was not touched at all and was still logged in at the end. Idle time, on its own, does not end a session.</li>
+      <li><strong>The 14-day marker never moved.</strong> Across all 21 checks, each account's <span class="mono">auth_cbrs_stay_signed_in</span> stayed fixed at its original login time (Sep 25), whether the account was refreshed hourly or left idle. This still points to a hard 14-day cap from login, to be confirmed around 25 Sep.</li>
+      <li><strong><span class="mono">ejecutivo_2</span>'s weakness is at page load, not session-holding.</strong> Once it holds a session it keeps it as reliably as the others; the occasional failed load through its proxy recovers on retry, which the worker already does.</li>
+    </ul>
+
+    <p class="prose muted">Still open after the 10-hour test: whether the portal ends a session 14 days after login regardless of refreshes (the “stay signed in” marker suggests it might), whether idle periods longer than three hours behave the same, and whether logging in to the same account elsewhere ends the session here. A refresh token with a “family” identifier usually means that reusing an older copy revokes the whole login, so each profile should be used by one process at a time and never restored from an old copy.</p>
   </section>
 
   <section class="stack-lg" aria-labelledby="cases-h">
@@ -841,7 +862,7 @@ footer { border-top: 1px solid var(--rule); padding-top: 18px; font-size: 0.84re
     <ol class="recs">
       <li><div><strong>Confirm the per-account daily limit with CBRS</strong> and set the code's quota to it. At the observed 7–9, 30 cases a day needs four to five working accounts, not three.</div></li>
       <li><div><strong>Fix submission detection before moving a case to another account</strong> (P6), so a case is never charged to two accounts. This is the cheapest capacity gain available.</div></li>
-      <li><div><strong>Treat logins as the scarce step and keep sessions alive.</strong> <span class="mono">ejecutivo_2</span> logged in on 1 of 19 proxy attempts, but once logged in its session was accepted through other exits. Log in rarely and patiently (one attempt per exit, minutes apart), reuse the session instead of logging in again (it renews for seven days on every refresh; one process per profile), and ask CBRS how they assess logins from mobile or proxy connections.</div></li>
+      <li><div><strong>Treat logins as the scarce step and keep sessions alive.</strong> <span class="mono">ejecutivo_2</span> logged in on 1 of 19 proxy attempts, but once logged in its session was accepted through other exits. Log in rarely and patiently (one attempt per exit, minutes apart), reuse the session instead of logging in again (it renews for seven days on every refresh, holds through at least 10 hours idle, and needs only one page load inside every 7 days; one process per profile), and ask CBRS how they assess logins from mobile or proxy connections.</div></li>
       <li><div><strong>Make it usable as a component:</strong> read credentials from the configuration file, document one supported way to run it without the service, and remove the contradictory templates and platform instructions.</div></li>
       <li><div><strong>Re-run the remaining 19 cases</strong> after the accounts' limits lift, and repeat the load test once the fixes above are in, to measure a clean per-account figure.</div></li>
     </ol>
