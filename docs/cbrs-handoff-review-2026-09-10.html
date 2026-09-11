@@ -440,7 +440,7 @@ footer { border-top: 1px solid var(--rule); padding-top: 18px; font-size: 0.84re
   <section class="verdict" aria-labelledby="verdict-h">
     <span class="eyebrow">Summary</span>
     <h2 id="verdict-h">It works end to end, but it delivered 11 of 30 cases, and at the observed limits it cannot reach 30 in a day with three accounts.</h2>
-    <p>Login, search, page download and PDF assembly all work: 13 valid PDFs came out of the review (11 of the 30 requested cases plus 2 earlier test cases). Getting there required six fixes and workarounds to the delivered setup. Three things then capped the volume: the portal stopped each working account after 7–9 searches, not the 20 per account the configuration assumes; one of the three accounts was refused at login every time it went through the proxies, although it logs in normally without one; and the retry logic spent daily searches twice on the same case.</p>
+    <p>Login, search, page download and PDF assembly all work: 13 valid PDFs came out of the review (11 of the 30 requested cases plus 2 earlier test cases). Getting there required six fixes and workarounds to the delivered setup. Three things then capped the volume: the portal stopped each working account after 7–9 searches, not the 20 per account the configuration assumes; one of the three accounts was refused at login on almost every proxy exit (1 success in 19 attempts), although it logs in normally without one; and the retry logic spent daily searches twice on the same case.</p>
   </section>
 
   <div class="figures" role="list">
@@ -454,7 +454,7 @@ footer { border-top: 1px solid var(--rule); padding-top: 18px; font-size: 0.84re
     </div>
     <div class="figure" role="listitem">
       <span class="num">1<small> / 3</small></span>
-      <span class="lbl">account refused at login through every proxy route tried, though its credentials work</span>
+      <span class="lbl">account refused at login on almost every proxy exit: 1 success in 19 attempts, though its credentials work</span>
     </div>
     <div class="figure" role="listitem">
       <span class="num">34</span>
@@ -493,6 +493,7 @@ footer { border-top: 1px solid var(--rule); padding-top: 18px; font-size: 0.84re
       <li><time>22:07</time><div class="what"><strong><span class="mono">ejecutivo_3</span> hit the portal's daily limit.</strong><span>7 accepted searches; the stuck test case 47092 was among them.</span></div></li>
       <li><time>22:08–22:16</time><div class="what"><strong>No account could search; the run was ended with 19 of 30 cases still queued.</strong><span><span class="mono">ejecutivo_2</span> was still being rejected at login. The code estimates the two limits lift around 21:20 and 21:59 on 11 Sep; the portal does not confirm a reset time.</span></div></li>
       <li><time>11 Sep</time><div class="what"><strong>Follow-up: <span class="mono">ejecutivo_2</span> logs in without a proxy, but not through one.</strong><span>One login straight from the workstation's own Chilean connection succeeded on the first try (HTTP 200). One login minutes later through the proxy exit that <span class="mono">ejecutivo_1</span> logs in through without trouble (port 10000) was refused with the same generic message.</span></div></li>
+      <li><time>11 Sep</time><div class="what"><strong>Proxy probe: <span class="mono">ejecutivo_2</span> logs in on the 8th fresh exit.</strong><span>Between 00:35 and 00:51, first a session check: the session from the direct login was still accepted through the account's own proxy port. Then one forced login per new port, two minutes apart: 6 refused with the generic message, 1 where the login page never loaded, and the 8th logged in (HTTP 200).</span></div></li>
     </ol>
   </section>
 
@@ -630,11 +631,12 @@ footer { border-top: 1px solid var(--rule); padding-top: 18px; font-size: 0.84re
           <span class="ref">P10</span>
           <div class="body">
             <div class="tags"><span class="chip portal">Portal</span><span class="chip open">Open</span></div>
-            <h3>One account is refused at login through the proxies, but its credentials work</h3>
+            <h3>One account is refused at login on most proxy exits, though its credentials work</h3>
             <dl>
               <dt>What happened</dt><dd>During the runs, <span class="mono">ejecutivo_2</span> was rejected 11 times with HTTP 400 and the portal's generic <code>intente-mas-tarde</code> (“try again later”) code: on its own proxy port and on three replacement ports the code tried automatically (12595, 15432, 14154).</dd>
               <dt>Follow-up tests</dt><dd>On 11 Sep the same account logged in on the first try from the workstation's own Chilean connection, with no proxy (HTTP 200). Minutes later, a login through the exact proxy exit that <span class="mono">ejecutivo_1</span> logs in through without trouble (port 10000) was refused with the same generic message.</dd>
-              <dt>What it means</dt><dd>The username and password are correct and the account is active. The portal refuses this account specifically when it arrives through a DataImpulse mobile exit, and it does not say why: every refusal carries the same “refresque la página e intente nuevamente” text. Likely factors are the portal's risk scoring of each login for proxy connections and the day's repeated failed attempts, but that cannot be confirmed from outside.</dd>
+              <dt>Proxy probe</dt><dd>A controlled probe then tried one login per fresh DataImpulse exit, two minutes apart. Six were refused with the same generic message, on exits of four different carriers (WOM, Telefónica, Telmex, Entel); one failed before the login page loaded; the eighth, a WOM exit in Santiago, logged in normally (HTTP 200). Before that, the session from the direct login was still accepted through the account's own proxy port, so the portal does not tie a session to the connection it started on.</dd>
+              <dt>What it means</dt><dd>The credentials are correct and the account can work through proxies, but its logins succeed on very few exits: 1 in 19 proxy attempts across the review, while the other two accounts were usually accepted. The carrier is not the deciding factor, since WOM exits were both refused and accepted. The refusal is made by the portal's application, not its firewall: every request passed the Imperva service in front of the site, Google's reCAPTCHA loaded normally each time, and the refusal came back as the application's own error message. That pattern is most consistent with a risk score computed for each login attempt (for example reCAPTCHA Enterprise, which the portal uses) that this account fails far more often than the others, possibly because of its history of failed attempts. The portal never states the reason, so this remains an inference.</dd>
               <dt>Context</dt><dd>The contractor's notes from 8 Sep describe the same rejection on two accounts and state it is not evidence of a wrong password. It was a known, unresolved issue at handoff.</dd>
             </dl>
           </div>
@@ -715,7 +717,7 @@ footer { border-top: 1px solid var(--rule); padding-top: 18px; font-size: 0.84re
         </thead>
         <tbody>
           <tr><td class="mono">ejecutivo_1</td><td>Worked</td><td class="num">6</td><td class="num">7</td><td class="num">9</td><td>Portal daily limit, 22:04</td></tr>
-          <tr><td class="mono">ejecutivo_2</td><td>Refused via proxy (11×); works without one</td><td class="num">0</td><td class="num">0</td><td class="num">—</td><td>Login rejected</td></tr>
+          <tr><td class="mono">ejecutivo_2</td><td>Refused via proxy in the runs; 1 of 19 proxy logins succeeded</td><td class="num">0</td><td class="num">0</td><td class="num">—</td><td>Login rejected</td></tr>
           <tr><td class="mono">ejecutivo_3</td><td>Worked after port change</td><td class="num">7</td><td class="num">14</td><td class="num">7</td><td>Portal daily limit, 22:07</td></tr>
         </tbody>
       </table>
@@ -733,7 +735,7 @@ footer { border-top: 1px solid var(--rule); padding-top: 18px; font-size: 0.84re
       <div><span class="k">Actual</span><span class="v bad">13 / day</span><p>Two accounts working, one refused at login through the proxies, and at least 3 searches spent on duplicates.</p></div>
     </div>
     <div class="prose stack">
-      <p>The shortfall is not one bug. At the limits the portal enforced, three accounts cannot cover 30 inscriptions in a day even when everything else works. On top of that, one account in three could not log in through the proxies and the retry logic wasted part of the remaining capacity. Clearing the 19 queued cases at the current rate takes about two more days.</p>
+      <p>The shortfall is not one bug. At the limits the portal enforced, three accounts cannot cover 30 inscriptions in a day even when everything else works. On top of that, one account in three could rarely log in through the proxies and the retry logic wasted part of the remaining capacity. Clearing the 19 queued cases at the current rate takes about two more days.</p>
       <p>What did work reliably: every accepted search produced a complete PDF (13 files, 43 pages, all valid), no case was marked failed or lost, and the code stopped cleanly on the portal's limit instead of pushing past it.</p>
     </div>
   </section>
@@ -811,7 +813,7 @@ footer { border-top: 1px solid var(--rule); padding-top: 18px; font-size: 0.84re
     <ol class="recs">
       <li><div><strong>Confirm the per-account daily limit with CBRS</strong> and set the code's quota to it. At the observed 7–9, 30 cases a day needs four to five working accounts, not three.</div></li>
       <li><div><strong>Fix submission detection before moving a case to another account</strong> (P6), so a case is never charged to two accounts. This is the cheapest capacity gain available.</div></li>
-      <li><div><strong>Find out why the portal refuses <span class="mono">ejecutivo_2</span> through proxies.</strong> Its credentials work, so this is a question for CBRS about how they treat proxy and mobile connections. A systematic probe across more proxy exits is under way to narrow it down.</div></li>
+      <li><div><strong>Treat logins as the scarce step and keep sessions alive.</strong> <span class="mono">ejecutivo_2</span> logged in on 1 of 19 proxy attempts, but once logged in its session was accepted through other exits. Log in rarely and patiently (one attempt per exit, minutes apart), reuse the session instead of logging in again, and ask CBRS how they assess logins from mobile or proxy connections.</div></li>
       <li><div><strong>Make it usable as a component:</strong> read credentials from the configuration file, document one supported way to run it without the service, and remove the contradictory templates and platform instructions.</div></li>
       <li><div><strong>Re-run the remaining 19 cases</strong> after the accounts' limits lift, and repeat the load test once the fixes above are in, to measure a clean per-account figure.</div></li>
     </ol>
