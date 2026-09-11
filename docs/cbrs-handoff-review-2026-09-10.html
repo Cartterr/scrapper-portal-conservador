@@ -1,0 +1,823 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CBRS Scraper Handoff Review</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Spectral:wght@500;600;700&display=swap">
+<style>
+:root {
+  --ground: #F3F5F8;
+  --surface: #FFFFFF;
+  --ink: #18212E;
+  --muted: #566173;
+  --rule: #D6DCE4;
+  --accent: #33398A;
+  --accent-soft: #E6E7F5;
+  --ok: #2B7349;
+  --ok-soft: #E1F0E6;
+  --warn: #9C6310;
+  --warn-soft: #F5EAD6;
+  --fail: #AE3934;
+  --fail-soft: #F6E0DF;
+  --unk: #687386;
+  --unk-soft: #E6E9EE;
+  --limit: #33398A;
+  --limit-soft: #E6E7F5;
+  --font-display: "Spectral", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --font-body: "IBM Plex Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground: #10141B;
+    --surface: #171D26;
+    --ink: #E5E9F0;
+    --muted: #9AA4B4;
+    --rule: #2A3341;
+    --accent: #A9AEF2;
+    --accent-soft: #232848;
+    --ok: #74C995;
+    --ok-soft: #173325;
+    --warn: #E2B460;
+    --warn-soft: #3A2E17;
+    --fail: #F08C86;
+    --fail-soft: #3D1E1D;
+    --unk: #A7B0BF;
+    --unk-soft: #262D38;
+    --limit: #A9AEF2;
+    --limit-soft: #232848;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --ground: #10141B;
+  --surface: #171D26;
+  --ink: #E5E9F0;
+  --muted: #9AA4B4;
+  --rule: #2A3341;
+  --accent: #A9AEF2;
+  --accent-soft: #232848;
+  --ok: #74C995;
+  --ok-soft: #173325;
+  --warn: #E2B460;
+  --warn-soft: #3A2E17;
+  --fail: #F08C86;
+  --fail-soft: #3D1E1D;
+  --unk: #A7B0BF;
+  --unk-soft: #262D38;
+  --limit: #A9AEF2;
+  --limit-soft: #232848;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.6;
+  padding-inline: 20px;
+  padding-block: 0;
+}
+.page {
+  max-width: 980px;
+  margin-inline: auto;
+  padding-block: 56px 72px;
+  display: flex;
+  flex-direction: column;
+  gap: 56px;
+}
+.prose { max-width: 68ch; }
+h1, h2, h3 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  line-height: 1.2;
+  text-wrap: balance;
+  margin: 0;
+  color: var(--ink);
+}
+h1 { font-size: clamp(2rem, 4.2vw, 2.75rem); letter-spacing: -0.01em; }
+h2 { font-size: 1.7rem; }
+h3 { font-size: 1.2rem; }
+p { margin: 0; }
+.stack { display: flex; flex-direction: column; gap: 16px; }
+.stack-lg { display: flex; flex-direction: column; gap: 24px; }
+.eyebrow {
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.muted { color: var(--muted); }
+code, .mono { font-family: var(--font-mono); font-size: 0.88em; }
+code {
+  background: var(--unk-soft);
+  padding: 0.08em 0.36em;
+  border-radius: 3px;
+  overflow-wrap: anywhere;
+}
+a { color: var(--accent); }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Header */
+.masthead { display: flex; flex-direction: column; gap: 20px; }
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 28px;
+  font-size: 0.9rem;
+  color: var(--muted);
+  border-top: 1px solid var(--rule);
+  padding-top: 16px;
+}
+.meta b { color: var(--ink); font-weight: 500; }
+
+/* Verdict */
+.verdict {
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  border-radius: 6px;
+  padding: 28px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.verdict h2 { font-size: 1.35rem; }
+.verdict p { max-width: 70ch; }
+
+/* Figures */
+.figures {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+}
+.figure {
+  padding: 22px 20px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.figure + .figure { border-left: 1px solid var(--rule); }
+.figure .num {
+  font-family: var(--font-display);
+  font-size: 2.3rem;
+  font-weight: 600;
+  line-height: 1;
+  font-variant-numeric: lining-nums tabular-nums;
+}
+.figure .num small { font-size: 1.1rem; color: var(--muted); font-weight: 500; }
+.figure .lbl { font-size: 0.88rem; color: var(--muted); line-height: 1.4; }
+@media (max-width: 760px) {
+  .figures { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .figure:nth-child(3) { border-left: 0; }
+  .figure:nth-child(n+3) { border-top: 1px solid var(--rule); }
+}
+
+/* Section headings */
+.section-head { display: flex; flex-direction: column; gap: 8px; max-width: 68ch; }
+
+/* Timeline */
+.timeline { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.timeline li {
+  display: grid;
+  grid-template-columns: 7.5rem minmax(0, 1fr);
+  gap: 20px;
+  padding-block: 14px;
+  border-top: 1px solid var(--rule);
+}
+.timeline li:last-child { border-bottom: 1px solid var(--rule); }
+.timeline time {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--muted);
+  padding-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.timeline .what { display: flex; flex-direction: column; gap: 4px; max-width: 70ch; }
+.timeline .what strong { font-weight: 600; }
+@media (max-width: 560px) {
+  .timeline li { grid-template-columns: 1fr; gap: 4px; }
+}
+
+/* Chips */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.74rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 3px;
+  white-space: nowrap;
+  line-height: 1.6;
+}
+.chip.defect { background: var(--fail-soft); color: var(--fail); }
+.chip.setup { background: var(--warn-soft); color: var(--warn); }
+.chip.docs { background: var(--unk-soft); color: var(--unk); }
+.chip.portal { background: var(--limit-soft); color: var(--limit); }
+.chip.fixed { background: var(--ok-soft); color: var(--ok); }
+.chip.workaround { background: var(--warn-soft); color: var(--warn); }
+.chip.open { background: var(--fail-soft); color: var(--fail); }
+.chip.external { background: var(--unk-soft); color: var(--unk); }
+
+/* Issue register */
+.register { display: flex; flex-direction: column; }
+.issue {
+  display: grid;
+  grid-template-columns: 2.5rem minmax(0, 1fr);
+  gap: 16px;
+  padding-block: 22px;
+  border-top: 1px solid var(--rule);
+}
+.issue:last-child { border-bottom: 1px solid var(--rule); }
+.issue .ref {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--muted);
+  padding-top: 3px;
+}
+.issue .body { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.issue .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.issue h3 { font-size: 1.12rem; }
+.issue dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: 8.5rem minmax(0, 1fr);
+  gap: 6px 18px;
+  max-width: 78ch;
+}
+.issue dt {
+  font-size: 0.76rem;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding-top: 3px;
+}
+.issue dd { margin: 0; }
+@media (max-width: 560px) {
+  .issue { grid-template-columns: 1fr; gap: 6px; }
+  .issue dl { grid-template-columns: 1fr; gap: 2px; }
+  .issue dd { margin-bottom: 8px; }
+}
+.register-group { display: flex; flex-direction: column; gap: 14px; }
+.register-group > h3 { font-family: var(--font-body); font-size: 0.8rem; letter-spacing: 0.09em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+
+/* Quote */
+blockquote.portal {
+  margin: 0;
+  padding: 14px 18px;
+  border-left: 3px solid var(--limit);
+  background: var(--surface);
+  font-family: var(--font-display);
+  font-size: 1.12rem;
+  font-style: italic;
+  max-width: 64ch;
+}
+blockquote.portal cite {
+  display: block;
+  margin-top: 6px;
+  font-family: var(--font-body);
+  font-size: 0.82rem;
+  font-style: normal;
+  color: var(--muted);
+}
+
+/* Tables */
+.table-wrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+th, td { text-align: left; padding: 10px 14px; vertical-align: top; }
+thead th {
+  font-size: 0.74rem;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border-bottom: 1px solid var(--rule);
+  white-space: nowrap;
+}
+tbody tr + tr td { border-top: 1px solid var(--rule); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.case { font-family: var(--font-mono); font-size: 0.86rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+td.trail { color: var(--muted); font-size: 0.86rem; min-width: 18rem; }
+tr.group td {
+  background: var(--ground);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding-block: 8px;
+}
+
+/* Chart */
+.chart { display: flex; flex-direction: column; gap: 18px; background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 24px 24px 18px; }
+.chart-rows { display: flex; flex-direction: column; gap: 16px; }
+.chart-row { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr); gap: 16px; align-items: center; }
+.chart-row .who { font-family: var(--font-mono); font-size: 0.86rem; }
+.chart-row .who small { display: block; font-family: var(--font-body); font-size: 0.78rem; color: var(--muted); }
+.track { position: relative; height: 30px; }
+.bar { display: flex; height: 100%; }
+.seg {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.78rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--surface);
+  border-right: 1px solid var(--surface);
+  overflow: hidden;
+}
+.seg.ok { background: var(--ok); }
+.seg.notsent { background: var(--warn); }
+.seg.refused { background: var(--fail); }
+.seg.unconf { background: var(--unk); }
+.seg.limit { background: var(--limit); }
+.bar-total {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  padding-left: 10px;
+  font-size: 0.82rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.no-bar {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  padding-inline: 12px;
+  border: 1px dashed var(--rule);
+  font-size: 0.86rem;
+  color: var(--muted);
+}
+.axis { position: relative; height: 18px; margin-left: calc(7.5rem + 16px); border-top: 1px solid var(--rule); }
+.axis span {
+  position: absolute;
+  top: 3px;
+  transform: translateX(-50%);
+  font-size: 0.74rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.axis span:first-child { transform: none; }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 0.84rem; color: var(--muted); }
+.legend i { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+@media (max-width: 560px) {
+  .chart { padding: 18px 14px 14px; }
+  .chart-row { grid-template-columns: 1fr; gap: 6px; }
+  .axis { margin-left: 0; }
+}
+
+/* Capacity math */
+.calc { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); }
+.calc > div { padding: 20px 22px; display: flex; flex-direction: column; gap: 6px; }
+.calc > div + div { border-left: 1px solid var(--rule); }
+.calc .k { font-size: 0.76rem; font-weight: 600; letter-spacing: 0.07em; text-transform: uppercase; color: var(--muted); }
+.calc .v { font-family: var(--font-display); font-size: 1.9rem; font-weight: 600; line-height: 1.1; font-variant-numeric: lining-nums tabular-nums; }
+.calc .v.bad { color: var(--fail); }
+.calc p { font-size: 0.9rem; color: var(--muted); line-height: 1.5; }
+@media (max-width: 760px) {
+  .calc { grid-template-columns: 1fr; }
+  .calc > div + div { border-left: 0; border-top: 1px solid var(--rule); }
+}
+
+/* Lists */
+ul.plain, ol.plain { margin: 0; padding-left: 1.2rem; display: flex; flex-direction: column; gap: 8px; max-width: 72ch; }
+ol.recs { margin: 0; padding: 0; list-style: none; counter-reset: rec; display: flex; flex-direction: column; }
+ol.recs li {
+  counter-increment: rec;
+  display: grid;
+  grid-template-columns: 2rem minmax(0, 1fr);
+  gap: 12px;
+  padding-block: 14px;
+  border-top: 1px solid var(--rule);
+  max-width: 80ch;
+}
+ol.recs li:last-child { border-bottom: 1px solid var(--rule); }
+ol.recs li::before {
+  content: counter(rec);
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 1.15rem;
+  color: var(--accent);
+  line-height: 1.4;
+}
+ol.recs strong { font-weight: 600; }
+
+footer { border-top: 1px solid var(--rule); padding-top: 18px; font-size: 0.84rem; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+
+<main class="page">
+
+  <header class="masthead">
+    <span class="eyebrow">Technical review · Índice del Registro de Comercio scraper</span>
+    <h1>CBRS scraper handoff review</h1>
+    <p class="prose muted">An account of what it took to run the contractor-delivered scraper for the Conservador de Bienes Raíces de Santiago (CBRS) portal, every problem found along the way, what was fixed, and what the system actually delivered against a request for 30 inscriptions with three portal accounts.</p>
+    <div class="meta">
+      <span><b>Review dates</b> 10–11 Sep 2026</span>
+      <span><b>Host</b> Ubuntu 24.04 workstation, no background service</span>
+      <span><b>Code</b> <span class="mono">scrapper-portal-conservador</span> at <span class="mono">eee1ac0</span> + local fixes</span>
+      <span><b>Times</b> Chile local (UTC−3)</span>
+    </div>
+  </header>
+
+  <section class="verdict" aria-labelledby="verdict-h">
+    <span class="eyebrow">Summary</span>
+    <h2 id="verdict-h">It works end to end, but it delivered 11 of 30 cases, and at the observed limits it cannot reach 30 in a day with three accounts.</h2>
+    <p>Login, search, page download and PDF assembly all work: 13 valid PDFs came out of the review (11 of the 30 requested cases plus 2 earlier test cases). Getting there required six fixes and workarounds to the delivered setup. Three things then capped the volume: the portal stopped each working account after 7–9 searches, not the 20 per account the configuration assumes; one of the three accounts never got past the portal's login; and the retry logic spent daily searches twice on the same case.</p>
+  </section>
+
+  <div class="figures" role="list">
+    <div class="figure" role="listitem">
+      <span class="num">11<small> / 30</small></span>
+      <span class="lbl">requested cases delivered as PDFs; 19 still queued</span>
+    </div>
+    <div class="figure" role="listitem">
+      <span class="num">7–9</span>
+      <span class="lbl">searches per account before the portal's daily limit (configuration assumes 20)</span>
+    </div>
+    <div class="figure" role="listitem">
+      <span class="num">1<small> / 3</small></span>
+      <span class="lbl">accounts never logged in: 11 rejected logins across 4 proxy routes</span>
+    </div>
+    <div class="figure" role="listitem">
+      <span class="num">34</span>
+      <span class="lbl">search attempts to get 13 successful searches</span>
+    </div>
+  </div>
+
+  <section class="stack-lg" aria-labelledby="context-h">
+    <div class="section-head">
+      <span class="eyebrow">Starting point</span>
+      <h2 id="context-h">What was handed over</h2>
+    </div>
+    <div class="prose stack">
+      <p>The repository is a Python 3.14 application that drives regular Google Chrome through Playwright. It logs into the CBRS portal with three named accounts (<span class="mono">ejecutivo_1</span>, <span class="mono">_2</span>, <span class="mono">_3</span>), routes each account through its own DataImpulse Mobile proxy port in Chile, searches the commerce index by foja, número and año, downloads the page images and assembles one PDF per result. Jobs are kept in a local SQLite queue.</p>
+      <p>As delivered, it was built to run as an always-on service: first as native Windows scheduled tasks, then migrated to systemd inside WSL on another machine, with a separate process that owns the Chrome windows. For this review the goal was simpler: run it on a Linux machine, without any service, as a component to be called from another codebase.</p>
+      <p>The contractor's own notes, dated 8 Sep 2026, already recorded that the migrated setup was incomplete: <em>“one account completed a new search and PDF download; two accounts are still receiving the portal's generic login rejection.”</em> The per-account quota of 20 searches a day is described in the README as a theoretical figure (<em>“cupo teórico”</em>) to be aligned with the contract.</p>
+    </div>
+  </section>
+
+  <section class="stack-lg" aria-labelledby="timeline-h">
+    <div class="section-head">
+      <span class="eyebrow">Sequence of events</span>
+      <h2 id="timeline-h">What happened, in order</h2>
+    </div>
+    <ol class="timeline">
+      <li><time>10 Sep</time><div class="what"><strong>Repository assessed; development environment built.</strong><span>Python 3.14 is not available on Ubuntu 24.04, so it was installed separately. The test suite ran: 469 of 470 tests pass; the one failure is a Windows-only test.</span></div></li>
+      <li><time>10 Sep</time><div class="what"><strong>Configuration assembled for 3 accounts, DataImpulse Mobile and a CAPTCHA solver.</strong><span>The templates contradict each other (see P3); the working layout had to be pieced together from the example file, a separate account-pool example and the proxy runbook.</span></div></li>
+      <li><time>20:46</time><div class="what"><strong>First proxy check: 2 of 3 accounts pass.</strong><span><span class="mono">ejecutivo_3</span>'s proxy route (port 10002) timed out on every check (P5).</span></div></li>
+      <li><time>20:48</time><div class="what"><strong>Two test cases queued; first worker run produces nothing.</strong><span>The worker reported that no account had credentials, although they were in the configuration file (P2).</span></div></li>
+      <li><time>21:03</time><div class="what"><strong>Second run: Chrome crashes on launch for every account.</strong><span>Chrome aborted with “Socket path too long” (P1). No search was possible on Linux until this was fixed in code.</span></div></li>
+      <li><time>21:12</time><div class="what"><strong>Chrome fix applied; <span class="mono">ejecutivo_3</span> moved to proxy port 15215.</strong><span>Its proxy check then passed: Chilean exit, reCAPTCHA and portal reachable.</span></div></li>
+      <li><time>21:20</time><div class="what"><strong>First case delivered: Foja 30282 · N° 12784 · 2024, 3 pages.</strong><span>Page 1 was checked visually and matches the requested inscription. In the same run the portal rejected the logins of <span class="mono">ejecutivo_2</span> and <span class="mono">ejecutivo_3</span>.</span></div></li>
+      <li><time>21:22–21:39</time><div class="what"><strong>Second test case (Foja 47092 · N° 32694 · 2010) stuck across four more runs.</strong><span>The portal refused it five times on <span class="mono">ejecutivo_3</span>; one attempt on <span class="mono">ejecutivo_1</span> ended with an unknown outcome, which by design bars that account from retrying the same case.</span></div></li>
+      <li><time>21:45</time><div class="what"><strong>The 30 requested cases were queued and the load run started.</strong><span>One continuous worker, all three accounts enabled, the code's own limit left at 20 per account.</span></div></li>
+      <li><time>22:04</time><div class="what"><strong><span class="mono">ejecutivo_1</span> hit the portal's daily limit.</strong><span>The portal showed its own message (quoted below). By then the account had 6 accepted searches in the code's records and 9 different inscriptions in the portal's history.</span></div></li>
+      <li><time>22:07</time><div class="what"><strong><span class="mono">ejecutivo_3</span> hit the portal's daily limit.</strong><span>7 accepted searches; the stuck test case 47092 was among them.</span></div></li>
+      <li><time>22:08–22:16</time><div class="what"><strong>No account could search; the run was ended with 19 of 30 cases still queued.</strong><span><span class="mono">ejecutivo_2</span> was still being rejected at login. The code estimates the two limits lift around 21:20 and 21:59 on 11 Sep; the portal does not confirm a reset time.</span></div></li>
+    </ol>
+  </section>
+
+  <section class="stack-lg" aria-labelledby="register-h">
+    <div class="section-head">
+      <span class="eyebrow">Problem register</span>
+      <h2 id="register-h">Every problem found, and what was done</h2>
+      <p class="muted">Grouped by where the problem sits. “Fixed” means changed in code; “workaround” means it was avoided without changing the code; “open” means it still affects results.</p>
+    </div>
+
+    <div class="register-group">
+      <h3>In the delivered code and configuration</h3>
+      <div class="register">
+
+        <article class="issue">
+          <span class="ref">P1</span>
+          <div class="body">
+            <div class="tags"><span class="chip defect">Code defect</span><span class="chip fixed">Fixed</span></div>
+            <h3>Chrome crashed on every launch on Linux</h3>
+            <dl>
+              <dt>What happened</dt><dd>Every account's Chrome exited immediately with <code>FATAL … Socket path too long</code>, so no login or search could start.</dd>
+              <dt>Cause</dt><dd>The code forces Chrome's temporary folder inside the repository. Chrome creates a socket there, and Linux caps socket paths at 107 characters; at this checkout's location the path came to 108. The previous host only worked because its folder path happened to be shorter.</dd>
+              <dt>What we did</dt><dd>Changed <code>cbrs/paths.py</code> to fall back to a short, private folder under <code>/tmp</code> when the in-repository path would be too long. Updated two tests and added two; the suite passes (471 of 472, the remaining failure being the pre-existing Windows-only test).</dd>
+            </dl>
+          </div>
+        </article>
+
+        <article class="issue">
+          <span class="ref">P2</span>
+          <div class="body">
+            <div class="tags"><span class="chip defect">Code defect</span><span class="chip workaround">Workaround</span></div>
+            <h3>The worker ignored the account credentials in the configuration file</h3>
+            <dl>
+              <dt>What happened</dt><dd>The first run failed for every account with “requires environment variable(s) … USERNAME, PASSWORD”, although both were set in <code>.env</code>.</dd>
+              <dt>Cause</dt><dd>Proxy and solver settings are read from <code>.env</code>, but account credentials are read only from the process environment. The old service injected them through a launcher script; running the documented command directly skips that step. The docs don't say so.</dd>
+              <dt>What we did</dt><dd>Every run goes through <code>deploy/run_with_env.py .env -- …</code>. Any integration has to do the same or pass the variables itself. A related trap: values in <code>.env</code> override environment variables, even when blank.</dd>
+            </dl>
+          </div>
+        </article>
+
+        <article class="issue">
+          <span class="ref">P3</span>
+          <div class="body">
+            <div class="tags"><span class="chip docs">Configuration</span><span class="chip workaround">Workaround</span></div>
+            <h3>Configuration templates contradict each other</h3>
+            <dl>
+              <dt>What happened</dt><dd>The Linux installer copies a template for a different proxy type (one static proxy URL per account, different variable names). The layout actually used in production lives in a different example file. That example also enables a mode that requires the separate Chrome-owner service.</dd>
+              <dt>What we did</dt><dd>Wrote a working <code>.env</code> and account-pool file by hand from the production layout and removed the service-only mode. The code rejects an account that mixes the two layouts, so a copied template does not work as-is.</dd>
+            </dl>
+          </div>
+        </article>
+
+        <article class="issue">
+          <span class="ref">P4</span>
+          <div class="body">
+            <div class="tags"><span class="chip docs">Configuration</span><span class="chip workaround">Workaround</span></div>
+            <h3>The CAPTCHA solver blocks startup and, per the contractor's own notes, does not help</h3>
+            <dl>
+              <dt>What happened</dt><dd>With a 2Captcha mode selected, every command refuses to start until an API key is present. The contractor's debugging notes (29 Aug) record that every 2Captcha token was rejected by the portal while the browser's own token was accepted.</dd>
+              <dt>What we did</dt><dd>Ran with the solver disabled (browser-only reCAPTCHA). No paid solves were used. The load run did not show CAPTCHA as a limiting factor.</dd>
+            </dl>
+          </div>
+        </article>
+
+        <article class="issue">
+          <span class="ref">P5</span>
+          <div class="body">
+            <div class="tags"><span class="chip setup">Operations</span><span class="chip workaround">Workaround</span></div>
+            <h3>One account's proxy route was dead, and changing it required editing the database</h3>
+            <dl>
+              <dt>What happened</dt><dd><span class="mono">ejecutivo_3</span>'s route (port 10002) timed out on 3 of 3 checks, so the account could never be approved.</dd>
+              <dt>Cause</dt><dd>A mobile proxy port maps to one device, which can go offline. The active port is stored in the local database and overrides the configuration file; the built-in command to change it only works while the always-on service is running.</dd>
+              <dt>What we did</dt><dd>Moved the account to port 15215 in both the database and the pool file (safe: the account had never logged in). Checks then passed.</dd>
+            </dl>
+          </div>
+        </article>
+
+        <article class="issue">
+          <span class="ref">P6</span>
+          <div class="body">
+            <div class="tags"><span class="chip defect">Code defect</span><span class="chip open">Open</span></div>
+            <h3>Retries spend the daily limit twice on the same case</h3>
+            <dl>
+              <dt>What happened</dt><dd>12 times the code decided the search form “did not submit within 15 seconds” and moved the case to another account. At least two of those were in fact recorded by the portal: Foja 37684 · 2007 and Foja 79769 · 2014 appear in <span class="mono">ejecutivo_1</span>'s portal history although the code logged them as not sent, and both were then searched again on <span class="mono">ejecutivo_3</span>. The stuck test case 47092 likewise shows up in both accounts' histories.</dd>
+              <dt>Effect</dt><dd><span class="mono">ejecutivo_1</span> used 9 portal searches to deliver 6 cases. With a limit of 7–9 a day, every duplicate costs about 12% of an account's day.</dd>
+              <dt>Status</dt><dd>Not changed. This is the most valuable fix to make before any further volume testing.</dd>
+            </dl>
+          </div>
+        </article>
+
+        <article class="issue">
+          <span class="ref">P7</span>
+          <div class="body">
+            <div class="tags"><span class="chip docs">Configuration</span><span class="chip open">Open</span></div>
+            <h3>The configured daily quota does not match the portal</h3>
+            <dl>
+              <dt>What happened</dt><dd>The code allows 20 searches per account per day (60 across three). The portal stopped both working accounts well before that, so the code's own limit was never reached and its capacity figures overstate what's available.</dd>
+              <dt>Status</dt><dd>Not changed. The real figure should come from the CBRS contract; the observed value is 7–9.</dd>
+            </dl>
+          </div>
+        </article>
+
+        <article class="issue">
+          <span class="ref">P8</span>
+          <div class="body">
+            <div class="tags"><span class="chip docs">Documentation</span><span class="chip open">Open</span></div>
+            <h3>Documentation disagrees on how the system is meant to run</h3>
+            <dl>
+              <dt>What happened</dt><dd>The README describes native Windows as the active setup and forbids WSL; the maintenance rules and Linux guide say WSL is active and Windows is only a fallback. None of it covers running without the service, and there is no guidance for calling it from another application.</dd>
+              <dt>Also found</dt><dd>Python 3.14 is required but not packaged for Ubuntu 24.04; one test fails on any non-Windows machine; when no account can proceed, the worker keeps re-checking the queued cases every few seconds (119 times in 8 minutes). None of these changed the results.</dd>
+            </dl>
+          </div>
+        </article>
+      </div>
+    </div>
+
+    <div class="register-group">
+      <h3>On the portal's side</h3>
+      <div class="register">
+
+        <article class="issue">
+          <span class="ref">P9</span>
+          <div class="body">
+            <div class="tags"><span class="chip portal">Portal</span><span class="chip open">Open</span></div>
+            <h3>The portal stops each account after 7–9 searches a day</h3>
+            <dl>
+              <dt>What happened</dt><dd><span class="mono">ejecutivo_1</span> was stopped at 22:04 and <span class="mono">ejecutivo_3</span> at 22:07, both with the portal's own dialog. The portal's recent-searches panel listed 9 inscriptions for the first account and 7 for the second at that moment.</dd>
+              <dt>How the code reacted</dt><dd>Correctly: it recorded a hold on each account, stopped using it, and kept the remaining cases queued rather than failing them.</dd>
+            </dl>
+            <blockquote class="portal">“Se han agotado las consultas disponibles por hoy.”<cite>Portal dialog shown to both accounts on reaching the limit</cite></blockquote>
+          </div>
+        </article>
+
+        <article class="issue">
+          <span class="ref">P10</span>
+          <div class="body">
+            <div class="tags"><span class="chip portal">Portal</span><span class="chip open">Open</span></div>
+            <h3>One of the three accounts never logged in</h3>
+            <dl>
+              <dt>What happened</dt><dd><span class="mono">ejecutivo_2</span> was rejected 11 times with HTTP 400 and the portal's generic <code>intente-mas-tarde</code> (“try again later”) code: on its own proxy port and on three replacement ports the code tried automatically (12595, 15432, 14154).</dd>
+              <dt>Context</dt><dd>The contractor's notes from 8 Sep describe the same rejection on two accounts and state it is not evidence of a wrong password. It was a known, unresolved issue at handoff. Whether the account is also in use elsewhere (for example by the previous deployment) was not verified.</dd>
+            </dl>
+          </div>
+        </article>
+
+        <article class="issue">
+          <span class="ref">P11</span>
+          <div class="body">
+            <div class="tags"><span class="chip portal">Portal</span><span class="chip external">Intermittent</span></div>
+            <h3>The portal refuses individual searches with a generic error</h3>
+            <dl>
+              <dt>What happened</dt><dd>6 searches (5 on <span class="mono">ejecutivo_3</span>, 1 on <span class="mono">ejecutivo_1</span>) were answered with the portal's dialog “Se ha detectado un problema, refresque la página e intente nuevamente.” The same case later succeeded, so this was not about the inscription itself.</dd>
+              <dt>How the code reacted</dt><dd>Paused the account for a few minutes and tried another account. The contractor's notes associate this response with the connection route rather than the account or query.</dd>
+            </dl>
+          </div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="stack-lg" aria-labelledby="results-h">
+    <div class="section-head">
+      <span class="eyebrow">Results</span>
+      <h2 id="results-h">What each account did</h2>
+      <p class="muted">All search attempts during the review, including the two test cases and the 30-case run.</p>
+    </div>
+
+    <figure class="chart" style="margin:0" aria-label="Search attempts per account by outcome">
+      <div class="chart-rows">
+        <div class="chart-row">
+          <span class="who">ejecutivo_1<small>13 attempts, 6 delivered</small></span>
+          <div class="track">
+            <div class="bar" style="width: calc(13 / 21 * 100%)">
+              <span class="seg ok" style="flex: 6" title="6 completed">6</span>
+              <span class="seg notsent" style="flex: 4" title="4 not sent within 15 s">4</span>
+              <span class="seg refused" style="flex: 1" title="1 refused by portal">1</span>
+              <span class="seg unconf" style="flex: 1" title="1 unconfirmed">1</span>
+              <span class="seg limit" style="flex: 1" title="1 stopped by daily limit">1</span>
+            </div>
+          </div>
+        </div>
+        <div class="chart-row">
+          <span class="who">ejecutivo_2<small>0 attempts, 0 delivered</small></span>
+          <div class="track"><div class="no-bar">No searches: login rejected 11 times on 4 proxy routes</div></div>
+        </div>
+        <div class="chart-row">
+          <span class="who">ejecutivo_3<small>21 attempts, 7 delivered</small></span>
+          <div class="track">
+            <div class="bar" style="width: 100%">
+              <span class="seg ok" style="flex: 7" title="7 completed">7</span>
+              <span class="seg notsent" style="flex: 8" title="8 not sent within 15 s">8</span>
+              <span class="seg refused" style="flex: 5" title="5 refused by portal">5</span>
+              <span class="seg limit" style="flex: 1" title="1 stopped by daily limit">1</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="axis" aria-hidden="true">
+        <span style="left: 0">0</span>
+        <span style="left: calc(5 / 21 * 100%)">5</span>
+        <span style="left: calc(10 / 21 * 100%)">10</span>
+        <span style="left: calc(15 / 21 * 100%)">15</span>
+        <span style="left: calc(20 / 21 * 100%)">20</span>
+      </div>
+      <div class="legend">
+        <span><i style="background: var(--ok)"></i>Completed search</span>
+        <span><i style="background: var(--warn)"></i>Form not sent within 15 s</span>
+        <span><i style="background: var(--fail)"></i>Refused by portal</span>
+        <span><i style="background: var(--unk)"></i>Outcome unknown</span>
+        <span><i style="background: var(--limit)"></i>Daily limit reached</span>
+      </div>
+    </figure>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Account</th><th>Login</th><th class="num">Completed</th><th class="num">Other attempts</th><th class="num">In portal history</th><th>Stopped by</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="mono">ejecutivo_1</td><td>Worked</td><td class="num">6</td><td class="num">7</td><td class="num">9</td><td>Portal daily limit, 22:04</td></tr>
+          <tr><td class="mono">ejecutivo_2</td><td>Never (11 rejections)</td><td class="num">0</td><td class="num">0</td><td class="num">—</td><td>Login rejected</td></tr>
+          <tr><td class="mono">ejecutivo_3</td><td>Worked after port change</td><td class="num">7</td><td class="num">14</td><td class="num">7</td><td>Portal daily limit, 22:07</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="stack-lg" aria-labelledby="why-h">
+    <div class="section-head">
+      <span class="eyebrow">The core question</span>
+      <h2 id="why-h">Why 30 cases with three accounts didn't get through</h2>
+    </div>
+    <div class="calc">
+      <div><span class="k">Configured</span><span class="v">60 / day</span><p>20 searches per account × 3 accounts, the figure the configuration and README assume.</p></div>
+      <div><span class="k">Best case at observed limits</span><span class="v bad">21–27 / day</span><p>7–9 per account × 3, with every account logging in and no duplicate searches. Still short of 30.</p></div>
+      <div><span class="k">Actual</span><span class="v bad">13 / day</span><p>Two accounts working, one never logged in, and at least 3 searches spent on duplicates.</p></div>
+    </div>
+    <div class="prose stack">
+      <p>The shortfall is not one bug. At the limits the portal enforced, three accounts cannot cover 30 inscriptions in a day even when everything else works. On top of that, a third of the accounts was unusable and the retry logic wasted part of the remaining capacity. Clearing the 19 queued cases at the current rate takes about two more days.</p>
+      <p>What did work reliably: every accepted search produced a complete PDF (13 files, 43 pages, all valid), no case was marked failed or lost, and the code stopped cleanly on the portal's limit instead of pushing past it.</p>
+    </div>
+  </section>
+
+  <section class="stack-lg" aria-labelledby="cases-h">
+    <div class="section-head">
+      <span class="eyebrow">Case by case</span>
+      <h2 id="cases-h">The 30 requested cases</h2>
+      <p class="muted">Written as the portal lists them. Each delivered case returned exactly one matching inscription.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Inscription</th><th>Result</th><th>Account</th><th class="num">Pages</th><th>Attempts</th></tr>
+        </thead>
+        <tbody>
+          <tr class="group"><td colspan="5">Delivered · 11 cases · 37 pages</td></tr>
+          <tr><td class="case">Foja 28511 · N° 14237 · 2020</td><td><span class="chip fixed">PDF</span></td><td class="mono">ejecutivo_1</td><td class="num">3</td><td class="trail">First try</td></tr>
+          <tr><td class="case">Foja 61077 · N° 33044 · 2017</td><td><span class="chip fixed">PDF</span></td><td class="mono">ejecutivo_1</td><td class="num">3</td><td class="trail">First try</td></tr>
+          <tr><td class="case">Foja 72197 · N° 38915 · 2016</td><td><span class="chip fixed">PDF</span></td><td class="mono">ejecutivo_1</td><td class="num">4</td><td class="trail">First try</td></tr>
+          <tr><td class="case">Foja 13583 · N° 8512 · 2014</td><td><span class="chip fixed">PDF</span></td><td class="mono">ejecutivo_1</td><td class="num">3</td><td class="trail">First try</td></tr>
+          <tr><td class="case">Foja 79769 · N° 48610 · 2014</td><td><span class="chip fixed">PDF</span></td><td class="mono">ejecutivo_3</td><td class="num">3</td><td class="trail">5 tries: not sent (ej. 1), not sent (ej. 3), refused (ej. 1), not sent (ej. 3), completed (ej. 3)</td></tr>
+          <tr><td class="case">Foja 27539 · N° 18289 · 2013</td><td><span class="chip fixed">PDF</span></td><td class="mono">ejecutivo_1</td><td class="num">5</td><td class="trail">First try</td></tr>
+          <tr><td class="case">Foja 41721 · N° 28918 · 2010</td><td><span class="chip fixed">PDF</span></td><td class="mono">ejecutivo_3</td><td class="num">3</td><td class="trail">3 tries: not sent (ej. 3), not sent (ej. 1), completed (ej. 3)</td></tr>
+          <tr><td class="case">Foja 37684 · N° 27027 · 2007</td><td><span class="chip fixed">PDF</span></td><td class="mono">ejecutivo_3</td><td class="num">3</td><td class="trail">2 tries: not sent (ej. 1, but recorded by the portal), completed (ej. 3)</td></tr>
+          <tr><td class="case">Foja 87526 · N° 33200 · 2025</td><td><span class="chip fixed">PDF</span></td><td class="mono">ejecutivo_3</td><td class="num">4</td><td class="trail">2 tries: daily limit (ej. 1), completed (ej. 3)</td></tr>
+          <tr><td class="case">Foja 26041 · N° 12071 · 2022</td><td><span class="chip fixed">PDF</span></td><td class="mono">ejecutivo_3</td><td class="num">3</td><td class="trail">First try</td></tr>
+          <tr><td class="case">Foja 26820 · N° 13521 · 2019</td><td><span class="chip fixed">PDF</span></td><td class="mono">ejecutivo_3</td><td class="num">3</td><td class="trail">First try</td></tr>
+          <tr class="group"><td colspan="5">Not run · 19 cases · still queued, no account available</td></tr>
+          <tr><td class="case">Foja 30185 · N° 15990 · 2018</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Daily limit reached on ej. 3 while trying it</td></tr>
+          <tr><td class="case">Foja 98198 · N° 36606 · 2025</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 109903 · N° 44296 · 2024</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 112154 · N° 45234 · 2024</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 16154 · N° 7660 · 2023</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 67931 · N° 34836 · 2018</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 17334 · N° 10874 · 2014</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 2198 · N° 1398 · 2013</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 17570 · N° 13346 · 2011</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 18036 · N° 12226 · 2010</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 6463 · N° 5244 · 1995</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 2297 · N° 1224 · 1988</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 23972 · N° 9310 · 2026</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 33932 · N° 15334 · 2023</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 91146 · N° 39929 · 2022</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 44590 · N° 20569 · 2021</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 83081 · N° 38324 · 2021</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 45546 · N° 21713 · 2020</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr><td class="case">Foja 28500 · N° 17745 · 2014</td><td><span class="chip open">Queued</span></td><td class="muted">—</td><td class="num">—</td><td class="trail">Not attempted</td></tr>
+          <tr class="group"><td colspan="5">Earlier test cases · both delivered · 6 pages</td></tr>
+          <tr><td class="case">Foja 30282 · N° 12784 · 2024</td><td><span class="chip fixed">PDF</span></td><td class="mono">ejecutivo_1</td><td class="num">3</td><td class="trail">2 tries: not sent (ej. 1), completed (ej. 1)</td></tr>
+          <tr><td class="case">Foja 47092 · N° 32694 · 2010</td><td><span class="chip fixed">PDF</span></td><td class="mono">ejecutivo_3</td><td class="num">3</td><td class="trail">12 tries: refused ×5 (ej. 3), outcome unknown (ej. 1), not sent ×5 (ej. 3), completed (ej. 3)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="stack-lg" aria-labelledby="changes-h">
+    <div class="section-head">
+      <span class="eyebrow">Changes</span>
+      <h2 id="changes-h">What was changed during the review</h2>
+    </div>
+    <ul class="plain">
+      <li><strong>Code:</strong> <code>cbrs/paths.py</code> (Chrome temporary-folder fallback, P1) and <code>tests/test_repo_paths.py</code> (two tests updated, two added). Not committed.</li>
+      <li><strong>Local configuration</strong> (never in git): a <code>.env</code> for three accounts, DataImpulse Mobile and browser-only CAPTCHA; an account-pool file; <span class="mono">ejecutivo_3</span>'s proxy port moved from 10002 to 15215 in the pool file and local database.</li>
+      <li><strong>Environment:</strong> Python 3.14.7 in a local virtual environment for the repository.</li>
+      <li><strong>Not changed:</strong> retry and quota logic (P6, P7), credential loading (P2), templates and documentation (P3, P8).</li>
+    </ul>
+  </section>
+
+  <section class="stack-lg" aria-labelledby="next-h">
+    <div class="section-head">
+      <span class="eyebrow">Recommendations</span>
+      <h2 id="next-h">What it would take to reach 30 cases a day</h2>
+    </div>
+    <ol class="recs">
+      <li><div><strong>Confirm the per-account daily limit with CBRS</strong> and set the code's quota to it. At the observed 7–9, 30 cases a day needs four to five working accounts, not three.</div></li>
+      <li><div><strong>Fix submission detection before moving a case to another account</strong> (P6), so a case is never charged to two accounts. This is the cheapest capacity gain available.</div></li>
+      <li><div><strong>Resolve <span class="mono">ejecutivo_2</span>'s login</strong> with CBRS, and make sure no other deployment is still using any of the three accounts.</div></li>
+      <li><div><strong>Make it usable as a component:</strong> read credentials from the configuration file, document one supported way to run it without the service, and remove the contradictory templates and platform instructions.</div></li>
+      <li><div><strong>Re-run the remaining 19 cases</strong> after the accounts' limits lift, and repeat the load test once the fixes above are in, to measure a clean per-account figure.</div></li>
+    </ol>
+  </section>
+
+  <footer>
+    <span>Prepared from the repository's own logs, job database, error evidence and portal dialogs captured during the review. Credentials are intentionally omitted.</span>
+    <span>Figures are counts from the local job database at the end of the run on 10 Sep 2026, 22:16 Chile time.</span>
+  </footer>
+</main>
+
+</html>
