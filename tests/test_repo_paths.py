@@ -1,16 +1,45 @@
+import os
 from pathlib import Path
 
+import pytest
+
 from cbrs.config import load_settings
-from cbrs.paths import PATH_KEYS, prepare_environment, runtime_environment
+from cbrs.paths import (
+    CHROME_SOCKET_SUFFIX,
+    PATH_KEYS,
+    UNIX_SOCKET_PATH_MAX,
+    prepare_environment,
+    runtime_environment,
+)
 
 
 def test_locations_are_repo_owned(tmp_path):
     values = prepare_environment({'TEMP': '/elsewhere', 'CBRS_OUTPUT_DIR': '/elsewhere'}, tmp_path)
     for key in ('CBRS_PROFILE_DIR', 'CBRS_OUTPUT_DIR', 'CBRS_LOG_DIR',
                 'CBRS_CAPTCHA_STATE_PATH', 'RESTIC_REPOSITORY', 'RESTIC_PASSWORD_FILE',
-                'RESTIC_CACHE_DIR', 'TEMP', 'TMP', 'TMPDIR', 'XDG_CACHE_HOME'):
+                'RESTIC_CACHE_DIR', 'XDG_CACHE_HOME'):
         assert Path(values[key]).is_relative_to(tmp_path)
-    assert Path(values['TMPDIR']).is_dir()
+    for key in ('TEMP', 'TMP', 'TMPDIR'):
+        assert values[key] == runtime_environment(tmp_path)['TMPDIR']
+    temp = Path(values['TMPDIR'])
+    assert temp.is_dir()
+    if not temp.is_relative_to(tmp_path):
+        temp.rmdir()
+
+
+def test_short_checkout_keeps_repo_local_temp():
+    root = Path('/srv/cbrs')
+    assert runtime_environment(root)['TMPDIR'] == str(root.resolve() / '.cbrs/runtime/tmp')
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='Unix socket path limit')
+def test_deep_checkout_uses_short_private_temp(tmp_path):
+    temp = Path(prepare_environment({}, tmp_path / ('d' * 80))['TMPDIR'])
+    try:
+        assert len(str(temp)) + len(CHROME_SOCKET_SUFFIX) <= UNIX_SOCKET_PATH_MAX
+        assert temp.stat().st_mode & 0o077 == 0
+    finally:
+        temp.rmdir()
 
 
 def test_production_ignores_stale_path_settings(tmp_path, monkeypatch):
@@ -42,4 +71,4 @@ def test_launcher_uses_repo_from_another_directory(tmp_path):
     cwd, output, temp = map(Path, json.loads(result.stdout))
     assert cwd == root
     assert output == root / '.cbrs/runtime/outputs'
-    assert temp == root / '.cbrs/runtime/tmp'
+    assert temp == Path(runtime_environment(root)['TEMP'])
