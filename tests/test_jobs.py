@@ -87,6 +87,11 @@ def test_uncertain_job_never_dispatches_owner_precondition_refusals(tmp_path, mo
     assert selections == []
     commands.cancel_queued(queued)
     assert process_job(obj,**args)=='waiting_capacity'
+    assert selections == []
+    with store.connect() as db:
+        assert not db.execute('SELECT 1 FROM search_retry_clearance WHERE job_id=?',(job['job_id'],)).fetchone()
+    assert store.authorize_alternate_search(job['job_id'])
+    assert process_job(obj,**args)=='waiting_capacity'
     assert selections and 'a1' in selections[0]['excluded']
     assert store.get_job(job['job_id'])['finished_at'] is None
     with store.connect() as db:
@@ -1603,9 +1608,9 @@ def test_worker_fails_over_after_account_captcha(tmp_path, monkeypatch):
     assert sum(store.usage_by_account(_today()).values()) == 1
 
 
-@pytest.mark.parametrize('failure', [RuntimeError('Navigation context destroyed'),
+@pytest.mark.parametrize('failure', [RuntimeError('Response lost after click'),
     SafetyStopException(StopReason.SEARCH_NOT_SUBMITTED, 'No POST observed')])
-def test_worker_immediately_fails_over_after_search_failure(
+def test_worker_only_fails_over_automatically_before_submission(
     tmp_path,
     monkeypatch,
     failure,
@@ -1638,7 +1643,10 @@ def test_worker_immediately_fails_over_after_search_failure(
         proxy_health_runner=_gate,
     )
 
-    assert store.get_job(job["job_id"])["status"] == "completed"
+    pre_submission = isinstance(failure, SafetyStopException)
+    assert store.get_job(job["job_id"])["status"] == (
+        "completed" if pre_submission else "waiting_capacity"
+    )
     with store.connect() as db:
         accounts = [
             row["account_id"]
@@ -1647,11 +1655,13 @@ def test_worker_immediately_fails_over_after_search_failure(
                 (job["job_id"],),
             ).fetchall()
         ]
-    assert accounts == ["a1", "a2"]
-    assert FlakyBrowserScraper.search_calls == 2
-    assert store.search_checkpoint(job["job_id"])["saved"]
+    assert accounts == (["a1", "a2"] if pre_submission else ["a1"])
+    assert FlakyBrowserScraper.search_calls == (2 if pre_submission else 1)
+    checkpoint = store.search_checkpoint(job["job_id"])
+    assert checkpoint["saved"] is pre_submission
+    assert checkpoint["uncertain"] is (not pre_submission)
     from cbrs.form_search import account_window
-    assert account_window(store.path, 'a1')['reserved'] == (0 if isinstance(failure, SafetyStopException) else 1)
+    assert account_window(store.path, 'a1')['reserved'] == (0 if pre_submission else 1)
 
 
 def test_all_uncertain_accounts_remain_pending_without_repeating_any(tmp_path, monkeypatch):
@@ -1669,9 +1679,10 @@ def test_all_uncertain_accounts_remain_pending_without_repeating_any(tmp_path, m
         once=True, scraper_factory=AlwaysUncertain, preflight_runner=_gate, proxy_health_runner=_gate)
     result = store.get_job(job['job_id'])
     assert result['status'] == 'waiting_capacity' and result['finished_at'] is None
-    assert AlwaysUncertain.calls == 3
+    assert AlwaysUncertain.calls == 1
     from cbrs.form_search import account_window
-    assert all(account_window(store.path,a)['reserved'] == 1 for a in ['a1','a2','a3'])
+    assert account_window(store.path, 'a1')['reserved'] == 1
+    assert all(account_window(store.path,a)['reserved'] == 0 for a in ['a2','a3'])
 
 
 def test_real_chrome_navigation_failover_produces_valid_pdf(tmp_path, monkeypatch):

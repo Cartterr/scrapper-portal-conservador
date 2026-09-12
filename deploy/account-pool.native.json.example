@@ -1,6 +1,6 @@
 {
   "selection_policy": "round_robin",
-  "daily_quota_per_account": 20,
+  "daily_quota_per_account": 8,
   "interval_minutes": 0,
   "job_interval_min_seconds": 10,
   "job_interval_max_seconds": 30,
@@ -20,7 +20,7 @@
       "proxy_provider": "dataimpulse_mobile_sticky",
       "proxy_brand": "DataImpulse Mobile",
       "dataimpulse_port": 10000,
-      "daily_quota": 20
+      "daily_quota": 8
     },
     {
       "id": "ejecutivo_2",
@@ -31,7 +31,7 @@
       "proxy_provider": "dataimpulse_mobile_sticky",
       "proxy_brand": "DataImpulse Mobile",
       "dataimpulse_port": 10001,
-      "daily_quota": 20
+      "daily_quota": 8
     },
     {
       "id": "ejecutivo_3",
@@ -42,7 +42,7 @@
       "proxy_provider": "dataimpulse_mobile_sticky",
       "proxy_brand": "DataImpulse Mobile",
       "dataimpulse_port": 10002,
-      "daily_quota": 20
+      "daily_quota": 8
     }
   ]
 }

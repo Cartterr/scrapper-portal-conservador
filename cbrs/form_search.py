@@ -247,6 +247,7 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
             return False
 
     submitted = False
+    clicked = False
     observed = []
     def request_sent(request):
         nonlocal submitted
@@ -270,17 +271,43 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
         # Listeners are armed before the single click. A click is not evidence
         # that a search request left the browser: expired sessions redirect
         # during the application's auth check, before its commerce POST.
+        # From this point onward a browser-side click may have reached the
+        # portal even if Playwright later reports a timeout or lost response.
+        # Mark it first so no exception can silently replay the query on a
+        # sibling account without explicit reconciliation.
+        clicked = True
         form.get_by_role('button', name='Buscar', exact=True).click(timeout=10000)
         import time
-        deadline = time.monotonic() + 90
-        submission_deadline = time.monotonic() + 15
+        submission_timeout = float(
+            getattr(browser.settings, "search_submission_timeout_seconds", 90.0)
+        )
+        response_timeout = float(
+            getattr(browser.settings, "search_response_timeout_seconds", 90.0)
+        )
+        submission_deadline = time.monotonic() + submission_timeout
+        response_deadline = None
         while not observed:
             if not submitted and runtime_module('runtime_observation').visible_login_gate(page):
                 raise SafetyStopException(StopReason.AUTH_REQUIRED,
                     'Session expired before any commerce search request', context='commerce form search')
+            if not submitted:
+                visible = urlsplit(page.url)
+                if (visible.scheme, visible.netloc, visible.path) != (
+                    origin.scheme, origin.netloc, origin.path
+                ):
+                    raise SafetyStopException(
+                        StopReason.SEARCH_NOT_SUBMITTED,
+                        'Portal left the protected search route before dispatching the commerce request',
+                        context='commerce form search',
+                    )
+            if submitted and response_deadline is None:
+                response_deadline = time.monotonic() + response_timeout
             if not submitted and time.monotonic() >= submission_deadline:
-                raise TimeoutError('Portal did not submit a commerce request within 15 seconds')
-            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    'Portal commerce submission remained unconfirmed after the single click; '
+                    'no automatic replay'
+                )
+            if response_deadline is not None and time.monotonic() >= response_deadline:
                 raise TimeoutError('Commerce search response was not observed; no automatic replay')
             page.wait_for_timeout(100)
         response = observed[0]
@@ -316,7 +343,7 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
             notify_browser_error(browser, auth)
             raise auth from exc
         notify_browser_error(browser, exc)
-        if not submitted and not isinstance(exc, SafetyStopException):
+        if not submitted and not clicked and not isinstance(exc, SafetyStopException):
             raise SafetyStopException(StopReason.SEARCH_NOT_SUBMITTED,
                 'Form could not submit a commerce request; alternate account required',
                 context='commerce form search') from exc

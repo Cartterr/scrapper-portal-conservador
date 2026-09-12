@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 from urllib.parse import urlparse
 
@@ -52,6 +53,11 @@ DEFAULT_BROWSER_HEALTHCHECK_SECONDS = 30.0
 DEFAULT_BROWSER_REAUTH_BACKOFF_SECONDS = 30.0
 DEFAULT_BROWSER_PREVIEW_INTERVAL_SECONDS = 5.0
 DEFAULT_BROWSER_PREVIEW_MAX_AGE_SECONDS = 60.0
+# The portal obtains a browser reCAPTCHA token before dispatching the commerce
+# POST.  On slower exits that routinely takes longer than the old 15-second
+# cutoff, so the submission and response windows are independent.
+DEFAULT_SEARCH_SUBMISSION_TIMEOUT_SECONDS = 90.0
+DEFAULT_SEARCH_RESPONSE_TIMEOUT_SECONDS = 90.0
 # Post-promotion pause only. A failed candidate is retried after the much
 # shorter candidate retry delay; it never waits for this cooldown.
 DEFAULT_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS = 60.0
@@ -60,12 +66,12 @@ DEFAULT_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS = 60.0
 # rejected at login, or is promoted.
 DEFAULT_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR = 30
 DEFAULT_DATAIMPULSE_CANDIDATE_RETRY_SECONDS = 10.0
-DEFAULT_DATAIMPULSE_CANDIDATES_PER_RECOVERY = 3
+DEFAULT_DATAIMPULSE_CANDIDATES_PER_RECOVERY = 10
 # Query-scope failures still fail over to another account first.
 DEFAULT_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD = 2
 # A visibly rejected login on an explicitly scoped account recovers at once.
 DEFAULT_DATAIMPULSE_LOGIN_RECOVERY_THRESHOLD = 1
-DEFAULT_DATAIMPULSE_CANARY_PER_HOUR = 6
+DEFAULT_DATAIMPULSE_CANARY_PER_HOUR = 12
 DEFAULT_DATAIMPULSE_CANARY_SPACING_SECONDS = 60.0
 ALLOWED_EGRESS_MODES = frozenset(
     {
@@ -82,6 +88,11 @@ CLOAK_REQUIRED_VERSION = "0.3.31"
 
 @dataclass(frozen=True)
 class Settings:
+    # Keep the exact, merged runtime environment available to account-pool
+    # consumers without copying credentials into account-pool.json or mutating
+    # the parent process environment.  repr/compare are disabled so secrets are
+    # never exposed by diagnostics or test failure diffs.
+    runtime_env: Mapping[str, str] = field(repr=False, compare=False)
     base_url: str
     commerce_route: str
     recaptcha_sitekey: str
@@ -118,6 +129,8 @@ class Settings:
     browser_reauth_backoff_seconds: float
     browser_preview_interval_seconds: float
     browser_preview_max_age_seconds: float
+    search_submission_timeout_seconds: float
+    search_response_timeout_seconds: float
     captcha_solver_mode: str
     two_captcha_api_key: str | None = field(repr=False)
     two_captcha_min_score: float
@@ -146,6 +159,10 @@ class Settings:
     def delay_seconds(self) -> float:
         return self.request_delay_seconds
 
+    def env_value(self, name: str, default: str | None = None) -> str | None:
+        """Read a runtime value with explicit process overrides first."""
+        return os.environ.get(name) or self.runtime_env.get(name) or default
+
     @property
     def external_captcha_provider(self) -> str | None:
         if self.captcha_solver_mode.startswith("capsolver"):
@@ -161,7 +178,10 @@ def _merged_env(dotenv_path: str | Path = ".env") -> dict[str, str]:
         for key, value in dotenv_values(dotenv_path).items()
         if value is not None
     }
-    return {**os.environ, **file_values}
+    # Match normal dotenv semantics: an explicit process value wins.  A stale
+    # or blank template must not silently replace a value supplied by a service
+    # manager or an embedding application.
+    return {**file_values, **os.environ}
 
 
 def _empty_to_none(value: str | None) -> str | None:
@@ -424,8 +444,25 @@ def load_settings(
         raise ValueError(
             "CBRS_BROWSER_PREVIEW_MAX_AGE_SECONDS must be at least twice the preview interval"
         )
+    search_submission_timeout_seconds = _float(
+        env.get("CBRS_SEARCH_SUBMISSION_TIMEOUT_SECONDS"),
+        default=DEFAULT_SEARCH_SUBMISSION_TIMEOUT_SECONDS,
+    )
+    if not 15 <= search_submission_timeout_seconds <= 300:
+        raise ValueError(
+            "CBRS_SEARCH_SUBMISSION_TIMEOUT_SECONDS must be between 15 and 300"
+        )
+    search_response_timeout_seconds = _float(
+        env.get("CBRS_SEARCH_RESPONSE_TIMEOUT_SECONDS"),
+        default=DEFAULT_SEARCH_RESPONSE_TIMEOUT_SECONDS,
+    )
+    if not 15 <= search_response_timeout_seconds <= 300:
+        raise ValueError(
+            "CBRS_SEARCH_RESPONSE_TIMEOUT_SECONDS must be between 15 and 300"
+        )
 
     return Settings(
+        runtime_env=MappingProxyType(dict(env)),
         base_url=env.get("CBRS_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
         commerce_route=env.get("CBRS_COMMERCE_ROUTE", COMMERCE_ROUTE),
         recaptcha_sitekey=env.get("CBRS_RECAPTCHA_SITEKEY", DEFAULT_RECAPTCHA_SITEKEY),
@@ -487,6 +524,8 @@ def load_settings(
         browser_reauth_backoff_seconds=browser_reauth_backoff_seconds,
         browser_preview_interval_seconds=browser_preview_interval_seconds,
         browser_preview_max_age_seconds=browser_preview_max_age_seconds,
+        search_submission_timeout_seconds=search_submission_timeout_seconds,
+        search_response_timeout_seconds=search_response_timeout_seconds,
         captcha_solver_mode=captcha_solver_mode,
         two_captcha_api_key=two_captcha_api_key,
         two_captcha_min_score=two_captcha_min_score,

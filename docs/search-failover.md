@@ -14,22 +14,39 @@ valid solution.
 ## Current behavior
 
 - Arm request listeners, fill fields with read-back, then click once.
-- A visible login gate or a confirmed failure before a commerce POST fails over
-  without charging search quota. No submitted request within 15 seconds is a
-  pre-submit failure, not an indefinitely stalled form.
+- A visible login gate or navigation away from the protected route before a
+  commerce POST fails over without charging search quota. A same-route stall
+  after the click is ambiguous and is not labelled safely unsubmitted.
+- Browser-token generation may take up to 90 seconds before the commerce POST;
+  the response then receives its own 90-second window. Both limits are
+  configurable and the button is still clicked exactly once.
 - After a possibly submitted request, preserve the uncertain attempt. Wait for
-  queued/running owner commands and the operation lease to finish. A durable
-  clearance then permits another account, never the same uncertain account.
+  queued/running owner commands and the operation lease to finish. The scheduler
+  never creates retry clearance by itself; explicit reconciliation may then
+  permit another account, never the same uncertain account.
 - Uncertain attempts retain conservative quota reservations for 24 hours. A
   second search on a different account may also consume quota; it is not an
   assertion that the first request never reached CBRS.
 - Accepted results (including an empty list) remain authoritative. Saved or
   incomplete acceptance receipts are never cleared to obtain another search.
-- Try eligible alternate accounts in the same worker pass. If none can proceed,
-  keep the request pending rather than finalize `search_outcome_unknown`.
+- Try eligible alternate accounts in the same worker pass only for proven
+  pre-submission failures. Keep `search_outcome_unknown` pending until explicit
+  reconciliation rather than spending another account silently.
 - Previously unconfirmed accounts remain excluded for that job. If every account
   has an uncertain attempt, operator reconciliation is required; do not loop
   indefinitely or forge success. Other queued jobs can continue.
+
+Después de comprobar manualmente que la inscripción **no** aparece en el
+historial del portal, el operador puede validar primero sin mutar y luego
+autorizar exactamente ese job para una cuenta distinta:
+
+```bash
+.venv/bin/python deploy/resume_unconfirmed_jobs.py JOB_ID
+.venv/bin/python deploy/resume_unconfirmed_jobs.py JOB_ID --apply
+```
+
+No ejecutar `--apply` si el historial muestra la búsqueda: en ese caso se debe
+recuperar el resultado/recibo existente sin repetir el POST.
 
 Successful sessions and proxy bindings are independent of job failover. No
 browser closure, logout or proxy rotation is part of this search retry flow.

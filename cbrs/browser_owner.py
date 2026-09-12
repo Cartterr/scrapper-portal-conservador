@@ -70,7 +70,7 @@ class BrowserOwner:
                 if state is CommerceAuthState.AUTHENTICATED_FORM:
                     return "browser_form"
             self.bindings[account_id] = binding
-            username, password = account_credentials(account)
+            username, password = account_credentials(account, self.settings)
             with self.pool.session(account_id, settings, username, password, force=bool(payload.get("force"))):
                 return "browser_form"
         entry = self.pool._entries.get(account_id)
@@ -212,7 +212,7 @@ def main():
     if args.action == "stop":
         OwnerCommands(command_path(SETTINGS)).stop()
     else:
-        if os.environ.get("CBRS_BROWSER_OWNER_MODE") != "external":
+        if SETTINGS.env_value("CBRS_BROWSER_OWNER_MODE") != "external":
             raise RuntimeError("Independent owner requires explicit external mode")
         BrowserOwner(SETTINGS, load_account_pool_config(SETTINGS), default_job_store(SETTINGS)).run()
 

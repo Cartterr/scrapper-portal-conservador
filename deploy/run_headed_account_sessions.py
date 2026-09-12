@@ -39,7 +39,7 @@ def main() -> int:
     try:
         for account in accounts:
             settings = account_settings(SETTINGS, account)
-            username, password = account_credentials(account)
+            username, password = account_credentials(account, SETTINGS)
             scraper = CBRSScraper(headless=False, settings=settings)
             scraper.__enter__()
             managers.append((account.account_id, scraper))

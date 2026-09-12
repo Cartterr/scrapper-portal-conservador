@@ -18,16 +18,16 @@ the existing Chile-targeted DataImpulse mobile credentials. Sticky candidates
 are uniformly sampled with `secrets.choice` across ports 10000 through 20000,
 excluding active/pending and previously rejected ports. Exit identity and
 country checks still apply: a new port does not guarantee a new IP. Current
-limits are three candidates per recovery, ten seconds between portal-rejected
+limits are ten candidates per recovery, ten seconds between portal-rejected
 candidates, and 30 attempts per account per hour. Existing global cooldowns,
 terminal stops and quotas are not reset by configuration changes.
 
-Live verification after activation: ejecutivo_2 sampled 18838, 17043 and 18059;
-all reached login testing and returned portal rejection. ejecutivo_3 then began
-validating 14729. This verifies fresh candidate selection for both scoped
-accounts, not successful recovery. The completed regression suite passed 450
-tests. Passive rejection checks now also inspect known LOGIN_GATE states,
-avoiding unnecessary same-route submissions when a rejection is already visible.
+The handoff review later confirmed that `ejecutivo_2` credentials work and that
+the account can authenticate through Mobile exits, but only after seven failed
+fresh candidates in the measured probe. The ten-candidate batch now covers that
+observed eighth-exit success while preserving the 30-attempt hourly ceiling.
+Passive rejection checks also inspect known LOGIN_GATE states, avoiding
+unnecessary same-route submissions when a rejection is already visible.
 
 The Linux stack is live, but full account parity is still pending: one account
 completed a new search and PDF download; two accounts are still receiving the

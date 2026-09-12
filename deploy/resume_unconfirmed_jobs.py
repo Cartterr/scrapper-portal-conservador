@@ -1,4 +1,4 @@
-"""Explicitly resume named historical unconfirmed jobs; never erase attempts."""
+"""Explicitly resume named unconfirmed jobs after portal-history review."""
 import argparse
 import json
 import os
@@ -17,15 +17,32 @@ def main():
     args = parser.parse_args()
     from dotenv import dotenv_values
     from cbrs.paths import prepare_environment
-    os.environ.update(prepare_environment({**os.environ, **dotenv_values(ROOT / '.env')}, ROOT))
+    file_env = {
+        key: value
+        for key, value in dotenv_values(ROOT / '.env').items()
+        if value is not None
+    }
+    os.environ.update(prepare_environment({**file_env, **os.environ}, ROOT))
     from cbrs.config import SETTINGS
     from cbrs.jobs import default_job_store, utc_now
     from cbrs.owner_protocol import command_path
     store = default_job_store()
     for job_id in args.job_ids:
         job = store.get_job(job_id)
-        if not job or job['status'] != 'failed' or job['error_code'] != 'search_outcome_unknown':
-            raise ValueError('Only explicitly named historical unconfirmed failures can be resumed')
+        historical = bool(
+            job
+            and job['status'] == 'failed'
+            and job['error_code'] == 'search_outcome_unknown'
+        )
+        awaiting_reconciliation = bool(
+            job
+            and job['status'] == 'waiting_capacity'
+            and job['error_code'] == 'search_reconciliation_required'
+        )
+        if not historical and not awaiting_reconciliation:
+            raise ValueError(
+                'Only named unconfirmed jobs awaiting explicit reconciliation can be resumed'
+            )
         with sqlite3.connect(f'{command_path(SETTINGS).as_uri()}?mode=ro', uri=True) as db:
             if db.execute("SELECT 1 FROM owner_commands WHERE job_id=? AND state IN ('queued','running')", (job_id,)).fetchone():
                 raise RuntimeError('Existing owner command must finish first')
@@ -36,12 +53,21 @@ def main():
                 changed = db.execute("""UPDATE jobs SET status='queued', finished_at=NULL,
                     error_code=NULL,error_message=NULL,next_run_at=?,updated_at=?,
                     worker_owner=NULL,lease_expires_at=NULL,current_account_id=NULL
-                    WHERE job_id=? AND status='failed' AND result_count IS NULL AND cancel_requested=0""",
+                    WHERE job_id=? AND result_count IS NULL AND cancel_requested=0
+                      AND ((status='failed' AND error_code='search_outcome_unknown')
+                        OR (status='waiting_capacity'
+                          AND error_code='search_reconciliation_required'))""",
                     (utc_now(),utc_now(),job_id)).rowcount
                 if changed:
-                    store._add_event_db(db,job_id,'historical_job_resumed',
+                    store._add_event_db(db,job_id,'uncertain_job_reconciled',
                         {'policy':'alternate_account_only','attempt_history_preserved':True})
-        print(json.dumps({'job_id':job_id,'applied':args.apply}))
+        print(json.dumps({
+            'job_id': job_id,
+            'eligible': True,
+            'prior_status': job['status'],
+            'prior_reason': job['error_code'],
+            'applied': args.apply,
+        }))
 
 
 if __name__ == '__main__':

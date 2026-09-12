@@ -14,7 +14,9 @@ Las búsquedas por texto conservan su implementación anterior; este cambio cubr
 FNA, utilizado por los seis fixtures de endurance.
 
 No se navega ni refresca automáticamente una sesión existente. La ruta y el
-formulario deben estar abiertos; si no, el job falla de forma acotada. No se
+formulario deben estar abiertos; si no, el job falla de forma acotada. El token
+del navegador puede tardar hasta 90 segundos antes del POST y la respuesta tiene
+una ventana separada de 90 segundos. No se
 presupone que un cambio visual equivalga a un logout. Timeout, respuesta inválida
 o `intente-mas-tarde` nunca generan otro click ni fallback silencioso al API.
 Los controles de cuota, cooldown, circuitos y preservación del worker se mantienen.
@@ -26,8 +28,9 @@ generación pagada y aceptación siguen registrándose por el cliente existente.
 Un error temporal genérico NO se convierte en una autorización CAPTCHA.
 
 Pruebas: Chrome nativo efímero con rutas interceptadas localmente para comprobar
-fill/click/respuesta, ignorar recientes, lista vacía, error temporal y formato
-inválido. No se usan sesiones, cuentas ni tráfico CBRS reales en estos tests.
+fill/click/respuesta, token lento, stall ambiguo, navegación pre-POST, ignorar
+recientes, lista vacía, error temporal y formato inválido. No se usan sesiones,
+cuentas ni tráfico CBRS reales en estos tests.
 Esto demuestra integración local, no fiabilidad de largo plazo en el portal.
 
 Activación pendiente: el worker vivo no ha sido reiniciado ni modificado en

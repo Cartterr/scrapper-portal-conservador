@@ -1,5 +1,5 @@
 {
-  "daily_quota_per_account": 20,
+  "daily_quota_per_account": 8,
   "selection_policy": "round_robin",
   "interval_minutes": 0,
   "job_interval_min_seconds": 10,
@@ -14,26 +14,32 @@
     {
       "id": "ejecutivo_1",
       "label": "Ejecutivo 1",
-      "username_env": "CBRS_ACCOUNT_1_USERNAME",
-      "password_env": "CBRS_ACCOUNT_1_PASSWORD",
-      "proxy_url_env": "CBRS_ACCOUNT_1_PROXY_URL",
-      "daily_quota": 20
+      "username_env": "CBRS_EJECUTIVO_1_USERNAME",
+      "password_env": "CBRS_EJECUTIVO_1_PASSWORD",
+      "proxy_provider": "dataimpulse_mobile_sticky",
+      "proxy_brand": "DataImpulse Mobile",
+      "dataimpulse_port": 10000,
+      "daily_quota": 8
     },
     {
       "id": "ejecutivo_2",
       "label": "Ejecutivo 2",
-      "username_env": "CBRS_ACCOUNT_2_USERNAME",
-      "password_env": "CBRS_ACCOUNT_2_PASSWORD",
-      "proxy_url_env": "CBRS_ACCOUNT_2_PROXY_URL",
-      "daily_quota": 20
+      "username_env": "CBRS_EJECUTIVO_2_USERNAME",
+      "password_env": "CBRS_EJECUTIVO_2_PASSWORD",
+      "proxy_provider": "dataimpulse_mobile_sticky",
+      "proxy_brand": "DataImpulse Mobile",
+      "dataimpulse_port": 10001,
+      "daily_quota": 8
     },
     {
       "id": "ejecutivo_3",
       "label": "Ejecutivo 3",
-      "username_env": "CBRS_ACCOUNT_3_USERNAME",
-      "password_env": "CBRS_ACCOUNT_3_PASSWORD",
-      "proxy_url_env": "CBRS_ACCOUNT_3_PROXY_URL",
-      "daily_quota": 20
+      "username_env": "CBRS_EJECUTIVO_3_USERNAME",
+      "password_env": "CBRS_EJECUTIVO_3_PASSWORD",
+      "proxy_provider": "dataimpulse_mobile_sticky",
+      "proxy_brand": "DataImpulse Mobile",
+      "dataimpulse_port": 10002,
+      "daily_quota": 8
     }
   ]
 }

@@ -97,6 +97,88 @@ def test_startup_and_idle_rejections_share_recovery_without_touching_healthy_con
     assert store.account_check("a3")["browser_last_auth_error"] == "login_rejected"
 
 
+def test_scoped_standalone_startup_recovers_a_dead_initial_mobile_route(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS", "a2")
+    monkeypatch.setenv("CBRS_BROWSER_OWNER_MODE", "embedded")
+    settings, config, store, pool_store, pool = setup_runtime(tmp_path, monkeypatch)
+    monkeypatch.setattr(jobs, "_ensure_account_gate", lambda *args, **kwargs: False)
+    recovered = []
+
+    def rotate(account, *args, **kwargs):
+        recovered.append(account.account_id)
+        if account.account_id == "a2":
+            pool_store.mark_account_available("test-run", account.account_id)
+            return True
+        return False
+
+    monkeypatch.setattr(jobs, "_rotate_dataimpulse_route", rotate)
+    jobs._run_startup_gates(
+        settings,
+        config,
+        store,
+        pool_store,
+        "test-run",
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+        pool,
+    )
+
+    assert recovered == ["a2"]
+    states = {row["account_id"]: row for row in pool_store.accounts("test-run")}
+    assert states["a2"]["status"] == "available"
+    events = [event["event"] for event in store.recent_events(limit=20)]
+    assert "startup_mobile_route_recovered" in events
+
+
+@pytest.mark.parametrize(
+    "owner_mode,replacement_scope,protected",
+    [
+        ("external", "a2", False),
+        ("embedded", "", False),
+        ("embedded", "a2", True),
+    ],
+)
+def test_startup_dead_route_recovery_never_crosses_preservation_scope(
+    tmp_path,
+    monkeypatch,
+    owner_mode,
+    replacement_scope,
+    protected,
+):
+    monkeypatch.setenv("CBRS_BROWSER_OWNER_MODE", owner_mode)
+    monkeypatch.setenv(
+        "CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS", replacement_scope
+    )
+    settings, config, store, pool_store, pool = setup_runtime(tmp_path, monkeypatch)
+    monkeypatch.setattr(jobs, "_ensure_account_gate", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        pool,
+        "has_protected_session",
+        lambda account_id: protected and account_id == "a2",
+    )
+    recovered = []
+    monkeypatch.setattr(
+        jobs,
+        "_rotate_dataimpulse_route",
+        lambda account, *args, **kwargs: recovered.append(account.account_id) or True,
+    )
+
+    jobs._run_startup_gates(
+        settings,
+        config,
+        store,
+        pool_store,
+        "test-run",
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+        pool,
+    )
+
+    assert recovered == []
+
+
 def test_first_visible_login_rejection_starts_recovery_by_default(tmp_path, monkeypatch):
     default_threshold = load_settings({}, root=tmp_path).dataimpulse_login_recovery_threshold
     assert default_threshold == 1
@@ -319,9 +401,13 @@ def test_continuous_worker_retains_contexts_after_scheduler_error_until_stop(tmp
 
 
 def candidate_runtime(tmp_path, monkeypatch, *, accepted=True, persistence_error=False, same_exit=False,
-                      gate_results=None, login_results=None, retry_seconds=0):
+                      gate_results=None, login_results=None, retry_seconds=0,
+                      candidates_per_recovery=None):
+    overrides = {"dataimpulse_candidate_retry_seconds": retry_seconds}
+    if candidates_per_recovery is not None:
+        overrides["dataimpulse_candidates_per_recovery"] = candidates_per_recovery
     settings, config, store, pool_store, pool = setup_runtime(
-        tmp_path, monkeypatch, dataimpulse_candidate_retry_seconds=retry_seconds)
+        tmp_path, monkeypatch, **overrides)
     old = pool.scraper_factory()
     pool._entries["a2"] = jobs._ManagedAccountScraper(manager=old, scraper=old, settings=settings)
     healthy = pool.scraper_factory()
@@ -429,12 +515,15 @@ def test_transport_failure_moves_to_the_next_port_without_waiting(tmp_path, monk
     failed = [json.loads(e["data_json"]) for e in store.recent_events(limit=20)
               if e["event"] == "dataimpulse_rotation_failed"]
     assert failed and failed[0]["reason"] == "candidate_connectivity_failed"
-    assert failed[0]["candidate_attempt"] == 1 and failed[0]["candidate_attempts_allowed"] == 3
+    assert failed[0]["candidate_attempt"] == 1 and failed[0]["candidate_attempts_allowed"] == 10
 
 
 def test_recovery_call_is_bounded_by_candidates_per_recovery(tmp_path, monkeypatch):
+    # The setting remains an explicit hard boundary even though the safer
+    # production default now covers the observed eighth-exit success case.
     ok, pool, store, old, healthy, probes, closed, baselines = candidate_runtime(
         tmp_path, monkeypatch, accepted=False,
+        candidates_per_recovery=3,
         gate_results=["e1", "e1", "e2", "e2", "e3", "e3", "e4", "e4"])
     assert not ok
     assert len(probes) == 3 and closed == probes
@@ -445,6 +534,26 @@ def test_recovery_call_is_bounded_by_candidates_per_recovery(tmp_path, monkeypat
     assert route["cooldown_until"] is None  # retry delay 0: eligible at once
     assert [row["outcome"] for row in store.recent_candidate_attempts("a2")] == [
         "candidate_login_rejected"] * 3
+
+
+def test_default_recovery_can_reach_the_observed_eighth_fresh_exit(tmp_path, monkeypatch):
+    gates = []
+    for index in range(1, 9):
+        gates.extend([f"exit-{index}", f"exit-{index}"])
+    ok, pool, store, old, healthy, probes, closed, baselines = candidate_runtime(
+        tmp_path,
+        monkeypatch,
+        gate_results=gates,
+        login_results=[False] * 7 + [True],
+    )
+    assert ok
+    assert len(probes) == 8
+    assert closed == probes[:7]
+    assert pool._entries["a2"].scraper is probes[7]
+    assert pool._entries["a1"].scraper is healthy
+    assert any(entry.scraper is old for account, entry in pool._retained_entries if account == "a2")
+    assert baselines == ["exit-8"]
+    assert store.dataimpulse_route("a2")["rotation_count"] == 8
 
 
 def test_exhausted_allowance_pauses_the_account_until_the_window_boundary(tmp_path, monkeypatch):
@@ -498,7 +607,7 @@ def test_mobile_canary_budget_is_pool_wide_durable_and_bounded(tmp_path):
         store.set_control("mobile_login_canary", json.dumps(state))
     assert not store.reserve_mobile_login_canary(**budget)
     defaults = load_settings({}, root=tmp_path)
-    assert (defaults.dataimpulse_canary_per_hour, defaults.dataimpulse_canary_spacing_seconds) == (6, 60.0)
+    assert (defaults.dataimpulse_canary_per_hour, defaults.dataimpulse_canary_spacing_seconds) == (12, 60.0)
 
 
 def test_failed_exit_history_is_durable_and_expires(tmp_path):

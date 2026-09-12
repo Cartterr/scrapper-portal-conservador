@@ -455,13 +455,10 @@ class _PersistentAccountBrowsers:
         return any(entry.authenticated_once for entry in entries)
 
     def can_replace_rejected_login(self, account_id: str) -> bool:
-        allowed = {v.strip() for v in os.environ.get(
-            "CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS", ""
-        ).split(",") if v.strip()}
-        if account_id not in allowed:
-            return False
         current = self._entries.get(account_id)
         if current is None:
+            return False
+        if not _replacement_account_scoped(getattr(current, "settings", None), account_id):
             return False
         browser = getattr(current.scraper, "browser", current.scraper)
         if getattr(browser, 'is_remote', False):
@@ -3004,7 +3001,7 @@ def run_job_worker(
     )
     runtime_headless = settings.headless if headless is None else headless
     worker_id = f"{socket.gethostname()}-{os.getpid()}-{secrets.token_hex(3)}"
-    owner_mode = os.environ.get("CBRS_BROWSER_OWNER_MODE", "embedded")
+    owner_mode = settings.env_value("CBRS_BROWSER_OWNER_MODE", "embedded")
     if owner_mode not in {"embedded", "external"}:
         raise ValueError("Invalid browser owner mode")
     if supplied_factory is None and owner_mode == "external":
@@ -3320,11 +3317,40 @@ def _run_startup_gates(
             force=True,
         )
         if not gate_ok:
+            # A fresh standalone account can recover from a dead initial Mobile
+            # port without editing SQLite. This path is deliberately narrower
+            # than rejected-login replacement: it requires explicit account
+            # scope, embedded ownership, and no current or retained protected
+            # browser to preserve.
+            if (
+                _is_dataimpulse_account(account)
+                and settings.env_value("CBRS_BROWSER_OWNER_MODE", "embedded")
+                == "embedded"
+                and _replacement_account_scoped(settings, account.account_id)
+                and not browser_pool.has_protected_session(account.account_id)
+                and _rotate_dataimpulse_route(
+                    account,
+                    settings,
+                    store,
+                    pool_store,
+                    run_id,
+                    browser_pool,
+                    preflight_runner,
+                    proxy_health_runner,
+                    reason="initial_mobile_route_gate_failed",
+                )
+            ):
+                store.set_account_check(account.account_id, session_checked=True)
+                store.add_event(
+                    "startup_mobile_route_recovered",
+                    account_id=account.account_id,
+                    data={"authenticated_candidate_adopted": True},
+                )
             continue
         username = ""
         password = ""
         try:
-            username, password = account_credentials(account)
+            username, password = account_credentials(account, settings)
             with browser_pool.session(
                 account.account_id,
                 runtime_settings,
@@ -3577,6 +3603,20 @@ def _is_dataimpulse_account(account: PoolAccount) -> bool:
     return account.proxy_provider in DATAIMPULSE_STICKY_PROVIDERS
 
 
+def _replacement_account_scoped(settings: Settings | None, account_id: str) -> bool:
+    raw = (
+        settings.env_value("CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS", "")
+        if settings is not None
+        else os.environ.get("CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS", "")
+    )
+    allowed = {
+        value.strip()
+        for value in str(raw or "").split(",")
+        if value.strip()
+    }
+    return account_id in allowed
+
+
 def _dataimpulse_failure_kind(exc: Exception) -> str:
     from .dataimpulse import classify_dataimpulse_failure
 
@@ -3655,7 +3695,7 @@ def _rotate_dataimpulse_route(
     up, or when a stop request / global cooldown appears. Every attempt is
     written to the candidate ledger with its own failure class.
     """
-    if os.environ.get("CBRS_BROWSER_OWNER_MODE") == "external" and not _owner_execution:
+    if settings.env_value("CBRS_BROWSER_OWNER_MODE") == "external" and not _owner_execution:
         from .owner_protocol import owner_preserves_recovery_contexts
         if not owner_preserves_recovery_contexts(settings, store):
             store.add_event('dataimpulse_rotation_skipped', account_id=account.account_id,
@@ -3820,7 +3860,7 @@ def _try_dataimpulse_candidate(
         # route durable.  This standalone context uses the exact profile that
         # the worker will retain after promotion while the current account
         # context remains untouched until the candidate succeeds.
-        username, password = account_credentials(account)
+        username, password = account_credentials(account, settings)
         try:
             candidate_manager = browser_pool.scraper_factory(
                 headless=browser_pool.headless,

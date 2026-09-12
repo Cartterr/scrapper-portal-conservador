@@ -178,6 +178,68 @@ def test_navigation_before_commerce_post_is_safe_to_fail_over(test_chrome):
         page.close()
 
 
+def test_post_click_stall_is_uncertain_not_safe_to_fail_over(test_chrome):
+    page = test_chrome.new_page()
+    try:
+        html = HTML.replace('submitSearch()', 'void 0', 1)
+        page.route(
+            'http://localhost:19999/**',
+            lambda route: route.fulfill(
+                body=html, content_type='text/html; charset=utf-8'
+            ),
+        )
+        page.goto('http://localhost:19999/protected')
+        browser = SimpleNamespace(
+            page=page,
+            settings=SimpleNamespace(
+                commerce_url=page.url,
+                search_submission_timeout_seconds=0.2,
+                search_response_timeout_seconds=0.2,
+            ),
+        )
+        with pytest.raises(TimeoutError, match='remained unconfirmed'):
+            search_fna_form(browser, 1, 2, 2000, client=None, pace=lambda _: None)
+    finally:
+        page.close()
+
+
+def test_slow_browser_token_submission_is_captured_once(test_chrome):
+    page = test_chrome.new_page()
+    requests = []
+    try:
+        html = HTML.replace(
+            'const body={',
+            'await new Promise(resolve=>setTimeout(resolve,300)); const body={',
+        )
+
+        def serve(route):
+            if route.request.url.endswith('/protected'):
+                route.fulfill(content_type='text/html; charset=utf-8', body=html)
+            elif route.request.url.endswith('/texto'):
+                requests.append(route.request.post_data_json)
+                route.fulfill(content_type='application/json', body='[]')
+            else:
+                route.fulfill(content_type='application/json', body='{}')
+
+        page.route('**/*', serve)
+        page.goto('http://127.0.0.1:19999/protected')
+        browser = SimpleNamespace(
+            page=page,
+            settings=SimpleNamespace(
+                commerce_url=page.url,
+                search_submission_timeout_seconds=1.0,
+                search_response_timeout_seconds=1.0,
+            ),
+        )
+        assert search_fna_form(
+            browser, 9441, 4580, 1980, client=None, pace=lambda _: None
+        ) == []
+        assert requests == [{'foja': '9441', 'numero': '4580', 'ano': '1980'}]
+        assert page.evaluate('window.clicks') == 1
+    finally:
+        page.close()
+
+
 @pytest.mark.parametrize('status,body,expected', [
     (200, [{'ticket': 'test-ticket', 'foja': 9441}], 'success'),
     (200, [], 'success'),

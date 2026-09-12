@@ -3,7 +3,7 @@
 ## Configuración de producción vigente (07-09-2026)
 
 Esta sección prevalece sobre los ejemplos históricos inferiores. El despliegue
-actual usa **Mobile Proxy / Plan 2**, Chrome normal visible en Windows nativo y
+actual usa **Mobile Proxy / Plan 2**, Chrome normal headed en Xvfb/WSL y
 un browser-owner independiente. No usar credenciales de Residential Plan 1 ni
 del dashboard como sustituto, ni cambiar automáticamente a residencial.
 
@@ -25,15 +25,15 @@ DATAIMPULSE_ASN=
 DATAIMPULSE_STICKY_TTL_MINUTES=120
 DATAIMPULSE_STICKY_PORT_MIN=10000
 DATAIMPULSE_STICKY_PORT_MAX=20000
-CBRS_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS=300
-CBRS_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR=3
-CBRS_DATAIMPULSE_CANDIDATE_RETRY_SECONDS=300
-CBRS_DATAIMPULSE_CANDIDATES_PER_RECOVERY=1
+CBRS_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS=60
+CBRS_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR=30
+CBRS_DATAIMPULSE_CANDIDATE_RETRY_SECONDS=10
+CBRS_DATAIMPULSE_CANDIDATES_PER_RECOVERY=10
 CBRS_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD=2
-CBRS_DATAIMPULSE_LOGIN_RECOVERY_THRESHOLD=2
-CBRS_DATAIMPULSE_CANARY_PER_HOUR=3
-CBRS_DATAIMPULSE_CANARY_SPACING_SECONDS=300
-CBRS_BROWSER_REAUTH_BACKOFF_SECONDS=60
+CBRS_DATAIMPULSE_LOGIN_RECOVERY_THRESHOLD=1
+CBRS_DATAIMPULSE_CANARY_PER_HOUR=12
+CBRS_DATAIMPULSE_CANARY_SPACING_SECONDS=60
+CBRS_BROWSER_REAUTH_BACKOFF_SECONDS=30
 ```
 
 El código compone los parámetros de usuario `__cr.cl;sessttl.120`; no duplicar
@@ -76,8 +76,8 @@ fiabilidad indefinida ni elimina errores funcionales del portal.
 > después de esa detención explícita. [AGENTS.md](../AGENTS.md) tiene prioridad.
 
 Esta es la referencia de onboarding y recuperación para el cliente y para un LLM
-que opere el runtime local. El entorno soportado es Windows nativo con Chrome
-headless persistente; no usa Docker, WSL, VM ni servicios cloud propios.
+que opere el runtime local. El entorno activo es Ubuntu/WSL con Chrome normal
+headed en Xvfb y owner independiente; no usa Docker ni servicios cloud propios.
 
 ## Contrato operativo
 
@@ -106,18 +106,18 @@ administrativas del panel no son usadas por el runtime y no pertenecen al entorn
 
 ## Configuración y secretos
 
-Usar `.env.example` como inventario y escribir valores reales solamente en
-`C:\ProgramData\CBRS\cbrs.env`, cuya ACL debe limitarse al usuario autorizado y
-`SYSTEM`. `G:\CBRS\account-pool.json` contiene `dataimpulse_port`, nunca una URL
-con usuario o contraseña. La fuente protegida y el `.env` local deben mantenerse
-en paridad mediante el script transaccional de migración.
+Usar `.env.example` como inventario y escribir valores reales solamente en el
+`.env` ignorado por Git del checkout Linux, con modo `0600` y dueño del servicio.
+`.cbrs/runtime/account-pool.json` contiene `dataimpulse_port`, nunca una URL con
+usuario o contraseña. Los paths Windows que aparecen en la sección de rollback
+son históricos y no se usan en paralelo con el runtime activo.
 
 Claves principales:
 
 ```dotenv
 CBRS_EGRESS_MODE=mobile_sticky
 CBRS_EXPECTED_EGRESS_COUNTRY=CL
-CBRS_HEADLESS=1
+CBRS_HEADLESS=0
 CBRS_WINDOW_MODE=normal
 DATAIMPULSE_PROXY_HOST=gw.dataimpulse.com
 DATAIMPULSE_PROXY_SCHEME=http
@@ -196,7 +196,7 @@ Cuando ninguna cuenta proxy ha tenido éxito reciente, un rechazo de **login**
 HTTP 400 (`CBRS_DATAIMPULSE_LOGIN_RECOVERY_THRESHOLD`, por defecto 1) permite
 una prueba Mobile acotada después de respetar el cooldown global:
 `CBRS_DATAIMPULSE_CANARY_PER_HOUR` candidatos por hora para todo el pool (por
-defecto 6) separados por `CBRS_DATAIMPULSE_CANARY_SPACING_SECONDS` (60 s). Este
+defecto 12) separados por `CBRS_DATAIMPULSE_CANARY_SPACING_SECONDS` (60 s). Este
 presupuesto es durable y adicional al límite por cuenta. No aplica a CAPTCHA/WAF
 explícito, credenciales inválidas ni errores terminales del proveedor.
 Un resultado fallido conserva el backoff global; no demuestra un ban ni lo elude
@@ -254,7 +254,7 @@ contextos permanecen vivos.
 Ritmo y presupuesto de la recuperación (valores por defecto):
 
 - Una llamada de recuperación prueba hasta `CBRS_DATAIMPULSE_CANDIDATES_PER_RECOVERY`
-  (3) puertos seguidos. Un fallo de transporte (preflight, salud del proxy,
+  (10) puertos seguidos. Un fallo de transporte (preflight, salud del proxy,
   salida repetida) pasa al siguiente puerto de inmediato; un rechazo de login del
   portal espera `CBRS_DATAIMPULSE_CANDIDATE_RETRY_SECONDS` (10 s).
 - `CBRS_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR` (30) es el **cupo de reintentos**
@@ -286,12 +286,13 @@ rechazado), `login_page_rejected` (página de login rechazada) y
 
 Para una prueba controlada o recuperación operativa, la solicitud debe enviarse
 al worker que ya posee el lease y los tres contextos. El comando no contiene ni
-imprime credenciales y solo reinicia el contexto de la cuenta indicada:
+imprime credenciales: conserva el contexto anterior y adopta exactamente el
+candidato autenticado de la cuenta indicada:
 
-```powershell
-.\.venv\Scripts\python.exe deploy\run_with_env.py C:\ProgramData\CBRS\cbrs.env -- `
-  .\.venv\Scripts\python.exe -m cbrs jobs proxy-rotate `
-  --account ejecutivo_2 --reason controlled_e2e_recovery `
+```bash
+cd /opt/scrapper-portal-conservador
+.venv/bin/python -m cbrs jobs proxy-rotate \
+  --account ejecutivo_2 --reason controlled_e2e_recovery \
   --acknowledge-authorized-live-traffic
 ```
 

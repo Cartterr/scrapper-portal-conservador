@@ -127,6 +127,37 @@ def test_settings_parse_production_defaults(tmp_path: Path) -> None:
     assert settings.output_dir == tmp_path / ".cbrs/runtime/outputs"
     assert settings.log_dir == tmp_path / ".cbrs/runtime/logs"
     assert settings.allow_cloak_auto_update is False
+    assert settings.search_submission_timeout_seconds == 90
+    assert settings.search_response_timeout_seconds == 90
+    assert settings.dataimpulse_candidates_per_recovery == 10
+    assert settings.dataimpulse_canary_per_hour == 12
+
+
+def test_search_timeouts_are_bounded(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="SUBMISSION_TIMEOUT"):
+        load_settings({"CBRS_SEARCH_SUBMISSION_TIMEOUT_SECONDS": "14"}, root=tmp_path)
+    with pytest.raises(ValueError, match="RESPONSE_TIMEOUT"):
+        load_settings({"CBRS_SEARCH_RESPONSE_TIMEOUT_SECONDS": "301"}, root=tmp_path)
+
+
+def test_dotenv_runtime_controls_are_available_without_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CBRS_BROWSER_OWNER_MODE", raising=False)
+    monkeypatch.delenv("CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS", raising=False)
+    (tmp_path / ".env").write_text(
+        "CBRS_BROWSER_OWNER_MODE=embedded\n"
+        "CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS=ejecutivo_2,ejecutivo_3\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(root=tmp_path)
+
+    assert settings.env_value("CBRS_BROWSER_OWNER_MODE") == "embedded"
+    assert settings.env_value("CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS") == (
+        "ejecutivo_2,ejecutivo_3"
+    )
 
 
 def test_legacy_cloak_profile_default_is_only_for_cloak_backend(tmp_path: Path) -> None:

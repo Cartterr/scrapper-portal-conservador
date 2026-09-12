@@ -32,7 +32,11 @@ from .validation import (
 )
 
 DEFAULT_ACCOUNT_POOL_CONFIG = ".cbrs/runtime/account-pool.json"
-DEFAULT_DAILY_QUOTA_PER_ACCOUNT = 20
+# Conservative September 2026 observation was 7-9 accepted searches before
+# CBRS displayed its own daily-limit dialog.  Keep the default below the
+# unverified historical contract assumption of 20; deployments may override it
+# only with an account-specific confirmed allowance.
+DEFAULT_DAILY_QUOTA_PER_ACCOUNT = 8
 DEFAULT_INTERVAL_MINUTES = 5.0
 DEFAULT_DASHBOARD_HOST = "127.0.0.1"
 DEFAULT_DASHBOARD_PORT = 8765
@@ -914,7 +918,7 @@ def load_account_pool_config(
     for account in config.accounts:
         if not account.enabled or not account.proxy_url_env:
             continue
-        proxy_value = os.environ.get(account.proxy_url_env)
+        proxy_value = settings.env_value(account.proxy_url_env)
         if proxy_value:
             accounts_by_proxy.setdefault(proxy_value, []).append(account)
     for shared_accounts in accounts_by_proxy.values():
@@ -964,7 +968,7 @@ def account_settings(
             scheme=settings.dataimpulse_proxy_scheme,
         )
     elif account.proxy_url_env:
-        proxy_url = os.environ.get(account.proxy_url_env)
+        proxy_url = settings.env_value(account.proxy_url_env)
         if not proxy_url:
             raise ValueError(
                 f"Pool account {account.account_id} requires env var "
@@ -982,14 +986,17 @@ def account_settings(
     )
 
 
-def account_credentials(account: PoolAccount) -> tuple[str, str]:
+def account_credentials(
+    account: PoolAccount,
+    settings: Settings = SETTINGS,
+) -> tuple[str, str]:
     if not account.username_env or not account.password_env:
         raise ValueError(
             f"Pool account {account.account_id} requires username_env and password_env "
             "for unattended authentication."
         )
-    username = os.environ.get(account.username_env)
-    password = os.environ.get(account.password_env)
+    username = settings.env_value(account.username_env)
+    password = settings.env_value(account.password_env)
     missing = [
         name
         for name, value in (
@@ -1191,7 +1198,7 @@ def _run_account_session_validation(
     try:
         with CBRSScraper(headless=False, settings=settings) as scraper:
             if account.username_env and account.password_env:
-                username, password = account_credentials(account)
+                username, password = account_credentials(account, settings)
                 scraper.ensure_authenticated(username, password)
             elif not scraper.browser.has_active_login():
                 raise SafetyStopException(

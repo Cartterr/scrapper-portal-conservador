@@ -95,10 +95,20 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
             if command_db.exists():
                 with sqlite3.connect(f'{command_db.as_uri()}?mode=ro', uri=True) as db:
                     pending = db.execute("SELECT 1 FROM owner_commands WHERE job_id=? AND operation IN ('search_fna','search_text') AND state IN ('queued','running')", (job.job_id,)).fetchone() is not None
-            if pending or not store.authorize_alternate_search(job.job_id):
-                store.set_waiting(job.job_id,'waiting_capacity',reason='awaiting_previous_operation')
-                return 'waiting_capacity'
-            continue
+            # A lost/late response after the single click may already have
+            # consumed CBRS quota. Never mint retry clearance in the scheduler:
+            # an operator/reconciliation tool must explicitly authorize a
+            # sibling only after checking the portal history/evidence.
+            store.set_waiting(
+                job.job_id,
+                'waiting_capacity',
+                reason=(
+                    'awaiting_previous_operation'
+                    if pending
+                    else 'search_reconciliation_required'
+                ),
+            )
+            return 'waiting_capacity'
         if checkpoint['saved']:
             if checkpoint['result_count'] == 0:
                 return store.finalize_job(job.job_id)
@@ -156,7 +166,7 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
         if not core._ensure_account_gate(account, runtime_settings, store, pool_store, run_id, preflight_runner, proxy_health_runner):
             continue
         try:
-            username, password = core.account_credentials(account)
+            username, password = core.account_credentials(account, settings)
         except ValueError as exc:
             pool_store.pause_account(run_id, account.account_id, reason='credentials_missing')
             store.add_event('account_credentials_missing', job_id=job.job_id, account_id=account.account_id, level='error', data={'error': str(exc)})

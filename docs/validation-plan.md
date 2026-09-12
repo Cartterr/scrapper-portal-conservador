@@ -1,8 +1,7 @@
 # Plan de validación del runtime productivo CBRS
 
-> La ruta activa es Windows nativo. Toda referencia Ubuntu/WSL2 debajo es
-> histórica; los criterios vigentes están en
-> [`native-windows-endurance.md`](native-windows-endurance.md).
+> La ruta activa es Ubuntu dentro de WSL2. Los criterios operativos vigentes
+> están en [`linux-service.md`](linux-service.md); Windows es solo rollback.
 
 ## 1. Gate offline
 

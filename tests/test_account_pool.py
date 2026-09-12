@@ -30,8 +30,8 @@ def test_pool_config_defaults_to_three_nominal_accounts(tmp_path: Path) -> None:
         "Ejecutivo 2",
         "Ejecutivo 3",
     ]
-    assert config.daily_quota_per_account == 20
-    assert config.pool_daily_quota == 60
+    assert config.daily_quota_per_account == 8
+    assert config.pool_daily_quota == 24
     assert config.interval_minutes == 5
     assert config.allow_live_repetition is False
     assert (
@@ -337,6 +337,68 @@ def test_pool_config_rejects_shared_proxy_reference_between_enabled_accounts(
 
     with pytest.raises(ValueError, match="distinct proxy_url_env"):
         load_account_pool_config(settings, path=config_path)
+
+
+def test_account_credentials_and_proxy_load_from_repository_dotenv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cbrs.account_pool import account_credentials, account_settings, load_account_pool_config
+
+    monkeypatch.delenv("CBRS_EMBEDDED_USERNAME", raising=False)
+    monkeypatch.delenv("CBRS_EMBEDDED_PASSWORD", raising=False)
+    monkeypatch.delenv("CBRS_EMBEDDED_PROXY", raising=False)
+    (tmp_path / ".env").write_text(
+        "CBRS_EMBEDDED_USERNAME=dotenv-user\n"
+        "CBRS_EMBEDDED_PASSWORD=dotenv-password\n"
+        "CBRS_EMBEDDED_PROXY=http://proxy-user:proxy-password@example.test:8080\n",
+        encoding="utf-8",
+    )
+    settings = load_settings(root=tmp_path)
+    config_path = tmp_path / "pool.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "id": "embedded",
+                        "username_env": "CBRS_EMBEDDED_USERNAME",
+                        "password_env": "CBRS_EMBEDDED_PASSWORD",
+                        "proxy_url_env": "CBRS_EMBEDDED_PROXY",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    account = load_account_pool_config(settings, path=config_path).accounts[0]
+
+    assert account_credentials(account, settings) == ("dotenv-user", "dotenv-password")
+    assert account_settings(settings, account).proxy_url.endswith("@example.test:8080")
+    assert "dotenv-password" not in repr(settings)
+
+
+def test_process_environment_overrides_repository_dotenv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cbrs.account_pool import PoolAccount, account_credentials
+
+    (tmp_path / ".env").write_text(
+        "CBRS_OVERRIDE_USERNAME=file-user\nCBRS_OVERRIDE_PASSWORD=file-password\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CBRS_OVERRIDE_USERNAME", "process-user")
+    monkeypatch.setenv("CBRS_OVERRIDE_PASSWORD", "process-password")
+    settings = load_settings(root=tmp_path)
+    account = PoolAccount(
+        "override",
+        "Override",
+        username_env="CBRS_OVERRIDE_USERNAME",
+        password_env="CBRS_OVERRIDE_PASSWORD",
+    )
+
+    assert account_credentials(account, settings) == ("process-user", "process-password")
 
 
 def test_pool_config_requires_explicit_group_for_shared_proxy_value(
@@ -1146,7 +1208,7 @@ def test_pool_dashboard_api_and_html_are_sanitized(
     assert payload["runtime"]["visual_url"].startswith("http://localhost:6080/")
     assert payload["runtime"]["visual_recovery_mode"] == "noVNC"
     assert "[REDACTED_IP]" not in payload["runtime"]["visual_url"]
-    assert payload["pool"]["daily_quota"] == 60
+    assert payload["pool"]["daily_quota"] == 24
     assert content.startswith(b"%PDF")
     assert stop_payload == {"ok": True, "status": "stop_requested"}
     assert resume_payload == {"ok": True, "status": "resume_requested"}

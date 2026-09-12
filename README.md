@@ -47,9 +47,10 @@ instalación Linux. El único puente activo del host mantiene WSL iniciado.
 
 ## Chrome independiente del worker
 
-La arquitectura opcional `CBRS_BROWSER_OWNER_MODE=external` conserva Chrome en un
-proceso propietario separado. Permite reemplazar el worker sin cerrar sesiones;
-la migración inicial es explícita, no automática. Consulte
+La instalación Linux activa usa `CBRS_BROWSER_OWNER_MODE=external`: Chrome vive
+en un proceso propietario separado y el worker puede recibir mantenimiento sin
+cerrar sesiones. Una instalación nueva debe completar explícitamente esa
+migración antes de activar el modo. Consulte
 [arquitectura, instalación y límites](docs/independent-browser-owner.md).
 
 ## Actualizaciones en vivo
@@ -104,15 +105,15 @@ tienen límites persistentes por cuenta y por pool.
 
 ## Resumen ejecutivo
 
-Antes de instalar, revisar [los prerrequisitos nativos](docs/native-windows-prerequisites.md). Ese archivo
-define los requisitos del equipo, autorizaciones, cuentas, proxies, respaldo y
-gates que tambien debera aplicar el instalador E2E de Windows.
+La instalación soportada está descrita en [operación Linux/WSL](docs/linux-service.md)
+y [onboarding por CLI](docs/cli-onboarding.md). Para integrar el worker en otra
+aplicación sin systemd, usar la [guía standalone](docs/standalone-component.md).
 
-### Instalación E2E en Windows
+### Rollback histórico en Windows (no activo)
 
-La ruta activa es Windows nativo; WSL queda únicamente como referencia legacy.
-Consultar [el runbook nativo](docs/native-windows-endurance.md). Desde PowerShell
-elevado:
+Los siguientes assets se conservan solo para un rollback controlado. No deben
+ejecutarse junto a la instalación Linux activa. Su runbook histórico es
+[Endurance nativo Windows](docs/native-windows-endurance.md):
 
 ```powershell
 .\deploy\windows\Install-CbrsNative.ps1
@@ -380,8 +381,9 @@ flowchart LR
 > fuerza cuentas pausadas y no intenta eludir límites del portal.
 
 Por defecto, el pool define `ejecutivo_1`, `ejecutivo_2` y `ejecutivo_3`, con un
-cupo teórico de 20 consultas diarias por cuenta y 60 totales. El cupo final debe
-alinearse con la autorización o contrato aplicable.
+límite conservador de 8 consultas diarias por cuenta. La ejecución del 10 de
+septiembre observó el límite del portal entre 7 y 9; cualquier aumento debe
+basarse en la autorización o contrato aplicable y en evidencia vigente.
 
 ## Capacidades
 
@@ -409,7 +411,7 @@ alinearse con la autorización o contrato aplicable.
 | Componente | Uso |
 |---|---|
 | **Python 3.14** | Aplicación, orquestación y comandos. |
-| **Playwright + Google Chrome** | Perfiles persistentes y aislados en Windows nativo. |
+| **Playwright + Google Chrome** | Perfiles persistentes y aislados en Linux/WSL. |
 | **Pillow** | Ensamblaje de imágenes en documentos PDF. |
 | **SQLite** | Estado local del monitoreo y del pool. |
 | **`http.server`** | Dashboard y API JSON exclusivamente en loopback. |
@@ -417,19 +419,17 @@ alinearse con la autorización o contrato aplicable.
 
 ## Límite del entorno soportado
 
-La prueba endurance usa exclusivamente **Windows nativo**: Python 3.14, Chrome,
-Playwright, SQLite, restic y Windows Scheduled Tasks. No se debe instalar ni
-ejecutar esta ruta mediante WSL, Docker, Xvfb o una máquina virtual. Los assets
-Ubuntu/WSL permanecen en el repositorio solo como material legacy y no forman
-parte del runbook activo.
+La operación activa usa **Ubuntu 24.04 en WSL2**: Python 3.14, Google Chrome,
+Playwright, SQLite, restic, Xvfb y systemd. Los assets Windows son rollback y no
+deben ejecutarse en paralelo. Docker y otras máquinas virtuales no forman parte
+de este despliegue.
 
 ### Operación headless persistente
 
-El worker programado ejecuta tres Chrome reales en modo headless
-(`CBRS_HEADLESS=1`). Los conserva durante periodos idle, cooldowns y fallas
-funcionales del portal mientras las tareas del runtime continúen activas. Para
-recuperación visual manual, primero se pausa endurance y se detiene el worker.
-El worker y la recuperación nunca comparten un perfil simultáneamente.
+El owner independiente ejecuta tres Chrome reales en Xvfb y los conserva durante
+periodos idle, cooldowns, mantenimiento del worker y fallas funcionales del
+portal. La recuperación visual usa noVNC sobre esos mismos contextos; nunca abre
+otro proceso contra el mismo perfil ni requiere cerrar una sesión aceptada.
 
 El dashboard muestra dentro de cada tarjeta una vista local, de solo lectura y
 baja frecuencia del viewport headless correspondiente. El worker publica un JPEG
@@ -445,25 +445,27 @@ eliminan cuando se descarta el contexto. Se puede ajustar la frecuencia con
 
 ### 1. Instalar dependencias
 
-Abre PowerShell nativo como administrador y ejecuta:
+Desde Ubuntu/WSL, en el checkout activo:
 
-```powershell
-.\deploy\windows\Install-CbrsNative.ps1 -InstallDevelopmentRequirements
-.\.venv\Scripts\python.exe -m pytest -q
+```bash
+cd /opt/scrapper-portal-conservador
+bash deploy/install-wsl.sh
+sudo bash deploy/install-ubuntu.sh
+.venv/bin/python -m pytest -q
 ```
 
-El procedimiento completo y el gate de aceptación están en
-[Endurance E2E nativo en Windows](docs/native-windows-endurance.md).
+El procedimiento completo está en [operación Linux/WSL](docs/linux-service.md).
 
 ### 2. Configurar el egreso autorizado
 
-Parte desde `.env.example`; el ejemplo solo contiene placeholders. Para
-producción, los secretos viven en `C:\ProgramData\CBRS\cbrs.env`:
+Parte desde `.env.example`; el ejemplo solo contiene placeholders. En la
+instalación activa, los secretos permanecen en `/opt/scrapper-portal-conservador/.env`
+con permisos restringidos:
 
 ```dotenv
 CBRS_EGRESS_MODE=mobile_sticky
 CBRS_EXPECTED_EGRESS_COUNTRY=CL
-CBRS_HEADLESS=1
+CBRS_HEADLESS=0
 CBRS_WINDOW_MODE=normal
 DATAIMPULSE_PROXY_HOST=gw.dataimpulse.com
 DATAIMPULSE_PROXY_SCHEME=http
@@ -531,16 +533,10 @@ worker, cupos, pacing, preflight y safety stops; no salta los gates de CBRS.
 Si CBRS devuelve más de una inscripción válida, se descarga un PDF
 permanente por cada resultado.
 
-El dashboard/API escucha exclusivamente en `127.0.0.1:8765`; no admite un bind
-privado durante la operación nativa. Las búsquedas publican PDFs permanentes en
-`G:\CBRS\outputs\jobs\<job_id>`. Las tareas `CBRS Worker`, `CBRS Dashboard` y
-`CBRS Daily Backup` recuperan la operación después del siguiente inicio de
-sesión del mismo usuario.
-
-`Start-CbrsNative.ps1` ejecuta además un gate operacional post-arranque. No
-declara éxito hasta comprobar tareas habilitadas, worker y dashboard corriendo,
-heartbeat vivo y `/api/health`; ante un fallo detiene sólo los procesos que el
-arranque actual creó y restaura el estado habilitado/deshabilitado previo.
+El dashboard/API escucha exclusivamente en `127.0.0.1:8765`. Las búsquedas
+publican PDFs permanentes bajo `.cbrs/runtime/outputs/jobs/<job_id>`. systemd
+supervisa worker, dashboard, owner, display y backup; el puente Windows solo
+mantiene WSL activo.
 
 ### Controles de operación en el dashboard
 
@@ -609,19 +605,13 @@ El dashboard de soak utiliza por defecto
 [`http://127.0.0.1:8765`](http://127.0.0.1:8765). El runner real ejecuta ciclos
 contra CBRS; el dashboard por sí solo es de solo lectura.
 
-Para comprobar la preparación E2E nativa sin iniciar Chrome ni crear un CAPTCHA:
+Para comprobar la instalación Linux sin enviar una búsqueda:
 
-```powershell
-.\.venv\Scripts\python.exe -m cbrs readiness `
-  --target windows `
-  --env-file C:\ProgramData\CBRS\cbrs.env `
-  --config G:\CBRS\account-pool.json `
-  --json-report G:\CBRS\readiness\indefinite-test.json
+```bash
+cbrs config validate
+cbrs health
+.venv/bin/python deploy/linux_health.py
 ```
-
-El procedimiento escalonado, los controles de arranque/parada y los criterios
-de observación están en
-[`docs/native-windows-endurance.md`](docs/native-windows-endurance.md).
 
 ## Pool de cuentas autorizadas
 
@@ -691,13 +681,12 @@ contener los proxies reales:
     {
       "id": "ejecutivo_1",
       "label": "Ejecutivo 1",
-      "username_env": "CBRS_ACCOUNT_1_USERNAME",
-      "password_env": "CBRS_ACCOUNT_1_PASSWORD",
+      "username_env": "CBRS_EJECUTIVO_1_USERNAME",
+      "password_env": "CBRS_EJECUTIVO_1_PASSWORD",
       "proxy_provider": "dataimpulse_mobile_sticky",
       "proxy_brand": "DataImpulse Mobile",
       "dataimpulse_port": 10000,
-      "profile_dir": "G:\\CBRS\\accounts\\ejecutivo_1\\chrome-profile",
-      "daily_quota": 20
+      "daily_quota": 8
     }
   ]
 }

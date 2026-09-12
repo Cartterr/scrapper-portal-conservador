@@ -1,7 +1,7 @@
 # Operación E2E autónoma en Ubuntu
 
-> **LEGACY:** la operación activa es Windows nativo. Usar
-> [`native-windows-endurance.md`](native-windows-endurance.md).
+> **VIGENTE:** la operación activa es Ubuntu dentro de WSL2. Los assets Windows
+> son rollback y no deben ejecutarse en paralelo.
 
 ## Arquitectura soportada
 
@@ -46,20 +46,22 @@ La configuración de cuentas contiene únicamente nombres de variables:
   "accounts": [
     {
       "id": "ejecutivo_1",
-      "username_env": "CBRS_ACCOUNT_1_USERNAME",
-      "password_env": "CBRS_ACCOUNT_1_PASSWORD",
-      "proxy_url_env": "CBRS_ACCOUNT_1_PROXY_URL",
+      "username_env": "CBRS_EJECUTIVO_1_USERNAME",
+      "password_env": "CBRS_EJECUTIVO_1_PASSWORD",
+      "proxy_provider": "dataimpulse_mobile_sticky",
+      "proxy_brand": "DataImpulse Mobile",
+      "dataimpulse_port": 10000,
       "profile_dir": "/var/lib/cbrs/accounts/ejecutivo_1/chrome-profile",
-      "daily_quota": 20
+      "daily_quota": 8
     }
   ]
 }
 ```
 
 Las variables reales se mantienen en `/etc/cbrs/cbrs.env`, con permisos
-`0640 root:cbrs`. Cada cuenta habilitada debe referenciar un proxy chileno
-dedicado diferente. Las contraseñas, URLs completas, IPs crudas, cookies y JWT
-no se escriben en SQLite ni en reportes.
+`0640 root:cbrs`. Cada cuenta habilitada debe usar un puerto Mobile distinto y
+un perfil aislado. Las contraseñas, URLs completas, IPs crudas, cookies y JWT no
+se escriben en SQLite ni en reportes.
 
 Antes del primer arranque, inicializar el repositorio restic sin política de
 pruning:

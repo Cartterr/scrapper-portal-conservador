@@ -124,7 +124,7 @@ def validate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"{account_id} proxy URL must include host and port")
 
         try:
-            quota = int(raw.get("daily_quota", 20))
+            quota = int(raw.get("daily_quota", 8))
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{account_id} daily quota must be an integer") from exc
         if not 1 <= quota <= 10_000:
@@ -284,7 +284,7 @@ def build_pool_config(validated: Mapping[str, Any]) -> dict[str, Any]:
             item["proxy_brand"] = account["proxy_brand"]
         accounts.append(item)
     return {
-        "daily_quota_per_account": 20,
+        "daily_quota_per_account": 8,
         "interval_minutes": 0,
         "job_interval_min_seconds": 10,
         "job_interval_max_seconds": 30,
@@ -405,7 +405,7 @@ def _existing_account_values(
             "username": environment.get(str(account.get("username_env") or "")) or "",
             "password": environment.get(str(account.get("password_env") or "")) or "",
             "proxy_url": environment.get(str(account.get("proxy_url_env") or "")) or "",
-            "daily_quota": account.get("daily_quota", 20),
+            "daily_quota": account.get("daily_quota", 8),
             "label": account.get("label") or account_id,
             "egress_group": account.get("egress_group") or "",
             "proxy_provider": account.get("proxy_provider") or "generic_static",
@@ -440,7 +440,7 @@ def build_account_update_payload(
                 "username": raw.get("username") or prior.get("username"),
                 "password": raw.get("password") or prior.get("password"),
                 "proxy_url": raw.get("proxy_url") or prior.get("proxy_url"),
-                "daily_quota": raw.get("daily_quota", prior.get("daily_quota", 20)),
+                "daily_quota": raw.get("daily_quota", prior.get("daily_quota", 8)),
                 "egress_group": raw.get("egress_group") or prior.get("egress_group") or "",
                 "proxy_provider": raw.get("proxy_provider")
                 or prior.get("proxy_provider")

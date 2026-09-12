@@ -2224,7 +2224,7 @@
       document.getElementById("settingCooldown").value = endurance.cooldown_seconds ?? 300;
       document.getElementById("settingEnduranceQuota").value = endurance.jobs_per_account_per_day ?? 20;
       document.getElementById("settingProductionReserve").value = endurance.production_reserve_per_account ?? 0;
-      document.getElementById("settingDailyQuota").value = pool.daily_quota_per_account ?? 20;
+      document.getElementById("settingDailyQuota").value = pool.daily_quota_per_account ?? 8;
       document.getElementById("runtimeSettingsSummary").textContent =
         `Propietario Chrome: ${runtime.owner_mode === "external" ? (runtime.browser_owner ? "independiente · activo" : "independiente · sin señal") : "acoplado al worker"} · ` +
         `Demora segura por petición: ${runtime.request_delay_seconds ?? "-"}s · ` +

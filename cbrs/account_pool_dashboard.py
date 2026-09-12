@@ -129,7 +129,9 @@ def _handler_factory(
                     from .runtime_updates import read_status
                     payload["runtime"]["updates"] = read_status(job_store.path.parent / "runtime-updates")
                     payload["runtime"]["browser_owner"] = job_store.active_lease("browser_owner")
-                    payload["runtime"]["owner_mode"] = os.environ.get("CBRS_BROWSER_OWNER_MODE", "embedded")
+                    payload["runtime"]["owner_mode"] = settings.env_value(
+                        "CBRS_BROWSER_OWNER_MODE", "embedded"
+                    )
                     payload["runtime"]["owner_updates"] = read_status(settings.profile_dir.parent / "browser-owner" / "runtime-updates")
                     from .backup import backup_health
                     from .captcha_budget import CaptchaBudgetStore
@@ -152,7 +154,7 @@ def _handler_factory(
                     payload["captcha_attempts"] = captcha_budget.recent_activity()
                     payload["backup"] = backup_health(settings)
                     payload = _with_proxy_state(payload, job_store, settings, config)
-                payload = _with_account_username_prefixes(payload, config)
+                payload = _with_account_username_prefixes(payload, config, settings)
                 payload = _with_captcha_phases(payload, captcha_phases)
                 self._send_json(
                     _with_artifact_urls(payload),
@@ -884,12 +886,14 @@ def _with_job_pool_usage(
 
 
 def _with_account_username_prefixes(
-    payload: dict[str, Any], config: PoolConfig
+    payload: dict[str, Any], config: PoolConfig, settings: Settings
 ) -> dict[str, Any]:
     """Expose only the non-email login prefix required by the local dashboard."""
     prefixes: dict[str, str] = {}
     for account in config.accounts:
-        raw_username = os.environ.get(account.username_env or "", "").strip()
+        raw_username = str(
+            settings.env_value(account.username_env or "", "") or ""
+        ).strip()
         if "@" in raw_username:
             prefix = raw_username.split("@", 1)[0].strip()
             if prefix:
@@ -1566,7 +1570,7 @@ def _hold_visual_captcha_session(
     )
     if account is None:
         raise ValueError(f"Unknown account: {account_id}")
-    timeout_raw = os.environ.get("CBRS_CAPTCHA_RECOVERY_TIMEOUT_SECONDS", "900")
+    timeout_raw = settings.env_value("CBRS_CAPTCHA_RECOVERY_TIMEOUT_SECONDS", "900")
     try:
         timeout = max(60, min(int(timeout_raw), 3600))
     except ValueError:
@@ -1582,7 +1586,7 @@ def _hold_visual_captcha_session(
     try:
         with BrowserSession(account_settings(settings, account), headless=False) as browser:
             if account.username_env and account.password_env:
-                username, password = account_credentials(account)
+                username, password = account_credentials(account, settings)
                 try:
                     # Use the real visible form: fill both fields and submit it
                     # exactly as an operator would. This is the only reliable
@@ -1658,7 +1662,7 @@ def _runtime_summary(settings: Settings) -> dict[str, Any]:
     # noVNC belongs exclusively to the legacy Linux display path. Native
     # Windows recovery opens the configured Chrome executable directly, so a
     # fabricated localhost:6080 link would always be a broken destination.
-    visual_url = os.environ.get("CBRS_NOVNC_URL", "").strip() or None
+    visual_url = str(settings.env_value("CBRS_NOVNC_URL", "") or "").strip() or None
     if visual_url:
         # Keep the recovery endpoint loopback-only while avoiding the general
         # IP redactor turning 127.0.0.1 into an unusable browser URL.
