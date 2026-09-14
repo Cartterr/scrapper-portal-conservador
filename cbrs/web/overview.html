@@ -1955,6 +1955,15 @@
         </tr>`;
       }).join("");
     }
+    function jobOutcome(job) {
+      if (['search_reconciliation_required','search_outcome_unknown','search_receipt_incomplete'].includes(job.error_code))
+        return {text:'Resultado no confirmado · bloqueado', css:'waiting_capacity',
+          detail:'No se puede certificar un resultado vacío ni un PDF. Reenvío automático bloqueado; requiere conciliación del intento anterior.'};
+      if (job.status === 'completed' && job.result_count === 0)
+        return {text:'Sin resultados · finalizado', css:'completed',
+          detail:'La búsqueda exacta devolvió 0 resultados. Resultado vacío guardado; no se reintenta automáticamente ni se vuelve a consumir cuota por este trabajo. No demuestra que existiera antes o fuera eliminado.'};
+      return null;
+    }
     function renderJobs(jobs) {
       const panel = document.getElementById("jobsPanel");
       const jobsBody = document.getElementById("jobs");
@@ -2004,6 +2013,7 @@
           documentOrdinals.set(job.job_id, { start, end, day });
         });
       jobsBody.innerHTML = jobs.map((job) => {
+        const outcome = jobOutcome(job);
         const terminal = ["completed", "partial", "failed", "cancelled"].includes(job.status);
         const preview = (job.completed_items || 0) > 0
           ? `<button class="preview-pdf" data-preview-job="${escapeHtml(job.job_id)}">Ver PDF</button>`
@@ -2031,7 +2041,7 @@
             attempted: true,
           });
         });
-        if (["waiting_capacity", "waiting_captcha"].includes(job.status)) {
+        if (!outcome && ["waiting_capacity", "waiting_captcha"].includes(job.status)) {
           for (const poolAccount of current.accounts || []) {
             if (describedAccounts.has(poolAccount.account_id) || poolAccount.status === "available") continue;
             detailEntries.push({
@@ -2090,12 +2100,13 @@
         } else if (job.error_code) {
           reason = `<span class="job-reason">${escapeHtml(stopReasonLabels[job.error_code] || label(job.error_code))}</span>`;
         }
+        if (outcome) reason = `<div class="job-reason"><strong>${escapeHtml(outcome.detail)}</strong></div>${reason === '-' ? '' : `<details><summary>Historial anterior</summary>${reason}</details>`}`;
         return `<tr>
           <td><a class="job-id" href="/api/jobs/${encodeURIComponent(job.job_id)}" target="_blank" title="${escapeHtml(job.job_id)}" aria-label="Abrir ${escapeHtml(job.job_id)}"><code>${escapeHtml(shortJobId(job.job_id))}</code></a></td>
           <td>${escapeHtml(job.kind)}${job.source === "endurance" ? " · endurance" : ""}</td>
           <td>${account}</td>
           <td>${documentNumber}</td>
-          <td><span class="status ${job.status === 'failed' && job.error_code !== 'document_retrieval_deferred' ? 'credentials_invalid' : escapeHtml(job.status)}" title="${escapeHtml(job.error_message || job.error_code || '')}">${escapeHtml(job.error_code === 'document_retrieval_deferred' ? 'Recuperando documento' : job.error_code === 'waiting_authenticated_alternate' ? 'Esperando cuenta disponible' : ['search_outcome_unknown','search_receipt_incomplete','awaiting_previous_operation'].includes(job.error_code) ? 'Confirmación pendiente' : job.error_code === 'document_recovery_exhausted' ? 'Error: documento no recuperado' : label(job.status))}</span></td>
+          <td><span class="status ${outcome ? outcome.css : job.status === 'failed' && job.error_code !== 'document_retrieval_deferred' ? 'credentials_invalid' : escapeHtml(job.status)}" title="${escapeHtml(outcome?.detail || job.error_message || job.error_code || '')}">${escapeHtml(outcome?.text || (job.error_code === 'document_retrieval_deferred' ? 'Recuperando documento' : job.error_code === 'waiting_authenticated_alternate' ? 'Esperando cuenta disponible' : job.error_code === 'awaiting_previous_operation' ? 'Confirmación pendiente' : job.error_code === 'document_recovery_exhausted' ? 'Error: documento no recuperado' : label(job.status)))}</span></td>
           <td>${reason}</td>
           <td>${job.result_count ?? "-"}</td>
           <td>${job.completed_items ?? 0}</td>

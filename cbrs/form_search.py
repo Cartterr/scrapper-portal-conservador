@@ -136,18 +136,22 @@ def portal_dialog_evidence(page):
         const visible=e=>e && e.getClientRects().length>0 && getComputedStyle(e).visibility!=='hidden';
         const normalize=s=>(s||'').normalize('NFD').replace(/[\\u0300-\\u036f]/g,'').replace(/\\s+/g,' ').trim().toLowerCase();
         const reasons=[];
-        for(const panel of document.querySelectorAll('[id^="headlessui-dialog-panel-"][data-headlessui-state~="open"], [role="dialog"]')){
+        const panels=[...document.querySelectorAll('[id^="headlessui-dialog-panel-"][data-headlessui-state~="open"]'), ...document.querySelectorAll('[role="dialog"]')];
+        for(const panel of panels){
             if(!visible(panel)) continue;
             const heading=[...panel.querySelectorAll('h2,h3')].some(e=>visible(e)&&normalize(e.textContent)==='atencion');
             const close=[...panel.querySelectorAll('button')].some(e=>visible(e)&&normalize(e.textContent)==='cerrar');
-            if(!heading || !close) continue;
+            const emptyHeading=[...panel.querySelectorAll('h2,h3')].some(e=>visible(e)&&normalize(e.textContent)==='no se encontraron resultados');
+            if((!heading && !emptyHeading) || !close) continue;
             const texts=[...panel.querySelectorAll('p')].filter(visible).map(e=>normalize(e.textContent));
             let reason=null;
-            if(texts.includes('se han agotado las consultas disponibles por hoy.')) reason='daily_limit';
-            else if(texts.includes('se ha detectado un problema, refresque la pagina e intente nuevamente.')) reason='temporary_unavailable';
+            if(emptyHeading && texts.some(t=>/^no se encontraron resultados para la busqueda de texto "[^"]*"[.]?$/.test(t))) reason='empty_results';
+            else if(heading && texts.includes('se han agotado las consultas disponibles por hoy.')) reason='daily_limit';
+            else if(heading && texts.includes('se ha detectado un problema, refresque la pagina e intente nuevamente.')) reason='temporary_unavailable';
             if(reason) reasons.push({reason, panel_selector: panel.id.startsWith('headlessui-dialog-panel-')
                 ? '[id^="headlessui-dialog-panel-"][data-headlessui-state~="open"]' : '[role="dialog"]',
-                heading: 'Atención', close_button: 'Cerrar', message_element: 'p'});
+                panel_id: panel.id || null,
+                heading: emptyHeading ? 'No se encontraron resultados' : 'Atención', close_button: 'Cerrar', message_element: 'p'});
         }
         return reasons.find(e=>e.reason==='daily_limit') || reasons[0] || null;
     }''')
@@ -176,6 +180,26 @@ def portal_error_dialog_stop(evidence, *, message, status=None, response_code=No
     return stop
 
 
+def dismiss_previous_empty_dialog(page):
+    """Dismiss only the recognized old empty modal; never infer this job's result."""
+    evidence = portal_dialog_evidence(page)
+    if not evidence or evidence['reason'] != 'empty_results':
+        return False
+    selector = evidence['panel_selector']
+    panel_id = evidence.get('panel_id')
+    if panel_id and panel_id.startswith('headlessui-dialog-panel-') and all(c.isalnum() or c in '-_:' for c in panel_id):
+        selector = '[id="' + panel_id + '"]'
+    panel = page.locator(selector).filter(
+        has=page.get_by_role('heading', name='No se encontraron resultados', exact=True)
+    ).filter(visible=True)
+    # Refuse ambiguous matches rather than click a different dialog.
+    if panel.count() != 1:
+        raise RuntimeError('Ambiguous empty-result dialog; no search submitted')
+    panel.get_by_role('button', name='Cerrar', exact=True).click(timeout=5000)
+    panel.wait_for(state='hidden', timeout=5000)
+    return True
+
+
 def search_fna_form(browser, foja, numero, ano, *, client, pace):
     from .runtime_updates import runtime_module
     if runtime_module('runtime_observation').visible_login_gate(browser.page):
@@ -187,6 +211,21 @@ def search_fna_form(browser, foja, numero, ano, *, client, pace):
     if path and not admit_quota_check(path, account_id):
         raise SafetyStopException(StopReason.DAILY_LIMIT, 'Portal quota hold remains active', context='commerce form search')
     initial = portal_dialog_evidence(browser.page)
+    if initial and initial['reason'] == 'empty_results':
+        # This predates our submission and belongs to a previous query. The
+        # portal uses the literal text "null" even for tuple searches.
+        from .jobs import JobStore
+        try:
+            dismiss_previous_empty_dialog(browser.page)
+        except Exception as exc:
+            if path:
+                JobStore(path).add_event('previous_empty_dialog_dismiss_failed', account_id=account_id,
+                    data={'error_type': type(exc).__name__})
+            raise
+        if path:
+            JobStore(path).add_event('previous_empty_dialog_dismissed', account_id=account_id,
+                data={'panel_selector': initial['panel_selector'], 'panel_id': initial.get('panel_id'),
+                      'new_search_result_inferred': False})
     if initial and initial['reason'] == PORTAL_ERROR_DIALOG:
         # The portal error dialog is already open on this route. It is never
         # refreshed away: the exit is compromised and another account must take

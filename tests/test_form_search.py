@@ -9,6 +9,64 @@ from cbrs.form_search import portal_dialog_reason, portal_dialog_evidence
 from cbrs.safety import SafetyStopException, StopReason
 
 
+def empty_modal(hidden=False):
+    return f'''<div role="dialog" style="display:{'none' if hidden else 'block'}">
+    <h3>No se encontraron resultados</h3>
+    <p>No se encontraron resultados para la búsqueda de texto "null".</p>
+    <button onclick="this.parentElement.remove()">Cerrar</button></div>'''
+
+
+def test_old_null_modal_dismissed_without_labeling_new_query_empty(test_chrome):
+    page = test_chrome.new_page()
+    posts = []
+    def serve(route):
+        if route.request.url.endswith('/api/v1/comercio/indice/texto'):
+            posts.append(route.request.post_data_json)
+            route.fulfill(content_type='application/json', body='[{"id":"new-result"}]')
+        else:
+            route.fulfill(content_type='text/html; charset=utf-8', body=HTML + empty_modal())
+    try:
+        page.route('http://localhost:19999/**', serve)
+        page.goto('http://localhost:19999/protected')
+        assert portal_dialog_reason(page) == 'empty_results'
+        browser = SimpleNamespace(page=page, settings=SimpleNamespace(commerce_url=page.url))
+        result = search_fna_form(browser,91146,39929,2022,client=None,pace=lambda _:None)
+        assert result == [{'id':'new-result'}]
+        assert len(posts) == 1
+        assert str(posts[0]['foja']) == '91146'
+        assert page.get_by_role('dialog').count() == 0
+    finally:
+        page.close()
+
+
+def test_empty_dialog_hidden_is_ignored_and_quota_is_not_closed(test_chrome):
+    from cbrs.form_search import dismiss_previous_empty_dialog
+    page = test_chrome.new_page()
+    try:
+        page.set_content(empty_modal(True))
+        assert portal_dialog_reason(page) is None
+        assert not dismiss_previous_empty_dialog(page)
+        page.set_content(modal('Se han agotado las consultas disponibles por hoy.'))
+        assert not dismiss_previous_empty_dialog(page)
+        assert portal_dialog_reason(page) == 'daily_limit'
+    finally:
+        page.close()
+
+
+def test_nested_headless_empty_modal_uses_exact_inner_panel(test_chrome):
+    from cbrs.form_search import dismiss_previous_empty_dialog
+    page = test_chrome.new_page()
+    try:
+        content = empty_modal().replace('role="dialog"', 'id="headlessui-dialog-panel-123" data-headlessui-state="open"')
+        page.set_content('<div role="dialog">' + content + '</div>')
+        evidence = portal_dialog_evidence(page)
+        assert evidence['panel_id'] == 'headlessui-dialog-panel-123'
+        assert dismiss_previous_empty_dialog(page)
+        assert portal_dialog_reason(page) is None
+    finally:
+        page.close()
+
+
 def modal(message, hidden=False):
     return f'<div id="headlessui-dialog-panel-987" data-headlessui-state="open" style="display:{"none" if hidden else "block"}"><h3>Atención</h3><p>{message}</p><button>Cerrar</button></div>'
 
