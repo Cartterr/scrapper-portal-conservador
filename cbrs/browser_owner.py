@@ -42,8 +42,17 @@ class BrowserOwner:
             # Recovery is a bounded owner operation, never a raw proxy/close RPC.
             # Recheck current DOM here; worker-side evidence alone cannot close
             # or replace a formerly authenticated browser.
-            if not self.pool.can_replace_rejected_login(account_id) or self.store.global_cooldown():
+            compromised = self.store.route_compromised(account_id)
+            if self.store.global_cooldown():
                 return False
+            if not compromised and not self.pool.can_replace_rejected_login(account_id):
+                return False
+            if compromised:
+                # The durable quarantine is the authorization: this exact exit
+                # was proven compromised by the portal error dialog. Log out,
+                # close and delete its Chrome before a replacement is tried, so
+                # no cookie, token or cache from that exit is ever reused.
+                self.pool.ditch_compromised(account_id)
             from .jobs import _rotate_dataimpulse_route
             from .account_pool import AccountPoolStore
             from .preflight import run_preflight
@@ -52,14 +61,30 @@ class BrowserOwner:
             run = pool_store.latest_run(dry_run=False)
             if not run or run.get("finished_at"):
                 return False
-            ok = _rotate_dataimpulse_route(account, self.settings, self.store, pool_store,
+            settings = self.settings
+            budget = payload.get("candidates")
+            if compromised and isinstance(budget, int) and budget >= 1:
+                # The worker paces recovery so searches keep their turn on this
+                # single browser owner; never widen its own configured budget.
+                from dataclasses import replace
+                settings = replace(settings, dataimpulse_candidates_per_recovery=min(
+                    budget, int(self.settings.dataimpulse_candidates_per_recovery)))
+            ok = _rotate_dataimpulse_route(account, settings, self.store, pool_store,
                 run["run_id"], self.pool, run_preflight, run_proxy_health,
-                reason="scoped_visible_login_rejection", _owner_execution=True)
+                reason=payload.get("reason") if compromised else "scoped_visible_login_rejection",
+                _owner_execution=True)
             if ok:
                 self.bindings[account_id] = binding_fingerprint(
                     _runtime_account_settings(self.settings, account, self.store), self.settings.headless)
             return ok
         if operation == "ensure":
+            if self.store.route_compromised(account_id):
+                from .jobs import portal_error_dialog_stop
+                stop = portal_error_dialog_stop(
+                    "Proxy route is compromised; a replacement exit must be adopted first",
+                    evidence={"route_compromised": True}, context="route recovery")
+                stop.route_compromised = True
+                raise stop
             settings = _runtime_account_settings(self.settings, account, self.store)
             binding = binding_fingerprint(settings, self.settings.headless)
             if payload.get("binding") != binding or (account_id in self.bindings and self.bindings[account_id] != binding):
@@ -133,7 +158,12 @@ class BrowserOwner:
                 result = self.execute(command)
                 self.commands.finish(command["id"], result=result)
             except Exception as exc:
-                from .jobs import capture_error
+                from .jobs import capture_error, is_portal_error_dialog
+                if is_portal_error_dialog(exc):
+                    # Detected inside the owner's own browser: record the
+                    # durable quarantine here so recovery proceeds even if the
+                    # worker dies before reading this reply.
+                    self._quarantine(command["account"], passive=False)
                 entry = self.pool._entries.get(command["account"])
                 if entry:
                     try:
@@ -141,6 +171,7 @@ class BrowserOwner:
                     except Exception:
                         pass  # Evidence failure must not strand the command.
                 error = {"reason": exc.reason.value, "status": exc.status,
+                         "route_compromised": is_portal_error_dialog(exc),
                          "context": exc.context if exc.context in {"auth login", "auth navigation", "form search"} else "browser owner"} if isinstance(exc, SafetyStopException) else {"reason": "credentials_invalid" if isinstance(exc, CredentialsRejectedError) else "owner_operation_failed"}
                 self.commands.finish(command["id"], error=error,
                     uncertain=command["operation"].startswith("search_") and not isinstance(exc, SafetyStopException))
@@ -151,6 +182,35 @@ class BrowserOwner:
         # No worker required for passive evidence and previews. No worker-side
         # sleep, crash, replacement or PDF generation can close these contexts.
         self.pool.capture_previews()
+        self._quarantine_portal_error_dialogs()
+
+    def _quarantine_portal_error_dialogs(self):
+        """Flag exits whose live page shows the portal error dialog.
+
+        Detection is continuous and independent of any search: the preview /
+        DOM sampler sets the flag, and this records the durable quarantine so
+        the worker can drive ditch-and-replace recovery even while idle.
+        """
+        for account_id, entry in tuple(self.pool._entries.items()):
+            if not getattr(entry, "portal_error_dialog", False):
+                continue
+            entry.portal_error_dialog = False
+            self._quarantine(account_id, passive=True)
+
+    def _quarantine(self, account_id, *, passive):
+        account = self.accounts.get(account_id)
+        if account is None or account.dataimpulse_port is None:
+            return
+        try:
+            first = self.store.mark_route_compromised(
+                account_id, initial_port=int(account.dataimpulse_port))
+            self.store.add_event(
+                "portal_error_dialog_detected", account_id=account_id, level="warning",
+                data={"first_detection": first, "passive": bool(passive),
+                      "observer": "browser_owner", "verdict": "proxy_compromised",
+                      "search_replayed": False})
+        except Exception:
+            return
 
     def _heartbeat(self):
         while not self.heartbeat_stop.wait(10):

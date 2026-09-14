@@ -161,7 +161,7 @@ def test_document_phase_reuses_original_account_at_full_search_quota(tmp_path, m
     assert retrieved == ([] if held else ["a1"])
     assert store.search_checkpoint(job["job_id"])["saved"]
     assert store.usage_by_account(_today())["a1"] == 1
-    assert store.get_job(job["job_id"])["status"] == ("failed" if failure or held else "completed")
+    assert store.get_job(job["job_id"])["status"] == ("waiting_capacity" if failure or held else "completed")
     if failure or held:
         assert store.get_job(job["job_id"])["error_code"] == 'document_retrieval_deferred'
 
@@ -1538,7 +1538,7 @@ def test_worker_restart_registers_an_atomically_published_pdf_without_redownload
     assert len(store.artifacts(job_id=job["job_id"])) == 1
 
 
-def test_worker_preserves_successful_pdfs_and_finishes_partial(tmp_path, monkeypatch):
+def test_worker_preserves_successful_pdfs_and_retries_pending_documents(tmp_path, monkeypatch):
     class PartialScraper(FakeScraper):
         def download_image(self, uuid, output_path):
             if str(uuid).startswith("ticket-2"):
@@ -1570,10 +1570,12 @@ def test_worker_preserves_successful_pdfs_and_finishes_partial(tmp_path, monkeyp
     )
 
     saved = store.get_job(job["job_id"])
-    assert saved["status"] == "failed"
+    assert saved["status"] == "waiting_capacity"
     assert saved["error_code"] == "document_retrieval_deferred"
     assert saved["completed_items"] == 1
-    assert saved["failed_items"] == 1
+    assert saved["failed_items"] == 0
+    assert saved["finished_at"] is None
+    assert saved["next_run_at"] is not None
     assert len(store.artifacts(job_id=job["job_id"])) == 1
 
 

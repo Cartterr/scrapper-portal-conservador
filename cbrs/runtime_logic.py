@@ -35,6 +35,27 @@ def settle_owner_attempts(store, settings, job_id):
 
 def finish_for_review(store, job_id, reason):
     """End only this job, retaining ambiguous receipts and live operations."""
+    if reason == 'document_retrieval_deferred':
+        from datetime import datetime, timedelta, timezone
+        with store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT 1 FROM leases WHERE lease_name=? AND expires_at>=?',
+                          ('browser_operation:' + job_id, core.utc_now())).fetchone():
+                return False
+            job = db.execute('SELECT source,status FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+            if job and job['source'] == 'production' and job['status'] in {'running', 'queued', 'waiting_capacity'}:
+                now = core.utc_now()
+                db.execute("""UPDATE jobs SET status='waiting_capacity', error_code=?,
+                    error_message='Document recovery pending; accepted search preserved',
+                    next_run_at=?, finished_at=NULL, updated_at=?, current_account_id=NULL,
+                    worker_owner=NULL, lease_expires_at=NULL WHERE job_id=?""",
+                    (reason, (datetime.now(timezone.utc)+timedelta(seconds=60)).isoformat(), now, job_id))
+                db.execute("UPDATE job_items SET status='pending', updated_at=? WHERE job_id=? AND status='failed'", (now, job_id))
+                db.execute("""UPDATE jobs SET failed_items=0,
+                    completed_items=(SELECT COUNT(*) FROM job_items WHERE job_id=? AND status='completed')
+                    WHERE job_id=?""", (job_id, job_id))
+                store._add_event_db(db, job_id, 'document_retry_pending', {'reason': reason, 'replayed': False})
+                return True
     if reason == 'search_outcome_unknown':
         with store.connect() as db:
             if db.execute('SELECT 1 FROM leases WHERE lease_name=? AND expires_at>=?',
@@ -76,7 +97,7 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
             return store.finalize_job(job.job_id)
         checkpoint = store.search_checkpoint(job.job_id)
         quota_policy = runtime_module('form_search')
-        if not checkpoint['saved']:
+        if not checkpoint['saved'] and config.enforce_estimated_quota:
             excluded.update(a.account_id for a in config.accounts
                 if (lambda w: w['used'] + w['reserved'] >= config.quota_for(a))(
                     quota_policy.account_window(store.path,a.account_id)))
@@ -84,6 +105,11 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
         # including document work. Saved receipts remain available after expiry.
         excluded.update(a.account_id for a in config.accounts
                         if (quota_policy.quota_hold(store.path, a.account_id) or {}).get('blocked'))
+        # An exit proven compromised by the portal error dialog is quarantined:
+        # never open, log into or search through it until recovery adopts a new
+        # one. Another authenticated account takes this search immediately; if
+        # every account is quarantined the job waits for the first replacement.
+        excluded.update(store.compromised_routes())
         if checkpoint['incomplete_receipt']:
             store.set_waiting(job.job_id, 'waiting_capacity', reason='search_receipt_incomplete')
             return 'waiting_capacity'
@@ -147,14 +173,22 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
             if checkpoint['saved'] and finish_for_review(store, job.job_id, 'document_retrieval_deferred'):
                 # Do not monopolize the one endurance slot while its original
                 # account cannot retrieve documents. Keep its accepted receipt.
-                return 'failed'
+                return store.get_job(job.job_id)['status']
             if target_account_id:
                 target_state = next((str(row['status']) for row in pool_store.accounts(run_id) if str(row['account_id']) == target_account_id), 'paused')
                 status = 'waiting_captcha' if target_state == core.CAPTCHA_PENDING_STATUS else 'waiting_capacity'
             else:
                 status = core._unavailable_job_status(pool_store, run_id, config, excluded)
+            # A pool held by quarantined exits is waiting on recovery, not on
+            # the daily quota reset. Publishing the reset time here would show
+            # an hours-long countdown for something retried every minute.
+            quarantined = bool(store.compromised_routes())
             store.set_waiting(job.job_id, status, reason='waiting_authenticated_alternate' if excluded and not checkpoint['saved'] else status)
-            pool_store.update_run(run_id, status=status, next_cycle_at=core.next_quota_reset_at() if status == 'waiting_capacity' else '', blocked_reason=status)
+            pool_store.update_run(
+                run_id, status=status,
+                next_cycle_at='' if quarantined or status != 'waiting_capacity' else core.next_quota_reset_at(),
+                blocked_reason=core.PROXY_COMPROMISED_REASON if quarantined else status,
+            )
             return status
         excluded.add(account.account_id)
         try:
@@ -179,7 +213,7 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                 store.set_account_check(account.account_id, session_checked=True)
                 items = store.items(job.job_id, public=False)
                 if not checkpoint['saved']:
-                    attempt_id = store.begin_attempt(job_id=job.job_id, account_id=account.account_id, quota_date=quota_date, quota=config.quota_for(account), run_id=run_id, consume_quota=True)
+                    attempt_id = store.begin_attempt(job_id=job.job_id, account_id=account.account_id, quota_date=quota_date, quota=config.search_limit_for(account), run_id=run_id, consume_quota=True)
                     if not attempt_id:
                         continue
                     try:
@@ -244,7 +278,7 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                     store.finish_attempt(attempt_id, status='completed')
                 if any(i['status'] != 'completed' for i in store.items(job.job_id, public=False)):
                     if finish_for_review(store, job.job_id, 'document_retrieval_deferred'):
-                        return 'failed'
+                        return store.get_job(job.job_id)['status']
                 return store.finalize_job(job.job_id)
         except core.CredentialsRejectedError as exc:
             browser_pool.discard(account.account_id, status='credentials_invalid')

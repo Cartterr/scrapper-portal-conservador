@@ -80,6 +80,19 @@ def test_capture_is_bounded_and_does_not_attach_other_accounts(runtime):
     assert len(store.get_job(job)["attempts"][0]["error_evidence"]) == 8
 
 
+def test_repeated_dialog_event_is_sanitized(runtime):
+    from cbrs.safety import SafetyStopException, StopReason
+    store, job = runtime
+    error = SafetyStopException(StopReason.TEMPORARY_UNAVAILABLE, 'SECRET-body',
+                               context='commerce form search', status=400)
+    error.portal_dialog = {'reason': 'temporary_unavailable', 'after_reload': True,
+                           'untrusted_extra': 'SECRET'}
+    capture_error(store, 'a1', SimpleNamespace(page=Page()), error)
+    events = store.recent_events(job_id=job)
+    assert 'SECRET' not in str(events)
+    assert 'repeated_after_reload' in str(events)
+
+
 def test_error_image_route_and_ui(runtime, tmp_path):
     store, job = runtime
     capture_error(store, "a1", SimpleNamespace(page=Page()), RuntimeError())

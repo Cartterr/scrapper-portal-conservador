@@ -177,6 +177,14 @@ def cmd_overview(args) -> int:
 
 
 def cmd_services(args) -> int:
+    if args.service_action == "install":
+        if not sys.platform.startswith("linux"):
+            print("La instalación del servicio requiere Ubuntu.", file=sys.stderr)
+            return 2
+        command = ["bash", str(REPO_ROOT / "deploy/install-ubuntu.sh")]
+        if os.geteuid() != 0:
+            command.insert(0, "sudo")
+        return subprocess.call(command)
     names = list(SERVICE_UNITS) if args.component == "all" else [args.component]
     if args.service_action == "status":
         payload = {name: _unit_state(SERVICE_UNITS[name]) for name in names}
@@ -188,6 +196,12 @@ def cmd_services(args) -> int:
                 print(f"{name:10} {_status(state['active'], p):18} {state['detail']:12} {p(state['enabled'], 'dim')}")
         return 0 if all(state["active"] == "active" for state in payload.values()) else 1
     if args.service_action == "logs":
+        logfile = config.SETTINGS.log_dir / "services.log"
+        if logfile.is_file() and sys.platform.startswith("linux"):
+            command = ["tail", "-n", str(args.lines)]
+            if args.follow:
+                command.append("-f")
+            return subprocess.call([*command, str(logfile)])
         command = ["journalctl"]
         for name in names:
             command.extend(["-u", SERVICE_UNITS[name]])
@@ -263,9 +277,22 @@ def cmd_config(args) -> int:
         return 0
     if args.config_action == "validate":
         try:
-            config.load_settings(root=REPO_ROOT)
+            settings = config.load_settings(root=REPO_ROOT)
             from .account_pool import load_account_pool_config
-            pool = load_account_pool_config(config.SETTINGS)
+            pool = load_account_pool_config(settings)
+            missing = []
+            for account in pool.accounts:
+                if not account.enabled:
+                    continue
+                for key in (account.username_env, account.password_env):
+                    if not key or settings.env_value(key) in {None, "", "REPLACE_ME"}:
+                        missing.append(key or f"credenciales de {account.account_id}")
+                if account.proxy_provider.startswith("dataimpulse_"):
+                    for key in ("DATAIMPULSE_PROXY_LOGIN", "DATAIMPULSE_PROXY_PASSWORD"):
+                        if settings.env_value(key) in {None, "", "REPLACE_ME"}:
+                            missing.append(key)
+            if missing:
+                raise ValueError("Faltan campos: " + ", ".join(dict.fromkeys(missing)))
         except Exception as exc:
             print(f"FAIL configuracion: {exc}", file=sys.stderr)
             return 1
@@ -345,13 +372,14 @@ def add_operator_parsers(subparsers) -> None:
 
     service = subparsers.add_parser("service", help="Inspect and control Linux/WSL services")
     service_sub = service.add_subparsers(dest="service_action", required=True)
+    service_sub.add_parser("install", help="Instalar dependencias y unidades en Ubuntu")
     for action in ("status", "start", "stop", "restart"):
         item = service_sub.add_parser(action)
-        item.add_argument("component", choices=(*SERVICE_UNITS, "all"))
+        item.add_argument("component", choices=(*SERVICE_UNITS, "all"), nargs="?", default="worker")
         item.add_argument("--json", action="store_true")
         item.add_argument("--acknowledge-session-loss", action="store_true", help=argparse.SUPPRESS)
     logs = service_sub.add_parser("logs")
-    logs.add_argument("component", choices=(*SERVICE_UNITS, "all"))
+    logs.add_argument("component", choices=(*SERVICE_UNITS, "all"), nargs="?", default="worker")
     logs.add_argument("--lines", type=int, default=80)
     logs.add_argument("--follow", "-f", action="store_true")
 

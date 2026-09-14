@@ -284,6 +284,15 @@
     .account-top { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
     .account-name { font-weight: 850; }
     .account-status-stack { display: grid; justify-items: end; gap: 4px; text-align: right; }
+    .account-activity { margin: 10px 0; padding: 10px; border-radius: 10px; background: #eef2ff; color: #243469; }
+    .account-activity small { display: block; margin-top: 4px; }
+    .activity-emoji { display: inline-block; margin-right: 6px; }
+    .account-activity.is-working .activity-emoji { animation: account-working 1.2s ease-in-out infinite; }
+    .account-activity.is-stale { background: #fff3cf; color: #765300; }
+    @keyframes account-working { 50% { transform: rotate(18deg) scale(1.15); } }
+    @media (prefers-reduced-motion: reduce) {
+      .account-activity.is-working .activity-emoji { animation: none; }
+    }
     .account-eligibility { color: var(--muted); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .03em; }
     .status.browser_authenticated { background: var(--ok-soft); color: var(--ok); }
     .status.browser_unconfirmed { background: var(--warn-soft); color: var(--warn); }
@@ -1152,6 +1161,11 @@
       validating: "probando candidato",
       active: "ruta activa",
       candidate_failed: "candidato falló",
+      compromised: "ruta comprometida",
+      proxy_compromised: "ruta comprometida · reemplazando",
+      portal_error_dialog: "diálogo de error del portal",
+      portal_error_dialog_visible: "diálogo de error del portal visible",
+      proxy_compromised_discarded: "navegador descartado por ruta comprometida",
       rotation_cooldown: "esperando reintento",
       retry_allowance_exhausted: "cupo de reintentos agotado",
       proxy_recovery_exhausted: "cupo de reintentos agotado (legado)",
@@ -1228,6 +1242,7 @@
       startup_auth_failed: "falló autenticación inicial",
       unexpected_worker_failure: "fallo inesperado del navegador",
       waf_challenge: "bloqueo WAF",
+      proxy_compromised: "proxy comprometido; reemplazando la ruta",
       waiting_capacity: "sin cuentas elegibles",
       waiting_captcha: "esperando captcha",
     };
@@ -1404,6 +1419,11 @@
       } catch (error) {
         freshness.textContent = "Vista sin actualizar · el estado mostrado puede ser anterior. Reintentando…";
         freshness.style.color = "var(--bad)";
+        document.querySelectorAll('.account-activity').forEach(el => {
+          el.classList.remove('is-working');
+          el.classList.add('is-stale');
+          el.textContent = '📡 Sin conexión con la vista · actividad actual desconocida';
+        });
         throw error;
       }
     }
@@ -1545,13 +1565,36 @@
     }
     function quotaCountdownText(deadline) {
       const seconds = Math.max(0, Math.ceil((new Date(deadline).getTime()-Date.now())/1000));
-      return seconds ? `Espera: ${Math.floor(seconds/3600)} h ${Math.floor(seconds%3600/60)} min ${seconds%60} s` : 'Comprobación pendiente; saldo aún no confirmado';
+      return seconds ? `Tiempo restante: ${Math.floor(seconds/3600)} h ${Math.floor(seconds%3600/60)} min ${seconds%60} s` : 'Comprobación pendiente; saldo aún no confirmado';
     }
     function retryCountdownText(deadline) {
       const end = Date.parse(deadline);
       if (!Number.isFinite(end)) return 'Sin plazo de reintento informado';
       const seconds = Math.max(0, Math.ceil((end - Date.now()) / 1000));
       return seconds > 0 ? `Reintento habilitado en: ${fmtSeconds(seconds)}` : 'Plazo cumplido · esperando actualización del servicio';
+    }
+    function accountActivity(account, state, now = Date.now()) {
+      const age = value => {
+        const stamp = Date.parse(value);
+        return Number.isFinite(stamp) ? Math.max(0, (now - stamp) / 1000) : Infinity;
+      };
+      if (!account.worker_active || age(state.run?.heartbeat_at) > 120)
+        return { icon: '⚠️', title: 'Worker sin señal vigente', detail: 'No se puede confirmar actividad. No significa que la cuenta o el proxy estén dañados.', stale: true };
+      if (age(account.browser_checked_at) > 180)
+        return { icon: '🕰️', title: 'Estado del navegador desactualizado', detail: 'Sin comprobación reciente (más de 3 min o sin registro). Puede estar ocupado; no confirma un fallo.', stale: true };
+      const job = (state.jobs?.recent || []).find(j => j.status === 'running'
+        && (j.current_account_id || j.account_id) === account.account_id);
+      if (job)
+        return { icon: '⚙️', title: 'Procesando trabajo asignado', detail: 'Trabajo marcado en ejecución por el servicio; no implica que ya haya terminado.', working: true };
+      if (['validating', 'recovering', 'rotating'].includes(account.proxy_route_status))
+        return { icon: '🔄', title: 'Recuperación reportada por el servicio', detail: 'Ruta en validación o reemplazo; todavía no es un acceso confirmado.', working: true };
+      if (account.proxy_route_compromised || account.paused_reason === 'proxy_compromised')
+        return { icon: '⏳', title: 'Recuperación pendiente · sin ejecución confirmada', detail: 'Esperando turno o condiciones de recuperación. No espera la renovación del cupo.' };
+      if (account.portal_quota?.blocked)
+        return { icon: '⏸️', title: 'En espera de cupo del portal', detail: 'Esperar cupo no significa que el navegador esté desactualizado.' };
+      return { icon: account.browser_authenticated ? '✅' : '💤',
+        title: account.browser_authenticated ? 'Autenticada · sin trabajo activo visible' : 'Sin operación activa confirmada',
+        detail: 'Estado reciente. Estar en espera no significa estar atascada.' };
     }
     function renderAccounts(accounts) {
       let pendingEvidence = document.getElementById('pendingSearchEvidence');
@@ -1568,6 +1611,12 @@
       pendingEvidence.style.display = uncertainJob ? 'grid' : 'none';
       pendingEvidence.innerHTML = uncertainJob ? `<strong>Error de búsqueda: resultado no confirmado</strong><span>El trabajo terminó sin evidencia suficiente para certificar un PDF o un resultado vacío. No se repite la búsqueda ni se solicita revisión manual. Las sesiones se conservan.</span><a href="/api/jobs/${encodeURIComponent(uncertainJob.job_id)}">Ver diagnóstico</a>` : '';
       document.getElementById("accounts").innerHTML = accounts.map((account, index) => {
+        const activity = accountActivity(account, current);
+        const activityView = `<div class="account-activity${activity.working ? ' is-working' : ''}${activity.stale ? ' is-stale' : ''}" role="status">
+          <strong><span class="activity-emoji" aria-hidden="true">${activity.icon}</span>${escapeHtml(activity.title)}</strong>
+          <small>${escapeHtml(activity.detail)}</small>
+          <small>Última comprobación del navegador: ${escapeHtml(account.browser_checked_at ? localTime(account.browser_checked_at) : 'Sin registro')}</small>
+        </div>`;
         const pct = account.daily_quota ? Math.min(100, (account.used_today / account.daily_quota) * 100) : 0;
         const route = account.egress_shared
           ? `Salida compartida: ${account.egress_group || "Chile"}`
@@ -1591,7 +1640,7 @@
               ? `BLOQUEADO · temporary_unavailable · ${localTime(latestAttempt.finished_at)}`
               : `${label(latestAttempt.status)} · ${label(latestAttempt.reason)} · ${localTime(latestAttempt.finished_at)}`;
         const note = account.paused_reason
-          ? `Motivo: ${account.paused_reason}${retryNote} · ${route}${baseline}`
+          ? `Motivo: ${escapeHtml(label(account.paused_reason))}${retryNote} · ${route}${baseline}`
           : `${account.remaining_today} restantes en su ventana de 24 h · ${route}${baseline}`;
         const routeIsHealthy = account.proxy_health_status === "passed"
           && account.egress_baseline_status === "matched";
@@ -1599,6 +1648,7 @@
         const routeStateClass = routeIsHealthy ? "" : " standby";
         const commerceBlocked = account.browser_authenticated
           && account.paused_reason === "temporary_unavailable";
+        const routeCompromised = Boolean(account.proxy_route_compromised);
         const authMethod = account.browser_status === "authenticated_login_api"
           ? "Login API aceptado"
           : account.browser_status === "authenticated_login_form"
@@ -1630,7 +1680,9 @@
           : account.browser_live
             ? "NO CONFIRMADA"
             : `NO · ${browserName} detenido`;
-        const browserStateLabel = commerceBlocked
+        const browserStateLabel = routeCompromised
+          ? "RUTA COMPROMETIDA · REEMPLAZANDO PROXY"
+          : commerceBlocked
           ? "LOGUEADA · REINTENTO EN ESPERA"
           : account.browser_authenticated
           ? `LOGUEADA · ${authMethod.toUpperCase()}`
@@ -1686,7 +1738,8 @@
             <div><dt>Salud / baseline</dt><dd>${escapeHtml(label(account.proxy_health_status))} · ${escapeHtml(account.egress_baseline_status || "-")}</dd></div>
             <div><dt>Puerto sticky</dt><dd>${escapeHtml(account.proxy_sticky_port ?? "-")}</dd></div>
             <div><dt>TTL / generación</dt><dd>${account.proxy_sticky_ttl_minutes ? `${escapeHtml(account.proxy_sticky_ttl_minutes)} min` : "-"} · ${escapeHtml(account.proxy_generation ?? 0)}</dd></div>
-            <div><dt>Estado de recuperación</dt><dd>${escapeHtml(label(account.proxy_route_status || "not_initialized"))}</dd></div>
+            <div><dt>Estado de recuperación</dt><dd>${escapeHtml(account.proxy_route_compromised ? label("compromised") : label(account.proxy_route_status || "not_initialized"))}</dd></div>
+            ${account.proxy_route_compromised ? `<div><dt>Ruta comprometida desde</dt><dd>${escapeHtml(localTime(account.proxy_compromised_since))} · ${escapeHtml(label(account.proxy_compromised_evidence || "portal_error_dialog"))}</dd></div>` : ""}
             <div><dt>Último fallo de candidato</dt><dd>${escapeHtml(account.proxy_last_candidate_outcome ? label(account.proxy_last_candidate_outcome) : "-")}</dd></div>
             <div><dt>Intentos en la ventana</dt><dd>${escapeHtml(String(account.proxy_rotation_count_hour ?? 0))}${account.proxy_rotation_limit_hour ? ` / ${escapeHtml(String(account.proxy_rotation_limit_hour))} por hora` : ""}</dd></div>
             <div><dt>Próximo intento elegible</dt><dd>${nextEligibleLabel}</dd></div>
@@ -1706,7 +1759,9 @@
         </div>`;
         const phase = account.captcha_phase || "";
         const phaseLabel = captchaPhaseLabels[phase] || "";
-        const browserBadge = commerceBlocked
+        const browserBadge = routeCompromised
+          ? { label: "RUTA COMPROMETIDA · REEMPLAZANDO PROXY", css: "browser_offline" }
+          : commerceBlocked
           ? { label: "LOGUEADA · REINTENTO EN ESPERA", css: "browser_unconfirmed" }
           : account.browser_authenticated
           ? { label: browserStateLabel, css: "browser_authenticated" }
@@ -1718,7 +1773,37 @@
               ? { label: `${browserName} no iniciado`, css: "browser_offline" }
               : { label: `${browserName} detenido`, css: "browser_offline" };
         const quotaHold = account.portal_quota;
-        const retryView = account.status === 'paused' && !quotaHold ? `<div class="quota-hold retry-hold" role="status">
+        const episodeStart = Date.parse(account.proxy_compromised_since);
+        const episodeCandidates = recentCandidates.filter(c => Number.isFinite(episodeStart) && Date.parse(c.started_at) >= episodeStart);
+        const candidatePorts = new Set(episodeCandidates.map(c => c.sticky_port).filter(p => p != null));
+        const candidateRoutes = new Set(episodeCandidates.map(c => c.egress_route_id).filter(Boolean));
+        const latestCandidate = [...recentCandidates].sort((a,b) => String(b.finished_at || b.started_at || '').localeCompare(String(a.finished_at || a.started_at || '')))[0];
+        const recoveryDeadline = account.proxy_next_eligible_at || (secondsUntil(account.proxy_rotation_cooldown_until) > 0 ? account.proxy_rotation_cooldown_until : null);
+        const recoveryView = routeCompromised ? `<div class="quota-hold retry-hold" role="status">
+          <strong>Recuperación automática del proxy</strong>
+          <span>Esta cuenta no puede buscar hasta validar una ruta de reemplazo.</span>
+          <b>No espera la renovación del cupo de 24 h.</b>
+          <dl class="account-route-grid">
+            <div><dt>Tiempo desde el bloqueo actual</dt><dd>${Number.isFinite(episodeStart) ? escapeHtml(fmtSeconds(Math.max(0, (Date.now() - episodeStart) / 1000))) : 'Sin registro'}</dd></div>
+            <div><dt>Bloqueo detectado</dt><dd>${escapeHtml(account.proxy_compromised_since ? localTime(account.proxy_compromised_since) : 'Sin registro')}</dd></div>
+            <div><dt>Intentos en ventana horaria</dt><dd>${escapeHtml(String(account.proxy_rotation_count_hour ?? 'Sin dato'))} / ${escapeHtml(String(account.proxy_rotation_limit_hour ?? 'Sin dato'))}</dd></div>
+            <div><dt>Ventana horaria desde</dt><dd>${escapeHtml(account.proxy_rotation_window_started_at ? localTime(account.proxy_rotation_window_started_at) : 'Sin registro')}</dd></div>
+            <div><dt>Candidatos del bloqueo actual (historial visible)</dt><dd>${episodeCandidates.length}</dd></div>
+            <div><dt>Puertos sticky distintos (historial visible)</dt><dd>${candidatePorts.size}</dd></div>
+            <div><dt>Rutas identificadas distintas (historial visible)</dt><dd>${candidateRoutes.size}</dd></div>
+            <div><dt>IPs distintas probadas</dt><dd>No disponible en esta vista; un puerto o una ruta no prueba una IP distinta.</dd></div>
+            <div><dt>Último resultado registrado</dt><dd>${escapeHtml(latestCandidate ? label(latestCandidate.outcome) : 'Sin registro')}${latestCandidate?.http_status ? ' · HTTP ' + escapeHtml(String(latestCandidate.http_status)) : ''}</dd></div>
+            <div><dt>Último intento finalizado</dt><dd>${escapeHtml(latestCandidate?.finished_at ? localTime(latestCandidate.finished_at) : 'Sin registro')}</dd></div>
+          </dl>
+          <small>El tiempo incluye esperas; no es tiempo de trabajo continuo. El historial es parcial: estos conteos no representan todos los intentos ni IPs únicas.</small>
+          ${recoveryDeadline
+            ? `<span>Próximo intento de recuperación (elegibilidad, no inicio garantizado):</span><b data-retry-countdown="${escapeHtml(recoveryDeadline)}">${escapeHtml(retryCountdownText(recoveryDeadline))}</b>`
+            : '<span>Sin hora exacta publicada para el próximo intento.</span>'}
+          <small>Los intentos dependen de las pausas y límites de recuperación y de que el servicio esté activo. No significa que haya un intento ejecutándose ahora.</small>
+          <small>La cola puede usar otra cuenta disponible; si no hay ninguna, espera una cuenta apta.</small>
+          ${candidateLog}
+        </div>` : '';
+        const retryView = account.status === 'paused' && !quotaHold && !routeCompromised ? `<div class="quota-hold retry-hold" role="status">
           <strong>Reintento en espera</strong>
           <span>Motivo: ${escapeHtml(label(account.paused_reason || 'unknown'))}</span>
           <b data-retry-countdown="${escapeHtml(account.resume_at || '')}">${escapeHtml(retryCountdownText(account.resume_at))}</b>
@@ -1766,9 +1851,12 @@
               <div class="account-eligibility">Cupo: ${escapeHtml(eligibilityLabel)}</div>
             </div>
           </div>
+          ${activityView}
+          ${recoveryView}
+          <div class="muted" style="margin-top:8px">Consultas usadas / cupo local</div>
           <div class="account-count">${account.used_today}/${account.daily_quota}</div>
           <div class="mini-bar"><span style="width:${pct}%"></span></div>
-          ${account.quota_window?.resets_at ? `<div class="muted" style="margin-top:8px">Ventana local de 24 h · desde ${escapeHtml(localTime(account.quota_window.started_at))}<br>Renovación local: ${escapeHtml(localTime(account.quota_window.resets_at))}<br><b data-quota-countdown="${escapeHtml(account.quota_window.resets_at)}">${escapeHtml(quotaCountdownText(account.quota_window.resets_at))}</b></div>` : '<div class="muted">La ventana de 24 h comienza con la primera búsqueda aceptada.</div>'}
+          ${account.quota_window?.resets_at ? `<details class="muted" style="margin-top:8px"><summary>Renovación del cupo local · no es el reintento del proxy</summary>Ventana de 24 h · desde ${escapeHtml(localTime(account.quota_window.started_at))}<br>Renovación local: ${escapeHtml(localTime(account.quota_window.resets_at))}<br><b data-quota-countdown="${escapeHtml(account.quota_window.resets_at)}">${escapeHtml(quotaCountdownText(account.quota_window.resets_at))}</b><br>Este contador solo corresponde al cupo local. No programa la recuperación del proxy ni confirma el saldo del portal.</details>` : '<div class="muted">La ventana de 24 h comienza con la primera búsqueda aceptada.</div>'}
           <div class="muted" style="margin-top:8px">${escapeHtml(note)}</div>
           ${quotaView}
           ${retryView}

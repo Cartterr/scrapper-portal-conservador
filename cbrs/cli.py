@@ -1168,6 +1168,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     from .operator_cli import add_operator_parsers
     add_operator_parsers(subparsers)
+    from .download_cli import add_download_parsers
+    add_download_parsers(subparsers)
 
     init_parser = subparsers.add_parser("init", help="Open browser for manual login")
     init_parser.add_argument(
@@ -1632,6 +1634,9 @@ def main(argv: list[str] | None = None) -> int:
     validate_fna_args(args, parser)
 
     try:
+        if args.command in {"get", "get-batch", "status"}:
+            from .download_cli import run
+            return run(args)
         if args.command == "overview":
             from .operator_cli import cmd_overview
             return cmd_overview(args)

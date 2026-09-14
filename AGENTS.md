@@ -12,6 +12,27 @@ Use `systemctl restart cbrs-worker` for worker-only maintenance; never restart
 authenticated Chrome and exact proxy routes as below. Older Windows-specific
 runbook commands do not apply to the active Linux service.
 
+## Latest override: the portal error dialog means a compromised proxy exit
+
+The user proved on 2026-09-13 that the same account and the same search work
+from a clean network while the pooled exits show the exact visible dialog
+`Atención` / `Se ha detectado un problema, refresque la página e intente
+nuevamente.` / `Cerrar`. That complete signature is now evidence about the
+ROUTE and authorizes, for that account only: ending the attempt with no reload
+and no replay, quarantining the exit, logging out and closing and DELETING that
+account's Chrome contexts and profiles, and adopting a proven replacement
+sticky exit. This is the single authorized destructive browser path and the one
+exception to the preservation rules below; it never extends to healthy
+siblings, their contexts or their profiles, and it never clears or replays an
+accepted search receipt. Any weaker signal (unknown DOM, HTTP 400 alone, a
+timeout, a hidden dialog, the daily-quota dialog) stays under the preservation
+rules. Another authenticated account takes the search immediately; when every
+account is quarantined the search waits for the first proven replacement
+instead of the shared outage circuit or a 24-hour wait, and every worker pass
+retries recovery at the route's own pacing. The user authorized the whole
+service and Chrome restart required to activate this on 2026-09-13.
+See `docs/portal-error-dialog.md`.
+
 ## Failed-login candidate recovery: no production cleanup
 
 The user revoked the old failed-login production-context cleanup exception.

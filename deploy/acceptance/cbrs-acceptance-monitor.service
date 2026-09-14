@@ -1,0 +1,22 @@
+[Unit]
+Description=CBRS continuous acceptance observer and idempotent fixture runner
+After=network-online.target
+
+[Service]
+Type=simple
+User=cbrs
+Group=cbrs
+Environment=CBRS_REPOSITORY=/opt/scrapper-portal-conservador
+Environment=PYTHONPATH=/opt/cbrs-acceptance-runner
+Environment=PYTHONDONTWRITEBYTECODE=1
+WorkingDirectory=/opt/cbrs-acceptance-runner
+ExecStart=/opt/scrapper-portal-conservador/.venv/bin/python /opt/cbrs-acceptance-runner/deploy/acceptance_monitor.py --state /opt/scrapper-portal-conservador/.cbrs/runtime/acceptance --runtime /opt/scrapper-portal-conservador --fixtures /opt/cbrs-acceptance-runner/examples/acceptance-live.csv --worker-commit c059762cbcf0bda90ff3493245dfd234f6e328da --client-revision acceptance-master-20260913 --hours 24 --live-workload
+Restart=on-failure
+RestartSec=15
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/scrapper-portal-conservador/.cbrs/runtime
+
+[Install]
+WantedBy=multi-user.target

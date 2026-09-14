@@ -12,14 +12,15 @@ User=cbrs
 Group=cbrs
 WorkingDirectory=@REPO_ROOT@
 EnvironmentFile=@REPO_ROOT@/.env
+Environment=CBRS_BROWSER_OWNER_MODE=external
 Environment=HOME=@REPO_ROOT@/.cbrs/runtime
 Environment=DISPLAY=:99
 Environment=TMPDIR=@REPO_ROOT@/.cbrs/runtime/tmp
-UMask=0027
+UMask=0007
 ExecStartPre=@REPO_ROOT@/.venv/bin/python @REPO_ROOT@/deploy/linux_control.py wait-owner
 ExecStart=@REPO_ROOT@/.venv/bin/python @REPO_ROOT@/deploy/run_with_env.py @REPO_ROOT@/.env -- @REPO_ROOT@/.venv/bin/python -m cbrs jobs worker
 ExecStop=@REPO_ROOT@/.venv/bin/python @REPO_ROOT@/deploy/linux_control.py drain-worker
-Restart=on-failure
+Restart=always
 RestartSec=20
 KillSignal=SIGINT
 TimeoutStopSec=180

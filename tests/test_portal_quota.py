@@ -15,14 +15,16 @@ def test_due_probe_refreshes_stale_modal_and_clears_only_on_acceptance(tmp_path,
     class Page:
         reloaded = 0
         def evaluate(self, script):
-            return 'daily_limit' if not self.reloaded else None
+            if self.reloaded:
+                return None
+            return {'reason': 'daily_limit', 'panel_selector': '[role="dialog"]',
+                    'heading': 'Atención', 'close_button': 'Cerrar', 'message_element': 'p'}
         def reload(self, **kwargs):
             self.reloaded += 1
     page = Page()
     browser = SimpleNamespace(settings=SimpleNamespace(account_id='a3'), quota_store_path=path, page=page)
     monkeypatch.setattr(policy, '_search_fna_once', lambda *a, **kw: [])
     monkeypatch.setattr(policy, 'notify_browser_error', lambda *a: None)
-    monkeypatch.setattr(policy, 'claim_dialog_reload', lambda *a: False)
     assert policy.search_fna_form(browser,1,2,2000,client=None,pace=None) == []
     assert page.reloaded == 1
     assert quota_hold(path, 'a3') is None

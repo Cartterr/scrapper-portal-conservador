@@ -10,7 +10,7 @@ if [[ ! -f /etc/os-release ]] || ! grep -qi '^ID=ubuntu' /etc/os-release; then
   exit 1
 fi
 
-PYTHON_BIN="${CBRS_PYTHON_BIN:-python3.14}"
+PYTHON_BIN="${CBRS_PYTHON_BIN:-python3}"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 APP_DIR="${SOURCE_DIR}"
@@ -18,12 +18,13 @@ STATE_DIR="${APP_DIR}/.cbrs/runtime"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y ca-certificates curl gnupg software-properties-common restic xvfb x11vnc novnc websockify
+apt-get install -y ca-certificates curl gnupg software-properties-common python3 python3-venv restic xvfb x11vnc novnc websockify
 
-if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1 || ! "${PYTHON_BIN}" -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
   add-apt-repository -y ppa:deadsnakes/ppa
   apt-get update
-  apt-get install -y python3.14 python3.14-venv
+  apt-get install -y python3.11 python3.11-venv
+  PYTHON_BIN=python3.11
 fi
 
 if ! command -v google-chrome-stable >/dev/null 2>&1; then
@@ -52,9 +53,10 @@ if [[ -n "${OPERATOR_USER}" && "${OPERATOR_USER}" != "root" ]]; then
   usermod -a -G cbrs "${OPERATOR_USER}"
 fi
 
-install -d -o cbrs -g cbrs -m 0750 "${STATE_DIR}" "${STATE_DIR}"/outputs "${STATE_DIR}"/control "${STATE_DIR}/logs" "${STATE_DIR}/backup/restic"
+install -d -o cbrs -g cbrs -m 2770 "${STATE_DIR}" "${STATE_DIR}"/outputs "${STATE_DIR}"/control "${STATE_DIR}/logs" "${STATE_DIR}/backup/restic"
 install -d -o root -g cbrs -m 0750 "${STATE_DIR}/secrets"
 install -d -o root -g root -m 0755 "${APP_DIR}"
+install -d -o cbrs -g cbrs -m 2770 "${APP_DIR}/outputs/pdf"
 
 if [[ "${SOURCE_DIR}" != "${APP_DIR}" ]]; then
   rsync_args=(
@@ -78,15 +80,14 @@ if [[ ! -x "${APP_DIR}/.venv/bin/python" ]]; then
 fi
 "${APP_DIR}/.venv/bin/python" -m pip install --upgrade pip
 "${APP_DIR}/.venv/bin/python" -m pip install -r "${APP_DIR}/requirements.txt"
+"${APP_DIR}/.venv/bin/python" -m pip install --no-deps -e "${APP_DIR}"
 "${APP_DIR}/.venv/bin/python" -m playwright install-deps chromium
 
 if [[ ! -f "${APP_DIR}/.env" ]]; then
-  install -o root -g cbrs -m 0640 "${APP_DIR}/deploy/cbrs.env.example" "${APP_DIR}/.env"
+  install -o root -g cbrs -m 0640 "${APP_DIR}/.env.example" "${APP_DIR}/.env"
 fi
-if [[ ! -f "${STATE_DIR}"/account-pool.json ]]; then
-  install -o cbrs -g cbrs -m 0640 \
-    "${APP_DIR}/deploy/account-pool.json.example" "${STATE_DIR}"/account-pool.json
-fi
+# New installations discover account pairs from .env. Preserve an existing
+# explicit pool configuration; do not silently replace account routes.
 
 "${APP_DIR}/.venv/bin/python" "${APP_DIR}/deploy/render_units.py"
 systemctl daemon-reload
@@ -96,7 +97,8 @@ systemctl daemon-reload
 cat > /usr/local/bin/cbrs <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-cd '${APP_DIR}'
+export CBRS_REPOSITORY='${APP_DIR}'
+export PYTHONPATH='${APP_DIR}'
 exec '${APP_DIR}/.venv/bin/python' -m cbrs "\$@"
 EOF
 chmod 0755 /usr/local/bin/cbrs
@@ -104,12 +106,12 @@ chmod 0755 /usr/local/bin/cbrs
 install -d -m 0755 /usr/local/share/bash-completion/completions
 cat > /usr/local/share/bash-completion/completions/cbrs <<'EOF'
 _cbrs_complete() {
-  local commands="overview service config accounts health commands doctor preflight readiness captcha-health init search download validate captcha-test soak pool jobs"
+  local commands="get get-batch status overview service config accounts health commands doctor preflight readiness captcha-health init search download validate captcha-test soak pool jobs"
   local services="owner worker dashboard display novnc backup watchdog all"
   if [[ ${COMP_CWORD} -eq 1 ]]; then
     COMPREPLY=( $(compgen -W "${commands}" -- "${COMP_WORDS[COMP_CWORD]}") )
   elif [[ ${COMP_CWORD} -eq 2 && ${COMP_WORDS[1]} == service ]]; then
-    COMPREPLY=( $(compgen -W "status start stop restart logs" -- "${COMP_WORDS[COMP_CWORD]}") )
+    COMPREPLY=( $(compgen -W "install status start stop restart logs" -- "${COMP_WORDS[COMP_CWORD]}") )
   elif [[ ${COMP_CWORD} -eq 3 && ${COMP_WORDS[1]} == service ]]; then
     COMPREPLY=( $(compgen -W "${services}" -- "${COMP_WORDS[COMP_CWORD]}") )
   fi
@@ -118,8 +120,8 @@ complete -F _cbrs_complete cbrs
 EOF
 
 echo "Ubuntu runtime installed. Complete ${APP_DIR}/.env and"
-echo "${STATE_DIR}/account-pool.json, run the documented preflight, then enable services."
+echo "Run cbrs config validate, then enable the services following INSTALL.md."
 echo "Global CLI installed: cbrs commands"
 if [[ -n "${OPERATOR_USER}" && "${OPERATOR_USER}" != "root" ]]; then
-  echo "Open a new WSL shell once so ${OPERATOR_USER} receives cbrs group access."
+  echo "Abra una sesión nueva para que ${OPERATOR_USER} reciba acceso al grupo cbrs."
 fi

@@ -5,6 +5,9 @@
 !.env.example
 .venv/
 .venv-*/
+build/
+dist/
+*.egg-info/
 output/
 outputs/*
 !outputs/

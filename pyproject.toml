@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cbrs"
+version = "0.1.0"
+description = "Cliente y servicio de descarga del Registro de Comercio CBRS"
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[project.scripts]
+cbrs = "cbrs.entrypoint:main"
+
+[tool.setuptools]
+packages = ["cbrs"]
+
+[tool.setuptools.package-data]
+cbrs = ["web/*.html"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}

@@ -72,8 +72,12 @@ def capture_error(store, account_id, browser, error) -> None:
             if context in {"auth refresh", "ticket validation", "image reference lookup", "image download", "commerce form search"}:
                 job = db.execute("SELECT job_id FROM job_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
                 if job:
+                    dialog = getattr(error, 'portal_dialog', None)
+                    detail = {}
+                    if isinstance(dialog, dict) and dialog.get('reason') == 'temporary_unavailable' and dialog.get('after_reload') is True:
+                        detail = {'portal_dialog': 'temporary_unavailable', 'repeated_after_reload': True}
                     store._add_event_db(db, job["job_id"], "portal_operation_error",
-                        {"operation": context, "reason": reason, "http_status": http_status})
+                        {"operation": context, "reason": reason, "http_status": http_status, **detail})
         error._cbrs_error_captured = True
     except Exception:
         pass

@@ -1,5 +1,11 @@
 # Plataforma de Consulta Documental CBRS
 
+La interfaz de entrega por CLI y Python se documenta en [INSTALL.md](INSTALL.md).
+Consulte los [criterios del cliente](CRITERIOS-DE-ACEPTACION.md) y el
+[estado verificable de aceptación](docs/acceptance-status.md) antes de considerar
+la entrega certificada. Las secciones operativas históricas siguientes describen
+también instalaciones anteriores.
+
 ## Operación principal por CLI
 
 El servicio de `master` se puede operar completamente desde una terminal

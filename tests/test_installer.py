@@ -26,7 +26,7 @@ def test_linux_installers_register_global_cbrs_cli() -> None:
     assert "bash-completion/completions/cbrs" in ubuntu
 
 
-def test_native_env_templates_keep_exact_key_parity() -> None:
+def test_minimal_env_requires_only_account_and_proxy_credentials() -> None:
     def keys(path: Path) -> set[str]:
         return {
             line.split("=", 1)[0]
@@ -34,9 +34,10 @@ def test_native_env_templates_keep_exact_key_parity() -> None:
             if re.fullmatch(r"[A-Z][A-Z0-9_]*=.*", line)
         }
 
-    assert keys(ROOT / ".env.example") == keys(
-        ROOT / "deploy" / "cbrs-native.env.example"
-    )
+    assert keys(ROOT / ".env.example") == {
+        "DATAIMPULSE_PROXY_LOGIN", "DATAIMPULSE_PROXY_PASSWORD",
+        *(f"CBRS_EJECUTIVO_{i}_{part}" for i in range(1, 4) for part in ("USERNAME", "PASSWORD")),
+    }
 
 
 def _load_configure_module():

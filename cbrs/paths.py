@@ -5,7 +5,7 @@ import os
 import shutil
 import stat
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(os.environ.get("CBRS_REPOSITORY", Path(__file__).resolve().parents[1])).expanduser().resolve()
 PATH_KEYS = frozenset({
     "CBRS_PROFILE_DIR", "CBRS_CLOAK_PROFILE_DIR", "CBRS_CLOAK_CACHE_DIR",
     "CBRS_OUTPUT_DIR", "CBRS_LOG_DIR", "CBRS_CAPTCHA_STATE_PATH",

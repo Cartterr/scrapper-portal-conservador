@@ -61,8 +61,6 @@ def quota_db(path):
             account_id TEXT PRIMARY KEY, detected_at TEXT NOT NULL,
             first_success_at TEXT, next_check_at TEXT NOT NULL,
             evidence TEXT NOT NULL, probe_count INTEGER NOT NULL DEFAULT 0)''')
-        db.execute('''CREATE TABLE IF NOT EXISTS portal_search_reloads(
-            job_id TEXT PRIMARY KEY, used_at TEXT NOT NULL)''')
         db.commit()
         yield db
         db.commit()
@@ -132,8 +130,8 @@ def browser_quota_path(browser):
     return SETTINGS.profile_dir.parent / 'pool' / 'pool.sqlite3'
 
 
-def portal_dialog_reason(page):
-    """Match open, visible content; generated HeadlessUI numeric IDs can vary."""
+def portal_dialog_evidence(page):
+    """Return only recognized modal structure; never capture unrelated page text."""
     return page.evaluate('''() => {
         const visible=e=>e && e.getClientRects().length>0 && getComputedStyle(e).visibility!=='hidden';
         const normalize=s=>(s||'').normalize('NFD').replace(/[\\u0300-\\u036f]/g,'').replace(/\\s+/g,' ').trim().toLowerCase();
@@ -144,25 +142,38 @@ def portal_dialog_reason(page):
             const close=[...panel.querySelectorAll('button')].some(e=>visible(e)&&normalize(e.textContent)==='cerrar');
             if(!heading || !close) continue;
             const texts=[...panel.querySelectorAll('p')].filter(visible).map(e=>normalize(e.textContent));
-            if(texts.includes('se han agotado las consultas disponibles por hoy.')) reasons.push('daily_limit');
-            if(texts.includes('se ha detectado un problema, refresque la pagina e intente nuevamente.')) reasons.push('temporary_unavailable');
+            let reason=null;
+            if(texts.includes('se han agotado las consultas disponibles por hoy.')) reason='daily_limit';
+            else if(texts.includes('se ha detectado un problema, refresque la pagina e intente nuevamente.')) reason='temporary_unavailable';
+            if(reason) reasons.push({reason, panel_selector: panel.id.startsWith('headlessui-dialog-panel-')
+                ? '[id^="headlessui-dialog-panel-"][data-headlessui-state~="open"]' : '[role="dialog"]',
+                heading: 'Atención', close_button: 'Cerrar', message_element: 'p'});
         }
-        return reasons.includes('daily_limit') ? 'daily_limit' : reasons[0] || null;
+        return reasons.find(e=>e.reason==='daily_limit') || reasons[0] || null;
     }''')
 
 
-def claim_dialog_reload(browser):
-    path = browser_quota_path(browser)
-    if path is None:
-        return True  # isolated test browser; no durable production job
-    with quota_db(path) as db:
-        db.execute('BEGIN IMMEDIATE')
-        rows = db.execute("SELECT job_id FROM job_attempts WHERE account_id=? AND status='running' AND quota_consumed=1",
-                          (browser.settings.account_id,)).fetchall()
-        if len(rows) != 1:
-            return False
-        return db.execute('INSERT OR IGNORE INTO portal_search_reloads VALUES(?,?)',
-            (rows[0][0], datetime.now(timezone.utc).isoformat())).rowcount == 1
+def portal_dialog_reason(page):
+    """Match visible content without depending on generated numeric IDs."""
+    evidence = portal_dialog_evidence(page)
+    return evidence['reason'] if evidence else None
+
+
+PORTAL_ERROR_DIALOG = 'temporary_unavailable'
+
+
+def portal_error_dialog_stop(evidence, *, message, status=None, response_code=None, after_submission):
+    """Build the compromised-route stop carrying the recognized dialog signature.
+
+    The operator confirmed that the same account and search work from a clean
+    network, so this exact visible dialog is treated as a compromised proxy
+    exit: the caller must stop using that browser/route, not refresh and retry.
+    """
+    stop = SafetyStopException(StopReason.TEMPORARY_UNAVAILABLE, message, status=status,
+                               context='commerce form search', response_code=response_code)
+    stop.portal_dialog = {**evidence, 'after_submission': bool(after_submission),
+                          'verdict': 'proxy_compromised'}
+    return stop
 
 
 def search_fna_form(browser, foja, numero, ano, *, client, pace):
@@ -175,50 +186,54 @@ def search_fna_form(browser, foja, numero, ano, *, client, pace):
     previous_hold = quota_hold(path, account_id) if path else None
     if path and not admit_quota_check(path, account_id):
         raise SafetyStopException(StopReason.DAILY_LIMIT, 'Portal quota hold remains active', context='commerce form search')
-    reloaded = False
-    initial_dialog = portal_dialog_reason(browser.page)
+    initial = portal_dialog_evidence(browser.page)
+    if initial and initial['reason'] == PORTAL_ERROR_DIALOG:
+        # The portal error dialog is already open on this route. It is never
+        # refreshed away: the exit is compromised and another account must take
+        # this search while the route is replaced.
+        stop = portal_error_dialog_stop(initial, after_submission=False,
+            message='Portal error dialog visible before submission; route compromised, no search submitted')
+        notify_browser_error(browser, stop)
+        raise stop
     due_probe = bool(previous_hold and not previous_hold['blocked'])
-    if due_probe or initial_dialog == 'temporary_unavailable':
-        # A due probe has its own atomic hourly admission. A historical job's
-        # already-used generic retry must not trap it behind yesterday's modal.
-        if due_probe or claim_dialog_reload(browser):
-            notify_browser_error(browser, SafetyStopException(StopReason.TEMPORARY_UNAVAILABLE,
-                                 'Visible portal dialog before bounded refresh', context='commerce form search'))
-            browser.page.reload(wait_until='domcontentloaded', timeout=60000)
-            reloaded = True
-    for attempt in range(2):
-        try:
-            if portal_dialog_reason(browser.page) == 'daily_limit':
-                raise SafetyStopException(StopReason.DAILY_LIMIT, 'Portal daily quota exhausted', context='commerce form search')
-            result = _search_fna_once(browser, foja, numero, ano, client=client, pace=pace)
+    if due_probe:
+        # A due probe has its own atomic hourly admission; render a fresh page
+        # so yesterday's daily-limit modal cannot mask the outcome.
+        browser.page.reload(wait_until='domcontentloaded', timeout=60000)
+    try:
+        if portal_dialog_reason(browser.page) == 'daily_limit':
+            raise SafetyStopException(StopReason.DAILY_LIMIT, 'Portal daily quota exhausted', context='commerce form search')
+        result = _search_fna_once(browser, foja, numero, ano, client=client, pace=pace)
+        if path:
+            clear_quota_hold(path, account_id)
+        return result
+    except SafetyStopException as exc:
+        if exc.reason == StopReason.AUTH_REQUIRED and due_probe and path:
+            # Admission reserved a probe, but the refreshed page never
+            # submitted it. Preserve the historical hold and restore its
+            # eligibility, without overwriting a newer concurrent check.
+            with quota_db(path) as db:
+                db.execute('UPDATE portal_quota_holds SET next_check_at=?,probe_count=? '
+                    'WHERE account_id=? AND probe_count=?',
+                    (previous_hold['next_check_at'], previous_hold['probe_count'],
+                     account_id, previous_hold['probe_count'] + 1))
+        if exc.reason == StopReason.DAILY_LIMIT:
             if path:
-                clear_quota_hold(path, account_id)
-            return result
-        except SafetyStopException as exc:
-            if exc.reason == StopReason.AUTH_REQUIRED and due_probe and path:
-                # Admission reserved a probe, but the refreshed page never
-                # submitted it. Preserve the historical hold and restore its
-                # eligibility, without overwriting a newer concurrent check.
-                with quota_db(path) as db:
-                    db.execute('UPDATE portal_quota_holds SET next_check_at=?,probe_count=? '
-                        'WHERE account_id=? AND probe_count=?',
-                        (previous_hold['next_check_at'], previous_hold['probe_count'],
-                         account_id, previous_hold['probe_count'] + 1))
-            if exc.reason == StopReason.DAILY_LIMIT:
-                if path:
-                    record_quota_hold(path, account_id)
-                notify_browser_error(browser, exc)
-                raise
-            # Only a definitive matching rejection plus its visible modal can
-            # trigger one reload. Timeouts/unknown outcomes never replay search.
-            if (attempt == 0 and not reloaded and exc.reason == StopReason.TEMPORARY_UNAVAILABLE
-                    and portal_dialog_reason(browser.page) == 'temporary_unavailable'
-                    and claim_dialog_reload(browser)):
-                notify_browser_error(browser, exc)
-                browser.page.reload(wait_until='domcontentloaded', timeout=60000)
-                reloaded = True
-                continue
+                record_quota_hold(path, account_id)
+            notify_browser_error(browser, exc)
             raise
+        if exc.reason == StopReason.TEMPORARY_UNAVAILABLE and not getattr(exc, 'portal_dialog', None):
+            # A definitive matching rejection plus its visible modal identifies
+            # a compromised exit. No reload, no same-search replay: the caller
+            # hands the search to another account and replaces this route.
+            evidence = portal_dialog_evidence(browser.page)
+            if evidence and evidence['reason'] == PORTAL_ERROR_DIALOG:
+                stop = portal_error_dialog_stop(evidence, after_submission=True,
+                    status=exc.status, response_code=exc.response_code,
+                    message='Portal error dialog after a confirmed rejection; route compromised, no replay')
+                notify_browser_error(browser, stop)
+                raise stop from exc
+        raise
 
 
 def _search_fna_once(browser, foja, numero, ano, *, client, pace):
@@ -344,6 +359,20 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
             raise auth from exc
         notify_browser_error(browser, exc)
         if not submitted and not clicked and not isinstance(exc, SafetyStopException):
+            # The dialog can open between the pre-submission check and the
+            # first keystroke. It then blocks the React-controlled inputs and
+            # the field read-back fails. Nothing was submitted, so attribute
+            # the failure to the exit that produced the dialog rather than
+            # handing the same bad route another query later.
+            try:
+                evidence = portal_dialog_evidence(page)
+            except Exception:
+                evidence = None
+            if evidence and evidence['reason'] == PORTAL_ERROR_DIALOG:
+                stop = portal_error_dialog_stop(evidence, after_submission=False,
+                    message='Portal error dialog blocked the search form; route compromised, nothing submitted')
+                notify_browser_error(browser, stop)
+                raise stop from exc
             raise SafetyStopException(StopReason.SEARCH_NOT_SUBMITTED,
                 'Form could not submit a commerce request; alternate account required',
                 context='commerce form search') from exc

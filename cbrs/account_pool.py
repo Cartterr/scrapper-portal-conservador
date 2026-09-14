@@ -66,6 +66,23 @@ SECRET_ACCOUNT_KEYS = {
 }
 
 
+def _heartbeat_predates_boot(heartbeat: str) -> bool:
+    """A pre-boot runner cannot survive, even if its heartbeat is still fresh.
+
+    Fail closed when Linux boot evidence is unavailable. This only retires the
+    run record; browser ownership, receipts and account state are untouched.
+    """
+    try:
+        for line in Path("/proc/stat").read_text(encoding="ascii").splitlines():
+            if line.startswith("btime "):
+                boot = int(line.split()[1])
+                stamp = datetime.fromisoformat(heartbeat)
+                return stamp.tzinfo is not None and stamp.timestamp() < boot
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
+
+
 @dataclass(frozen=True)
 class PoolAccount:
     account_id: str
@@ -108,6 +125,7 @@ class PoolConfig:
     instant_jobs_enabled: bool = True
     allow_live_repetition: bool = False
     selection_policy: str = "round_robin"
+    enforce_estimated_quota: bool = True
 
     @property
     def pool_daily_quota(self) -> int:
@@ -115,6 +133,10 @@ class PoolConfig:
 
     def quota_for(self, account: PoolAccount) -> int:
         return account.daily_quota or self.daily_quota_per_account
+
+    def search_limit_for(self, account: PoolAccount) -> int | None:
+        """Explicit operator budgets remain limits; estimates alone do not."""
+        return self.quota_for(account) if self.enforce_estimated_quota else None
 
 
 @dataclass(frozen=True)
@@ -292,7 +314,8 @@ class AccountPoolStore:
                 ).fetchone()
                 if active and str(active["status"]) in ACTIVE_RUN_STATUSES:
                     heartbeat_age = seconds_since(str(active["heartbeat_at"]))
-                    if heartbeat_age <= RUN_STALE_AFTER_SECONDS:
+                    previous_boot = _heartbeat_predates_boot(str(active["heartbeat_at"]))
+                    if heartbeat_age <= RUN_STALE_AFTER_SECONDS and not previous_boot:
                         raise RuntimeError(
                             "An account pool runner is already active "
                             f"(run_id={active['run_id']}). Stop it before starting another."
@@ -307,7 +330,8 @@ class AccountPoolStore:
                         (
                             now,
                             now,
-                            "runner heartbeat expired before a replacement run started",
+                            ("runner heartbeat predates current boot" if previous_boot else
+                             "runner heartbeat expired before a replacement run started"),
                             active["run_id"],
                         ),
                     )
@@ -843,10 +867,34 @@ def load_account_pool_config(
     accounts = tuple(
         _parse_accounts(raw.get("accounts"), profile_root=settings.profile_dir.parent / "accounts")
     )
+    if not raw.get("accounts"):
+        discovered = []
+        numbers = sorted({int(match.group(1)) for key in settings.runtime_env
+                          if (match := re.fullmatch(r"CBRS_EJECUTIVO_([1-9][0-9]*)_(?:USERNAME|PASSWORD)", key))})
+        for number in numbers:
+            prefix = f"CBRS_EJECUTIVO_{number}"
+            username, password = settings.env_value(prefix + "_USERNAME"), settings.env_value(prefix + "_PASSWORD")
+            if not username and not password:
+                continue
+            if not username or not password:
+                missing = "_USERNAME" if not username else "_PASSWORD"
+                raise ValueError(f"Falta {prefix}{missing}")
+            if number > 10001:
+                raise ValueError("La numeración de cuentas supera el rango de puertos sticky")
+            discovered.append(PoolAccount(
+                account_id=f"ejecutivo_{number}", label=f"Ejecutivo {number}",
+                username_env=prefix + "_USERNAME", password_env=prefix + "_PASSWORD",
+                proxy_provider="dataimpulse_mobile_sticky", dataimpulse_port=9999 + number,
+            ))
+        accounts = tuple(discovered)
     targets = tuple(_parse_targets(raw.get("targets")))
     allow_live_repetition = raw.get("allow_live_repetition", False)
     if not isinstance(allow_live_repetition, bool):
         raise ValueError("allow_live_repetition must be a JSON boolean")
+    enforce_estimated_quota = raw.get("enforce_estimated_quota",
+                                     bool(raw.get("accounts")) or "daily_quota_per_account" in raw or not bool(accounts))
+    if not isinstance(enforce_estimated_quota, bool):
+        raise ValueError("enforce_estimated_quota must be a JSON boolean")
     config = PoolConfig(
         accounts=accounts or DEFAULT_ACCOUNTS,
         daily_quota_per_account=int(
@@ -871,6 +919,7 @@ def load_account_pool_config(
         instant_jobs_enabled=bool(raw.get("instant_jobs_enabled", True)),
         allow_live_repetition=allow_live_repetition,
         selection_policy=str(raw.get("selection_policy", "round_robin")),
+        enforce_estimated_quota=enforce_estimated_quota,
     )
     if config.daily_quota_per_account <= 0:
         raise ValueError("daily_quota_per_account must be greater than zero")

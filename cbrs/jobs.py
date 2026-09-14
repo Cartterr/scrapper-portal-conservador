@@ -102,6 +102,23 @@ CANDIDATE_PROVEN_UNPERSISTED = "candidate_proven_unpersisted"
 # shared ``temporary_unavailable`` stop reason they derive from).
 AUTH_LOGIN_REJECTED = "login_rejected"
 AUTH_LOGIN_PAGE_REJECTED = "login_page_rejected"
+# The exact visible portal error dialog ("Atención / Se ha detectado un
+# problema, refresque la página e intente nuevamente." / "Cerrar") proves a
+# compromised proxy exit for that account: the same account and search work
+# from a clean network. The route is marked compromised, its Chrome instance
+# (cookies, tokens, cache, profile) is discarded, and a new sticky exit is
+# proven and adopted. Other authenticated accounts take the search meanwhile.
+ROUTE_COMPROMISED = "compromised"
+PROXY_COMPROMISED_REASON = "proxy_compromised"
+PORTAL_ERROR_DIALOG_EVIDENCE = "portal_error_dialog"
+PROXY_COMPROMISED_RECOVERY_REASON = "portal_error_dialog_recovery"
+# Proving a replacement exit means launching Chrome and logging in, which the
+# exclusive browser owner serializes against real searches. Quarantining is
+# immediate, but replacement is paced so a queued search always gets the next
+# healthy account first instead of waiting behind a candidate sweep: one
+# account and one candidate per worker pass, at most this often.
+COMPROMISED_RECOVERY_INTERVAL_SECONDS = 60.0
+COMPROMISED_RECOVERY_CANDIDATES_PER_PASS = 1
 DATAIMPULSE_ROTATION_RESULT_KEY = "dataimpulse_rotation_result"
 # `temporary_unavailable` is CBRS's generic retry response, not proof of a
 # CAPTCHA failure.  Once every account returns it, however, repeating the same
@@ -154,6 +171,62 @@ class _ManagedAccountScraper:
     last_restart_at: float = 0.0
     reauth_required: bool = False
     authenticated_once: bool = False
+    portal_error_dialog: bool = False
+
+
+def is_portal_error_dialog(exc: BaseException) -> bool:
+    """True when a stop carries the recognized compromised-route dialog evidence."""
+    if not isinstance(exc, SafetyStopException) or exc.reason != StopReason.TEMPORARY_UNAVAILABLE:
+        return False
+    evidence = getattr(exc, "portal_dialog", None)
+    if isinstance(evidence, Mapping) and evidence.get("reason") == StopReason.TEMPORARY_UNAVAILABLE.value:
+        return True
+    return bool(getattr(exc, "route_compromised", False))
+
+
+def portal_error_dialog_stop(message: str, *, evidence: Mapping[str, Any] | None = None,
+                             context: str = "portal error dialog") -> SafetyStopException:
+    stop = SafetyStopException(StopReason.TEMPORARY_UNAVAILABLE, message, context=context)
+    stop.portal_dialog = {"reason": StopReason.TEMPORARY_UNAVAILABLE.value,
+                          "verdict": "proxy_compromised", **dict(evidence or {})}
+    return stop
+
+
+def _logout_browser(browser: Any) -> None:
+    """Best-effort logout and storage wipe before a compromised context closes.
+
+    Never launches or re-opens a context, and never waits on a request that has
+    to travel through the compromised exit: the profile directory is deleted
+    straight after, which is what actually guarantees nothing is reused.
+    """
+    context = getattr(browser, "_context", "unset")
+    if context == "unset":
+        context = getattr(browser, "context", None)
+    if context is None:
+        return  # a closed or never-opened context has nothing to clear
+    page = None
+    try:
+        page = browser.page
+    except Exception:
+        page = None
+    if page is not None:
+        try:
+            # Fire-and-forget: the returned value is not a promise, so a dead
+            # proxy cannot block this call.
+            page.evaluate(
+                "() => { try { fetch('/api/v1/auth/logout', {method: 'POST',"
+                " credentials: 'include'}).catch(() => null); } catch (e) {}"
+                " try { localStorage.clear(); sessionStorage.clear(); } catch (e) {}"
+                " return true; }"
+            )
+            page.wait_for_timeout(300)
+        except Exception:
+            pass
+    try:
+        if callable(getattr(context, "clear_cookies", None)):
+            context.clear_cookies()
+    except Exception:
+        pass
 
 
 def _browser_engine(settings: Settings | None) -> str:
@@ -240,6 +313,26 @@ class _PersistentAccountBrowsers:
         for account_id, credentials in tuple(self._known_accounts.items()):
             settings, username, password = credentials
             entry = self._entries.get(account_id)
+            if entry is not None and entry.portal_error_dialog:
+                # Real-time passive detection of the portal error dialog on a
+                # living page: the route is compromised. Report it once; the
+                # recovery step discards this browser and replaces the exit.
+                entry.portal_error_dialog = False
+                try:
+                    if self.on_auth_failure:
+                        self.on_auth_failure(account_id, portal_error_dialog_stop(
+                            "Portal error dialog visible on an idle authenticated page",
+                            evidence={"passive": True}))
+                except Exception:
+                    # One account's recovery must never stop the others from
+                    # being reconciled, nor bring the worker down.
+                    pass
+                continue
+            try:
+                if self.store.route_compromised(account_id):
+                    continue  # never re-login or relaunch through a compromised exit
+            except Exception:
+                continue
             # An already-known failed login need not wait for the next passive
             # health scan after its cooldown expires. This is scheduling only:
             # account/global/route gates and the retry floor still apply.
@@ -341,6 +434,12 @@ class _PersistentAccountBrowsers:
     ) -> Iterator[Any]:
         validate_service_browser(settings)
         self._known_accounts[account_id] = (settings, username, password)
+        if self.store.route_compromised(account_id):
+            stop = portal_error_dialog_stop(
+                "Proxy route is compromised; recovery must adopt a new exit before use",
+                evidence={"route_compromised": True}, context="route recovery")
+            stop.route_compromised = True
+            raise stop
         entry = self._entries.get(account_id)
         if entry is None:
             manager = self.scraper_factory(headless=self.headless, settings=settings)
@@ -492,6 +591,65 @@ class _PersistentAccountBrowsers:
             status="authenticated_candidate_retained", auth_state="authenticated_form",
         )
         self.capture_previews(force=True)
+
+    def ditch_compromised(self, account_id: str, *, status: str = "proxy_compromised_discarded",
+                          extra_profile_dirs: tuple[Path, ...] = ()) -> list[str]:
+        """Log out, close and delete every Chrome context of a compromised route.
+
+        This is the one authorized destructive path: it applies only to an
+        account whose proxy exit was proven compromised by the portal error
+        dialog. Cookies, tokens, cache and the whole persistent profile go with
+        the context; nothing from that exit is carried into the replacement.
+        """
+        removed: list[str] = []
+        entries = [entry for key, entry in self._retained_entries if key == account_id]
+        self._retained_entries = [(key, entry) for key, entry in self._retained_entries if key != account_id]
+        current = self._entries.pop(account_id, None)
+        if current is not None:
+            entries.append(current)
+        profile_dirs = [Path(directory) for directory in extra_profile_dirs]
+        if not entries and not profile_dirs:
+            return []  # already ditched; retries must stay quiet and cheap
+        closed = 0
+        for entry in entries:
+            browser = getattr(entry.scraper, "browser", entry.scraper)
+            if getattr(browser, "is_remote", False):
+                continue  # the independent owner discards its own Chrome
+            closed += 1
+            profile = getattr(getattr(entry, "settings", None), "profile_dir", None)
+            if profile:
+                profile_dirs.append(Path(profile))
+            _logout_browser(browser)
+            for closer in (
+                lambda: browser.set_preview_callback(None),
+                lambda: browser.shutdown_service_context(),
+                lambda: entry.manager.__exit__(None, None, None),
+                lambda: entry.scraper.close(),
+            ):
+                try:
+                    closer()
+                except Exception:
+                    continue
+        import shutil
+        for directory in dict.fromkeys(profile_dirs):
+            try:
+                if directory.is_dir():
+                    shutil.rmtree(directory, ignore_errors=True)
+                    removed.append(str(directory))
+            except Exception:
+                continue
+        remove_browser_preview(self.store.path, account_id)
+        engine = _browser_engine(current.settings if current is not None else None)
+        self.store.set_account_browser_state(
+            account_id, live=False, authenticated=False, headless=self.headless,
+            owner=self.worker_id, engine=engine, status=status,
+            auth_error=PORTAL_ERROR_DIALOG_EVIDENCE,
+        )
+        self.store.add_event(
+            "proxy_compromised_browser_discarded", account_id=account_id, level="warning",
+            data={"contexts_closed": closed, "profiles_removed": len(removed), "status": status},
+        )
+        return removed
 
     def discard(self, account_id: str, *, status: str,
                 service_shutdown: bool = False) -> None:
@@ -756,6 +914,8 @@ class JobStore:
                     temporary_window_started_at TEXT,
                     temporary_failure_count INTEGER NOT NULL DEFAULT 0,
                     rejected_ports_json TEXT NOT NULL DEFAULT '[]',
+                    compromised_since TEXT,
+                    compromised_evidence TEXT,
                     updated_at TEXT NOT NULL
                 );
 
@@ -838,6 +998,16 @@ class JobStore:
                 db.execute(
                     "ALTER TABLE account_proxy_routes ADD COLUMN "
                     "rejected_ports_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            # A compromised exit is tracked apart from the rotation status so a
+            # failed candidate attempt cannot silently clear the quarantine.
+            if "compromised_since" not in route_columns:
+                db.execute(
+                    "ALTER TABLE account_proxy_routes ADD COLUMN compromised_since TEXT"
+                )
+            if "compromised_evidence" not in route_columns:
+                db.execute(
+                    "ALTER TABLE account_proxy_routes ADD COLUMN compromised_evidence TEXT"
                 )
             job_columns = {
                 str(row["name"])
@@ -1349,7 +1519,7 @@ class JobStore:
         job_id: str,
         account_id: str,
         quota_date: str,
-        quota: int,
+        quota: int | None,
         run_id: str,
         consume_quota: bool,
     ) -> str | None:
@@ -1380,7 +1550,7 @@ class JobStore:
                 if checkpoint is None or checkpoint["result_count"] is not None or prior_search:
                     return None
                 usage = self._account_usage_db(db, account_id, quota_date)
-                if usage >= quota:
+                if quota is not None and usage >= quota:
                     return None
             db.execute(
                 """
@@ -1569,9 +1739,9 @@ class JobStore:
                 quota = (
                     int(quota_by_account[account.account_id])
                     if quota_by_account and account.account_id in quota_by_account
-                    else config.quota_for(account)
+                    else config.search_limit_for(account)
                 )
-                if require_search_capacity and used >= quota:
+                if require_search_capacity and quota is not None and used >= quota:
                     continue
                 if require_search_capacity and source_quota_by_account and account.account_id in source_quota_by_account:
                     from .form_search import account_window_db
@@ -2003,6 +2173,77 @@ class JobStore:
             ).fetchone()
             return dict(row) if row else None
 
+    def route_compromised(self, account_id: str) -> bool:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT compromised_since FROM account_proxy_routes WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+        return bool(row and row["compromised_since"])
+
+    def compromised_routes(self) -> list[str]:
+        """Quarantined accounts, least recently attempted first (round robin)."""
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT account_id FROM account_proxy_routes "
+                "WHERE compromised_since IS NOT NULL ORDER BY updated_at, compromised_since"
+            ).fetchall()
+        return [str(row["account_id"]) for row in rows]
+
+    def mark_route_compromised(self, account_id: str, *, initial_port: int,
+                               evidence: str = PORTAL_ERROR_DIALOG_EVIDENCE) -> bool:
+        """Durably quarantine the active exit; True only on the first flag.
+
+        ``cooldown_until`` and the rotation window are preserved so recovery
+        pacing (candidate retry delay, promotion spacing, hourly allowance)
+        keeps applying instead of a fixed multi-hour wait.
+        """
+        now = utc_now()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "INSERT INTO account_proxy_routes(account_id, active_port, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(account_id) DO NOTHING",
+                (account_id, int(initial_port), now),
+            )
+            row = db.execute(
+                "SELECT compromised_since FROM account_proxy_routes WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            already = bool(row and row["compromised_since"])
+            db.execute(
+                "UPDATE account_proxy_routes SET compromised_since = COALESCE(compromised_since, ?), "
+                "compromised_evidence = ?, pending_port = NULL, last_error_code = ?, updated_at = ? "
+                "WHERE account_id = ?",
+                (now, redact_text(evidence)[:80], redact_text(evidence)[:80], now, account_id),
+            )
+        return not already
+
+    def mark_route_attempted(self, account_id: str) -> None:
+        """Stamp a recovery attempt so quarantined routes take turns fairly.
+
+        A rotation blocked by its own cooldown changes nothing else, so without
+        this the driver would keep picking the same blocked account forever.
+        Sub-second precision keeps the order strict when several attempts land
+        inside the same second.
+        """
+        stamp = datetime.now(timezone.utc).isoformat()
+        with self.connect() as db:
+            db.execute(
+                "UPDATE account_proxy_routes SET updated_at = ? "
+                "WHERE account_id = ? AND compromised_since IS NOT NULL",
+                (stamp, account_id),
+            )
+
+    def clear_route_compromised(self, account_id: str) -> None:
+        """Lift the quarantine; only a proven, adopted replacement exit may do this."""
+        with self.connect() as db:
+            db.execute(
+                "UPDATE account_proxy_routes SET compromised_since = NULL, "
+                "compromised_evidence = NULL, updated_at = ? WHERE account_id = ?",
+                (utc_now(), account_id),
+            )
+
     def dataimpulse_routes(self) -> list[dict[str, Any]]:
         with self.connect() as db:
             return [
@@ -2179,6 +2420,7 @@ class JobStore:
                     UPDATE account_proxy_routes
                     SET active_port = pending_port, pending_port = NULL,
                         generation = generation + 1, status = 'active',
+                        compromised_since = NULL, compromised_evidence = NULL,
                         last_error_code = NULL, last_rotated_at = ?,
                         cooldown_until = COALESCE(?, cooldown_until),
                         temporary_window_started_at = NULL,
@@ -2826,7 +3068,7 @@ def normalize_job_input(kind: str, input_data: Mapping[str, Any]) -> dict[str, A
             year = int(input_data.get("year", input_data.get("ano")))
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("fna jobs require integer foja, numero, and year values") from exc
-        if foja <= 0 or numero <= 0 or year < 1800 or year > 2200:
+        if foja <= 0 or numero <= 0 or year <= 0:
             raise ValueError("fna values are outside the accepted range")
         return {
             "foja": foja,
@@ -3021,6 +3263,7 @@ def run_job_worker(
     heartbeat_stop = threading.Event()
     heartbeat_thread: threading.Thread | None = None
     startup_gates_pending = True
+    last_recovery_at = 0.0
     browser_pool = _PersistentAccountBrowsers(
         scraper_factory=scraper_factory,
         headless=runtime_headless,
@@ -3054,6 +3297,12 @@ def run_job_worker(
             settings, config, store, pool_store, run_id, browser_pool,
             preflight_runner, proxy_health_runner,
         )
+        for quarantined in store.compromised_routes():
+            # The quarantine is durable; the pool run is not. Re-publish the
+            # hold so a restart never advertises a compromised exit as ready.
+            pool_store.pause_account(
+                run_id, quarantined, reason=PROXY_COMPROMISED_REASON, cooldown_seconds=None,
+            )
         pool_store.add_event(run_id, message="job worker started", data={"worker_id": worker_id})
         heartbeat_thread = threading.Thread(
             target=_worker_heartbeat,
@@ -3070,6 +3319,21 @@ def run_job_worker(
             pool_store.reactivate_expired_cooldowns(run_id)
             browser_pool.reconcile()
             browser_pool.capture_previews()
+            if (
+                time.monotonic() - last_recovery_at >= COMPROMISED_RECOVERY_INTERVAL_SECONDS
+                and store.compromised_routes()
+            ):
+                last_recovery_at = time.monotonic()
+                _recover_compromised_routes(
+                    settings=settings,
+                    config=config,
+                    store=store,
+                    pool_store=pool_store,
+                    run_id=run_id,
+                    browser_pool=browser_pool,
+                    preflight_runner=preflight_runner,
+                    proxy_health_runner=proxy_health_runner,
+                )
             # A replacement worker can acquire the global lease moments before
             # the previous job lease expires. Recheck on every scheduler pass
             # so that job is requeued once it becomes stale without requiring
@@ -3702,19 +3966,43 @@ def _rotate_dataimpulse_route(
                 level='warning', data={'reason': 'owner_preservation_upgrade_required'})
             return False
         entry = browser_pool._entries.get(account.account_id)
-        if entry is None or not getattr(getattr(entry.scraper, "browser", None), "is_remote", False):
+        scraper = entry.scraper if entry is not None else None
+        if scraper is not None and not getattr(getattr(scraper, "browser", None), "is_remote", False):
             return False
-        recovered = bool(entry.scraper._call("recover_route", {"reason": reason}))
+        if scraper is None:
+            # A quarantined account has no usable worker-side handle: the owner
+            # holds its Chrome. Address the owner directly to recover the route.
+            if not store.route_compromised(account.account_id):
+                return False
+            try:
+                scraper = browser_pool.scraper_factory(
+                    headless=browser_pool.headless,
+                    settings=_runtime_account_settings(settings, account, store),
+                )
+            except Exception:
+                return False
+            if not getattr(getattr(scraper, "browser", None), "is_remote", False):
+                return False
+        recovered = bool(scraper._call("recover_route", {
+            "reason": reason,
+            "candidates": int(getattr(settings, "dataimpulse_candidates_per_recovery", 1) or 1),
+        }))
         if recovered:
-            browser_pool.discard(account.account_id, status="remote_route_adopted", service_shutdown=True)
             fresh = _runtime_account_settings(settings, account, store)
-            browser_pool._known_accounts[account.account_id] = (fresh, entry.username, entry.password)
+            if entry is not None:
+                browser_pool.discard(account.account_id, status="remote_route_adopted", service_shutdown=True)
+                browser_pool._known_accounts[account.account_id] = (fresh, entry.username, entry.password)
+            else:
+                known = browser_pool._known_accounts.get(account.account_id)
+                if known:
+                    browser_pool._known_accounts[account.account_id] = (fresh, known[1], known[2])
         return recovered
     validate_service_browser(settings)
     if not _is_dataimpulse_account(account) or account.dataimpulse_port is None:
         return False
     if (browser_pool.has_protected_session(account.account_id)
-            and not browser_pool.can_replace_rejected_login(account.account_id)):
+            and not browser_pool.can_replace_rejected_login(account.account_id)
+            and not store.route_compromised(account.account_id)):
         store.add_event(
             "dataimpulse_rotation_skipped", account_id=account.account_id,
             level="warning",
@@ -4025,6 +4313,160 @@ def _try_dataimpulse_candidate(
                 pass
 
 
+def _recover_compromised_route(
+    account: PoolAccount,
+    settings: Settings,
+    store: JobStore,
+    pool_store: AccountPoolStore,
+    run_id: str,
+    browser_pool: _PersistentAccountBrowsers,
+    preflight_runner: Callable[..., Any],
+    proxy_health_runner: Callable[..., Any],
+    *,
+    reason: str = PROXY_COMPROMISED_RECOVERY_REASON,
+) -> bool:
+    """Ditch the compromised browser and adopt a proven replacement exit.
+
+    Order matters: the Chrome instance bound to the compromised exit is logged
+    out, closed and deleted first, so no cookie, token or cache from it can be
+    reused. Only a candidate that authenticates through a NEW exit lifts the
+    quarantine. Failure leaves the account quarantined and retryable on the
+    next pass at the existing route pacing, never a fixed 24-hour wait.
+    """
+    if not _is_dataimpulse_account(account) or account.dataimpulse_port is None:
+        return False
+    if pool_store.stop_requested() or store.global_cooldown():
+        return False
+    store.mark_route_attempted(account.account_id)
+    external = settings.env_value("CBRS_BROWSER_OWNER_MODE", "embedded") == "external"
+    if not external:
+        # The independent owner ditches its own Chrome inside recover_route.
+        try:
+            browser_pool.ditch_compromised(account.account_id)
+        except Exception as exc:
+            store.add_event(
+                "proxy_compromised_discard_failed", account_id=account.account_id,
+                level="error", data={"error": redact_text(str(exc))[:160]},
+            )
+            return False
+    failure = None
+    # One candidate per pass. The route's own pacing (candidate retry delay,
+    # rotation cooldown, hourly allowance) still governs how often this runs.
+    paced = replace(
+        settings,
+        dataimpulse_candidates_per_recovery=COMPROMISED_RECOVERY_CANDIDATES_PER_PASS,
+    )
+    try:
+        recovered = _rotate_dataimpulse_route(
+            account, paced, store, pool_store, run_id, browser_pool,
+            preflight_runner, proxy_health_runner, reason=reason,
+        )
+    except Exception as exc:
+        # Never let a pending owner reply, a provider error or a launch failure
+        # escape into the scheduler: the quarantine stands and the next pass
+        # retries. The search itself is already safe with another account.
+        recovered, failure = False, redact_text(str(exc))[:160]
+    route = store.dataimpulse_route(account.account_id) or {}
+    if recovered:
+        store.clear_route_compromised(account.account_id)
+        store.set_account_check(account.account_id, session_checked=True)
+        pool_store.mark_account_available(run_id, account.account_id)
+        store.add_event(
+            "proxy_compromised_route_replaced", account_id=account.account_id,
+            data={"sticky_port": route.get("active_port"),
+                  "generation": route.get("generation"),
+                  "authenticated_form": True, "evidence": PORTAL_ERROR_DIALOG_EVIDENCE},
+        )
+        return True
+    store.add_event(
+        "proxy_compromised_recovery_pending", account_id=account.account_id, level="warning",
+        data={"route_status": route.get("status"),
+              "next_eligible_at": route.get("cooldown_until"),
+              "quarantined_since": route.get("compromised_since"),
+              "error": failure},
+    )
+    return False
+
+
+def _handle_portal_error_dialog(
+    exc: SafetyStopException,
+    *,
+    job_id: str | None,
+    account: PoolAccount,
+    store: JobStore,
+    pool_store: AccountPoolStore,
+    run_id: str,
+) -> str:
+    """Quarantine a proven-compromised exit and release the job at once.
+
+    Only the fast, local decisions happen here. Ditching the browser and
+    proving a replacement exit are the periodic driver's work, so the queued
+    search reaches a healthy account without waiting for a candidate sweep.
+    """
+    first = store.mark_route_compromised(
+        account.account_id, initial_port=int(account.dataimpulse_port or 0),
+    )
+    evidence = getattr(exc, "portal_dialog", None)
+    store.add_event(
+        "portal_error_dialog_detected", job_id=job_id, account_id=account.account_id,
+        level="warning",
+        data={"first_detection": first,
+              "after_submission": bool(isinstance(evidence, Mapping)
+                                       and evidence.get("after_submission")),
+              "passive": bool(isinstance(evidence, Mapping) and evidence.get("passive")),
+              "verdict": "proxy_compromised", "search_replayed": False},
+    )
+    # Hold the account out of selection until a replacement exit is proven.
+    # No timed cooldown: recovery, not a clock, decides when it returns.
+    pool_store.pause_account(
+        run_id, account.account_id, reason=PROXY_COMPROMISED_REASON, cooldown_seconds=None,
+    )
+    # Return immediately so an already authenticated sibling runs this search
+    # now. Ditching the browser and proving a new exit happen on the worker's
+    # next pass, once the queued work has had its turn.
+    return "retry_account"
+
+
+def _recover_compromised_routes(
+    *,
+    settings: Settings,
+    config: PoolConfig,
+    store: JobStore,
+    pool_store: AccountPoolStore,
+    run_id: str,
+    browser_pool: _PersistentAccountBrowsers,
+    preflight_runner: Callable[..., Any],
+    proxy_health_runner: Callable[..., Any],
+) -> int:
+    """Replace one quarantined exit per pass, oldest attempt first.
+
+    Recovery keeps running until an account adopts a working exit, but never
+    takes more than one turn at a time on the single browser owner.
+    """
+    quarantined = store.compromised_routes()
+    if not quarantined or pool_store.stop_requested() or store.global_cooldown():
+        return 0
+    accounts = {account.account_id: account for account in config.accounts if account.enabled}
+    now = utc_now()
+    for account_id in quarantined:
+        account = accounts.get(account_id)
+        if account is None:
+            continue
+        route = store.dataimpulse_route(account_id) or {}
+        if str(route.get("cooldown_until") or "") > now:
+            continue  # still serving its own retry delay; give the turn away
+        # Exactly one real attempt per pass, oldest attempt first, so queued
+        # searches keep their turn on the shared browser owner.
+        try:
+            return int(_recover_compromised_route(
+                account, settings, store, pool_store, run_id, browser_pool,
+                preflight_runner, proxy_health_runner,
+            ))
+        except Exception:
+            return 0  # quarantine stands; the next pass retries
+    return 0
+
+
 def _process_requested_dataimpulse_rotation(
     *,
     settings: Settings,
@@ -4138,6 +4580,17 @@ def _handle_account_safety_stop(
             data={"reason": exc.reason.value, "resume_at": cooldown["resume_at"]},
         )
         return "cooldown"
+    if (
+        is_portal_error_dialog(exc)
+        and _is_dataimpulse_account(account)
+        and account.dataimpulse_port is not None
+    ):
+        # Proven compromised exit: quarantine, ditch, replace. Never a shared
+        # portal-outage signal and never a same-route retry.
+        return _handle_portal_error_dialog(
+            exc, job_id=job_id, account=account, store=store,
+            pool_store=pool_store, run_id=run_id,
+        )
     if exc.reason == StopReason.CAPTCHA_REJECTED:
         pool_store.mark_account_captcha_pending(
             run_id,

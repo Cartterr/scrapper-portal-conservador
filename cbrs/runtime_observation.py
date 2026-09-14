@@ -55,11 +55,19 @@ def sample_auth(self, *, account_ids=None):
         from .runtime_updates import runtime_module
         quota_policy = runtime_module('form_search')
         try:
-            quota_exhausted = quota_policy.portal_dialog_reason(browser.page) == 'daily_limit'
+            dialog = quota_policy.portal_dialog_reason(browser.page)
         except Exception:
-            quota_exhausted = False  # Disconnected pages cannot supply evidence.
+            dialog = None  # Disconnected pages cannot supply evidence.
+        quota_exhausted = dialog == 'daily_limit'
         if quota_exhausted:
             quota_policy.record_quota_hold(self.store.path, account_id)
+        # Real-time detection on any living page, not only during a search.
+        # The exact portal error dialog identifies a compromised exit: flag it
+        # for the owning process, which ditches the browser and replaces the
+        # route. Observation only; nothing is clicked, reloaded or logged out.
+        portal_error = dialog == getattr(quota_policy, 'PORTAL_ERROR_DIALOG', 'temporary_unavailable')
+        if portal_error:
+            entry.portal_error_dialog = True
         detector = getattr(browser, "detect_commerce_auth_state", None)
         if not callable(detector):
             legacy_detector = getattr(browser, "page_requires_login", None)
@@ -109,12 +117,14 @@ def sample_auth(self, *, account_ids=None):
             headless=self.headless,
             owner=self.worker_id,
             engine=_browser_engine(entry.settings),
-            status="login_rejected_visible" if rejected_login else {
+            status="portal_error_dialog_visible" if portal_error
+            else "login_rejected_visible" if rejected_login else {
                 CommerceAuthState.AUTHENTICATED_FORM: "authenticated_form_visible",
                 CommerceAuthState.LOGIN_GATE: "login_gate_visible",
                 CommerceAuthState.CONFLICT: "authentication_dom_conflict",
                 CommerceAuthState.UNKNOWN: "authentication_unknown",
             }[state],
             auth_state=state.value,
-            auth_error="temporary_unavailable" if rejected_login else None,
+            auth_error="portal_error_dialog" if portal_error
+            else "temporary_unavailable" if rejected_login else None,
         )

@@ -204,7 +204,13 @@ class RemoteScraper:
                 except ValueError:
                     error = {}
                 if isinstance(error, dict) and error.get("reason") in {reason.value for reason in StopReason}:
-                    raise SafetyStopException(StopReason(error["reason"]), "Browser owner reported a portal failure", status=error.get("status"), context=error.get("context") or "browser owner")
+                    stop = SafetyStopException(StopReason(error["reason"]), "Browser owner reported a portal failure", status=error.get("status"), context=error.get("context") or "browser owner")
+                    if error.get("route_compromised"):
+                        # The owner proved the portal error dialog on this exit.
+                        stop.route_compromised = True
+                        stop.portal_dialog = {"reason": StopReason.TEMPORARY_UNAVAILABLE.value,
+                                              "verdict": "proxy_compromised", "observer": "browser_owner"}
+                    raise stop
                 if isinstance(error, dict) and error.get("reason") == "credentials_invalid":
                     raise CredentialsRejectedError()
                 raise RuntimeError("Browser operation incomplete; inspect durable owner receipt, do not replay")

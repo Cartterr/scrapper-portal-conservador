@@ -1063,6 +1063,11 @@ def _with_proxy_state(
         item["proxy_rotation_window_started_at"] = route.get("rotation_window_started_at")
         # Last candidate failure class (login rejected vs transport failure).
         item["proxy_last_candidate_outcome"] = route.get("last_error_code")
+        # A quarantined exit: the portal error dialog proved it compromised and
+        # recovery must adopt a new one before the account is used again.
+        item["proxy_route_compromised"] = bool(route.get("compromised_since"))
+        item["proxy_compromised_since"] = route.get("compromised_since")
+        item["proxy_compromised_evidence"] = route.get("compromised_evidence")
         cooldown_until = str(route.get("cooldown_until") or "")
         item["proxy_next_eligible_at"] = (
             cooldown_until if cooldown_until and cooldown_until > utc_now() else None

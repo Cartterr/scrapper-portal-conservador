@@ -268,9 +268,9 @@ def load_settings(
         else ".cbrs/runtime/chrome-profile"
     )
 
-    captcha_solver_mode = env.get(
-        "CBRS_CAPTCHA_SOLVER_MODE", DEFAULT_CAPTCHA_SOLVER_MODE
-    ).strip().lower()
+    optional_solver = ("capsolver_fallback" if env.get("CBRS_CAPSOLVER_API_KEY") else
+                       "2captcha_fallback" if env.get("CBRS_2CAPTCHA_API_KEY") else DEFAULT_CAPTCHA_SOLVER_MODE)
+    captcha_solver_mode = env.get("CBRS_CAPTCHA_SOLVER_MODE", optional_solver).strip().lower()
     if captcha_solver_mode not in CAPTCHA_SOLVER_MODES:
         raise ValueError(
             "CBRS_CAPTCHA_SOLVER_MODE must be browser or a supported "
@@ -474,7 +474,7 @@ def load_settings(
         ),
         headless=_bool(env.get("CBRS_HEADLESS"), default=DEFAULT_HEADLESS),
         window_mode=env.get("CBRS_WINDOW_MODE", DEFAULT_WINDOW_MODE).strip().lower(),
-        egress_mode=env.get("CBRS_EGRESS_MODE", "").strip().lower(),
+        egress_mode=env.get("CBRS_EGRESS_MODE", "mobile_sticky" if env.get("DATAIMPULSE_PROXY_LOGIN") else "").strip().lower(),
         allow_personal_egress=_bool(env.get("CBRS_ALLOW_PERSONAL_EGRESS")),
         expected_egress_country=env.get(
             "CBRS_EXPECTED_EGRESS_COUNTRY",

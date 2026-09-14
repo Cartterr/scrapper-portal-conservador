@@ -5,7 +5,7 @@ import pytest
 from playwright.sync_api import sync_playwright
 
 from cbrs.form_search import search_fna_form
-from cbrs.form_search import portal_dialog_reason
+from cbrs.form_search import portal_dialog_reason, portal_dialog_evidence
 from cbrs.safety import SafetyStopException, StopReason
 
 
@@ -53,7 +53,8 @@ def test_current_login_gate_stops_before_search(test_chrome, href):
         page.close()
 
 
-def test_confirmed_generic_modal_one_reload_then_quota_stop(test_chrome):
+def test_quota_modal_on_the_first_rejection_is_a_daily_limit_stop(test_chrome):
+    """The quota dialog keeps its own meaning and still costs one submission."""
     page = test_chrome.new_page()
     submits, loads = [], []
     html = HTML.replace("document.querySelector('#results').textContent=JSON.stringify(await res.json());",
@@ -64,10 +65,9 @@ def test_confirmed_generic_modal_one_reload_then_quota_stop(test_chrome):
             route.fulfill(content_type='text/html; charset=utf-8', body=html)
         elif route.request.url.endswith('/texto'):
             submits.append(1)
-            message = ('Se ha detectado un problema, refresque la página e intente nuevamente.'
-                       if len(submits)==1 else 'Se han agotado las consultas disponibles por hoy.')
             route.fulfill(status=400, content_type='application/json',
-                          body=json.dumps({'code':'intente-mas-tarde', 'modal':modal(message)}))
+                          body=json.dumps({'code': 'intente-mas-tarde',
+                                           'modal': modal('Se han agotado las consultas disponibles por hoy.')}))
         else:
             route.fulfill(content_type='application/json', body='{}')
     try:
@@ -77,7 +77,8 @@ def test_confirmed_generic_modal_one_reload_then_quota_stop(test_chrome):
         with pytest.raises(SafetyStopException) as exc:
             search_fna_form(browser,9441,4580,1980,client=None,pace=lambda _:None)
         assert exc.value.reason == StopReason.DAILY_LIMIT
-        assert len(submits)==2 and len(loads)==2
+        # One click, one page load: the quota dialog is never refreshed away.
+        assert len(submits)==1 and len(loads)==1
         assert not page.is_closed()
     finally:
         page.close()
