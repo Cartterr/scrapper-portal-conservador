@@ -1009,6 +1009,10 @@ class JobStore:
                 db.execute(
                     "ALTER TABLE account_proxy_routes ADD COLUMN compromised_evidence TEXT"
                 )
+            if "last_recovery_attempt_at" not in route_columns:
+                db.execute(
+                    "ALTER TABLE account_proxy_routes ADD COLUMN last_recovery_attempt_at TEXT"
+                )
             job_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(jobs)").fetchall()
@@ -2186,7 +2190,12 @@ class JobStore:
         with self.connect() as db:
             rows = db.execute(
                 "SELECT account_id FROM account_proxy_routes "
-                "WHERE compromised_since IS NOT NULL ORDER BY updated_at, compromised_since"
+                "WHERE compromised_since IS NOT NULL ORDER BY "
+                "CASE WHEN last_recovery_attempt_at IS NULL "
+                "OR julianday(last_recovery_attempt_at) < julianday(compromised_since) "
+                "THEN 0 ELSE 1 END, "
+                "CASE WHEN julianday(last_recovery_attempt_at) >= julianday(compromised_since) "
+                "THEN julianday(last_recovery_attempt_at) END, compromised_since, account_id"
             ).fetchall()
         return [str(row["account_id"]) for row in rows]
 
@@ -2213,6 +2222,8 @@ class JobStore:
             already = bool(row and row["compromised_since"])
             db.execute(
                 "UPDATE account_proxy_routes SET compromised_since = COALESCE(compromised_since, ?), "
+                "last_recovery_attempt_at = CASE WHEN compromised_since IS NULL THEN NULL "
+                "ELSE last_recovery_attempt_at END, "
                 "compromised_evidence = ?, pending_port = NULL, last_error_code = ?, updated_at = ? "
                 "WHERE account_id = ?",
                 (now, redact_text(evidence)[:80], redact_text(evidence)[:80], now, account_id),
@@ -2230,7 +2241,7 @@ class JobStore:
         stamp = datetime.now(timezone.utc).isoformat()
         with self.connect() as db:
             db.execute(
-                "UPDATE account_proxy_routes SET updated_at = ? "
+                "UPDATE account_proxy_routes SET last_recovery_attempt_at = ? "
                 "WHERE account_id = ? AND compromised_since IS NOT NULL",
                 (stamp, account_id),
             )

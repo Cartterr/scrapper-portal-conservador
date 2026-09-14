@@ -1574,27 +1574,25 @@
       return seconds > 0 ? `Reintento habilitado en: ${fmtSeconds(seconds)}` : 'Plazo cumplido · esperando actualización del servicio';
     }
     function accountActivity(account, state, now = Date.now()) {
-      const age = value => {
-        const stamp = Date.parse(value);
-        return Number.isFinite(stamp) ? Math.max(0, (now - stamp) / 1000) : Infinity;
-      };
-      if (!account.worker_active || age(state.run?.heartbeat_at) > 120)
-        return { icon: '⚠️', title: 'Worker sin señal vigente', detail: 'No se puede confirmar actividad. No significa que la cuenta o el proxy estén dañados.', stale: true };
-      if (age(account.browser_checked_at) > 180)
-        return { icon: '🕰️', title: 'Estado del navegador desactualizado', detail: 'Sin comprobación reciente (más de 3 min o sin registro). Puede estar ocupado; no confirma un fallo.', stale: true };
-      const job = (state.jobs?.recent || []).find(j => j.status === 'running'
-        && (j.current_account_id || j.account_id) === account.account_id);
-      if (job)
-        return { icon: '⚙️', title: 'Procesando trabajo asignado', detail: 'Trabajo marcado en ejecución por el servicio; no implica que ya haya terminado.', working: true };
-      if (['validating', 'recovering', 'rotating'].includes(account.proxy_route_status))
-        return { icon: '🔄', title: 'Recuperación reportada por el servicio', detail: 'Ruta en validación o reemplazo; todavía no es un acceso confirmado.', working: true };
-      if (account.proxy_route_compromised || account.paused_reason === 'proxy_compromised')
-        return { icon: '⏳', title: 'Recuperación pendiente · sin ejecución confirmada', detail: 'Esperando turno o condiciones de recuperación. No espera la renovación del cupo.' };
-      if (account.portal_quota?.blocked)
-        return { icon: '⏸️', title: 'En espera de cupo del portal', detail: 'Esperar cupo no significa que el navegador esté desactualizado.' };
-      return { icon: account.browser_authenticated ? '✅' : '💤',
-        title: account.browser_authenticated ? 'Autenticada · sin trabajo activo visible' : 'Sin operación activa confirmada',
-        detail: 'Estado reciente. Estar en espera no significa estar atascada.' };
+      const operation = account.owner_activity;
+      const observed = Number(account.activity_observed_at) * 1000;
+      if (operation && Number.isFinite(observed) && now - observed <= 15000) {
+        if (operation.state === 'running') {
+          const names = {recover_route: 'Recuperando proxy / probando login', ensure: 'Comprobando acceso / iniciando sesión',
+            search_fna: 'Ejecutando búsqueda', download_image: 'Descargando documento',
+            capture_preview: 'Actualizando vista del navegador'};
+          const seconds = Math.max(0, Math.floor(now / 1000 - operation.state_changed_at));
+          return {icon:'⚙️', title:names[operation.operation] || 'Ejecutando operación del navegador',
+            detail:`EN EJECUCIÓN · ${operation.operation} · ${Math.floor(seconds/60)} min ${seconds%60} s desde el inicio registrado. Esto confirma una operación pendiente, no su progreso ni éxito.`, working:true};
+        }
+        if (operation.state === 'queued')
+          return {icon:'⏳', title:'En cola · todavía no está ejecutándose', detail:'Hay una orden pendiente para esta cuenta; espera al propietario del navegador.'};
+        if (operation.state === 'idle')
+          return {icon:'⏸️', title:'Sin operación del navegador en ejecución',
+            detail: account.proxy_route_compromised ? 'Recuperación pendiente. Ahora no hay una orden ejecutándose para esta cuenta.' : 'El servicio no tiene una orden del navegador activa para esta cuenta. Puede estar esperando trabajo o cupo.'};
+        return {icon:'📡', title:'Actividad no verificable', detail:'Sin lectura válida del propietario del navegador. No se puede afirmar que esté trabajando o detenida.', stale:true};
+      }
+      return {icon:'📡', title:'Actividad sin datos recientes', detail:'No hay información actual de operaciones. Un chequeo DOM antiguo no demuestra inactividad.', stale:true};
     }
     function renderAccounts(accounts) {
       let pendingEvidence = document.getElementById('pendingSearchEvidence');

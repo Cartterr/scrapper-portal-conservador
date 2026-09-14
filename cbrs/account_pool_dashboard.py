@@ -983,6 +983,27 @@ def _proxy_provider_summary(settings: Settings, config: PoolConfig) -> dict[str,
     return result
 
 
+def _owner_activity(path: Path, owner_alive: bool) -> dict[str, dict[str, Any]] | None:
+    """Read command metadata only; never open payloads, results or credentials."""
+    import sqlite3
+    if not owner_alive:
+        return None
+    try:
+        with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1) as db:
+            rows = db.execute(
+                "SELECT account, operation, state, created, updated FROM owner_commands "
+                "WHERE state IN ('running', 'queued') ORDER BY updated DESC"
+            ).fetchall()
+        activity = {}
+        for account, operation, state, created, updated in rows:
+            if account not in activity or (state == "running" and activity[account]["state"] != "running"):
+                activity[account] = dict(operation=operation, state=state,
+                    requested_at=created, state_changed_at=updated, observed_at=time.time())
+        return activity
+    except (OSError, sqlite3.Error, ValueError):
+        return None
+
+
 def _with_proxy_state(
     payload: dict[str, Any],
     job_store: "JobStore",
@@ -990,6 +1011,8 @@ def _with_proxy_state(
     config: PoolConfig,
 ) -> dict[str, Any]:
     configured = {account.account_id: account for account in config.accounts}
+    from .owner_protocol import command_path
+    operations = _owner_activity(command_path(settings), bool(job_store.active_lease("browser_owner")))
     worker_lease = job_store.active_lease()
     active_worker = job_store.active_lease("browser_owner") or worker_lease
     active_worker_owner = str(active_worker.get("owner") or "") if active_worker else ""
@@ -1083,6 +1106,11 @@ def _with_proxy_state(
         )
         browser_owner = str(check.get("browser_owner") or "")
         item["worker_active"] = bool(worker_lease)
+        item["activity_observed_at"] = time.time()
+        item["owner_activity"] = (
+            operations.get(account_id, {"state": "idle"}) if operations is not None
+            else {"state": "unknown"}
+        )
         item["browser_owner_active"] = bool(active_worker_owner)
         browser_live = bool(check.get("browser_live")) and bool(active_worker_owner)
         browser_live = browser_live and browser_owner == active_worker_owner

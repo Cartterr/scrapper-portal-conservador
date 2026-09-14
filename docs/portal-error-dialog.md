@@ -79,3 +79,16 @@ owner records the quarantine at the point of detection and returns
 verdict and drives recovery. `ensure` and `recover_route` both refuse to
 authenticate through a quarantined exit, and `recover_route` ditches the
 owner's own Chrome before proving a candidate.
+# Recovery fairness after repeated detections
+
+Recovery ordering uses `account_proxy_routes.last_recovery_attempt_at`, not
+`updated_at`. Repeated observations may update route metadata but cannot move
+an account behind its siblings. Eligible accounts with no attempt in the current
+quarantine episode are served first, then least-recently-attempted accounts.
+Existing per-route cooldowns and rotation limits still apply.
+
+The nullable column is added by the normal JobStore migration. A timestamp older
+than the current quarantine episode is treated as unattempted, allowing an
+already-running browser owner to retain the previous writer implementation.
+Activation needs worker-only maintenance, not a browser-owner restart.
+Regression coverage: `tests/test_recovery_fairness.py`.
