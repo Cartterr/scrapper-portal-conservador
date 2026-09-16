@@ -1,4 +1,4 @@
-name: Windows native verification
+name: Native Windows and Ubuntu verification
 
 on:
   pull_request:
@@ -9,6 +9,28 @@ permissions:
   contents: read
 
 jobs:
+  ubuntu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install and verify on delivery platform
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install --no-deps -e .
+          python -m pip check
+          python -m compileall -q cbrs
+          python -m pytest -q
+
+      - name: Smoke test native Google Chrome with a temporary local profile
+        env:
+          CBRS_RUN_CHROME_SMOKE: "1"
+        run: python -m pytest tests/test_chrome_launch_smoke.py -q
+
   test:
     runs-on: windows-latest
     timeout-minutes: 30

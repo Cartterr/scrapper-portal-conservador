@@ -42,6 +42,18 @@ def configure_logging(verbose: bool) -> None:
     root.setLevel(logging.DEBUG if verbose else logging.INFO)
 
 
+def configure_worker_file_logging(settings) -> None:
+    from logging.handlers import RotatingFileHandler
+    settings.log_dir.mkdir(parents=True, exist_ok=True)
+    target = (settings.log_dir / "worker.log").resolve()
+    root = logging.getLogger()
+    if any(getattr(handler, "baseFilename", None) == str(target) for handler in root.handlers):
+        return
+    handler = RotatingFileHandler(target, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    handler.setFormatter(RedactingFormatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+    root.addHandler(handler)
+
+
 def format_result(i: int, result: dict) -> str:
     parts = [f"  [{i}] {result.get('nombreSociedad', 'N/A')}"]
     parts.append(
@@ -1058,6 +1070,7 @@ def cmd_jobs(args: argparse.Namespace) -> int:
             dashboard.stop()
             print("\nDashboard stopped.")
         return 0
+    configure_worker_file_logging(config.SETTINGS)
     result = run_job_worker(
         settings=config.SETTINGS,
         config=pool_config,

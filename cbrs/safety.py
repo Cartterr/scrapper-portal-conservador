@@ -175,6 +175,8 @@ def classify_response(
 
     if isinstance(data, Mapping):
         code = str(data.get("code", "")).lower()
+        if code == "captcha-rechazado":
+            return StopReason.CAPTCHA_REJECTED
         if code == "err-limite":
             return StopReason.DAILY_LIMIT
         if code == "intente-mas-tarde":

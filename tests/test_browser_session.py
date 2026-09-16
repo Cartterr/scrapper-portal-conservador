@@ -91,6 +91,11 @@ def test_browser_session_launches_chrome_persistent_context(tmp_path: Path, monk
     assert captured["kwargs"]["accept_downloads"] is True
     assert captured["kwargs"]["bypass_csp"] is False
     assert captured["kwargs"]["chromium_sandbox"] is True
+    ignored = captured["kwargs"]["ignore_default_args"]
+    assert "--disable-background-networking" in ignored
+    assert "--disable-component-update" in ignored
+    assert "--enable-automation" not in ignored
+    assert "--remote-debugging-pipe" not in ignored
     assert captured["closed"] is True
     assert captured["stopped"] is True
 

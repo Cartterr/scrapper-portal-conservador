@@ -118,7 +118,11 @@ def run_preflight(
             settings,
             egress_hash=egress_hash,
             egress_country=egress_country,
-            approve=approve_baseline,
+            # A configured mobile proxy establishes its first observed baseline
+            # after country validation. Existing baselines still must match.
+            approve=approve_baseline or (
+                settings.egress_mode == "mobile_sticky" and bool(settings.proxy_url)
+            ),
         )
         if baseline_status == "mismatch":
             if allow_baseline_replacement:
@@ -127,8 +131,10 @@ def run_preflight(
                 errors.append("fixed egress hash differs from saved baseline")
         elif baseline_status == "approval_required":
             errors.append(
-                "fixed egress baseline approval required; rerun preflight with "
-                "--approve-egress-baseline only from the intended client-owned Chile egress"
+                "fixed egress baseline approval required; for pool accounts run "
+                "cbrs pool proxy-health --approve-egress-baseline; for a standalone "
+                "profile run cbrs preflight --approve-egress-baseline, "
+                "only from the intended client-owned Chile egress"
             )
 
     checks.append(

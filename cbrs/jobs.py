@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -32,6 +33,7 @@ from .account_pool import (
 )
 from .browser_session import CommerceAuthState, CredentialsRejectedError
 from .browser_runtime import validate_service_browser
+from .worker_lock import exclusive_worker
 from .browser_preview import capture_browser_preview, remove_browser_preview
 def capture_error(*args, **kwargs):
     from .runtime_updates import runtime_module
@@ -45,6 +47,8 @@ def create_pdf(*args, **kwargs):
     from .runtime_updates import runtime_module
     return runtime_module("pdf").create_pdf(*args, **kwargs)
 from .safety import SafetyStopException, StopReason, redact, redact_text
+
+logger = logging.getLogger(__name__)
 
 JOB_STATES = frozenset(
     {
@@ -3041,6 +3045,12 @@ class JobStore:
                 utc_now(),
             ),
         )
+        # Emit operational codes, never arbitrary payloads or response bodies.
+        safe_reason = str(data.get("reason") or "")
+        if not re.fullmatch(r"[a-z0-9_.:-]{0,100}", safe_reason):
+            safe_reason = "details_in_local_event_store"
+        logger.log(getattr(logging, level.upper(), logging.INFO),
+                   "event=%s account=%s reason=%s", event, account_id or "-", safe_reason or "-")
 
     @staticmethod
     def _account_usage_db(db: sqlite3.Connection, account_id: str, quota_date: str) -> int:
@@ -3216,6 +3226,7 @@ def download_job_item(
         # process restarts and later document-only retries. Never expose refs.
 
 
+@exclusive_worker
 def run_job_worker(
     *,
     settings: Settings = SETTINGS,
@@ -3386,6 +3397,14 @@ def run_job_worker(
                         final_status = "cooldown"
                         break
                     continue
+            else:
+                # Accounts that never opened a browser must recover while the
+                # queue is idle, after their own cooldown expires.
+                _run_startup_gates(
+                    settings, config, store, pool_store, run_id,
+                    preflight_runner, proxy_health_runner, browser_pool,
+                    retry_only=True,
+                )
             _process_requested_dataimpulse_rotation(
                 settings=settings,
                 config=config,
@@ -3564,10 +3583,21 @@ def _run_startup_gates(
     preflight_runner: Callable[..., Any],
     proxy_health_runner: Callable[..., Any],
     browser_pool: _PersistentAccountBrowsers,
+    *,
+    retry_only: bool = False,
 ) -> None:
+    states = {row["account_id"]: row for row in pool_store.accounts(run_id)}
     for account in config.accounts:
         if not account.enabled:
             continue
+        if retry_only:
+            check = store.account_check(account.account_id) or {}
+            state = states.get(account.account_id, {})
+            if (check.get("proxy_status") != "failed"
+                    or state.get("status") != "available"
+                    or account.account_id in browser_pool._entries
+                    or browser_pool.has_protected_session(account.account_id)):
+                continue
         try:
             runtime_settings = _runtime_account_settings(settings, account, store)
         except ValueError as exc:
@@ -4609,6 +4639,22 @@ def _handle_account_safety_stop(
             reason=exc.reason.value,
             cooldown_seconds=SAFETY_COOLDOWN_SECONDS[exc.reason],
         )
+        if (exc.context == "auth login" and job_id is None
+                and _is_dataimpulse_account(account)
+                and _replacement_account_scoped(settings, account.account_id)
+                and browser_pool.can_replace_rejected_login(account.account_id)
+                and not browser_pool.has_protected_session(account.account_id)):
+            # Require an explicit response and visible rejected form. Existing
+            # candidate budgets and browser preservation still apply.
+            if _rotate_dataimpulse_route(
+                account, settings, store, pool_store, run_id, browser_pool,
+                preflight_runner, proxy_health_runner, reason="login_captcha_rejected",
+            ):
+                return "retry_account"
+            _align_login_pause_with_route(
+                account, settings, store, pool_store, run_id,
+                reason=exc.reason.value,
+            )
     else:
         pool_store.pause_account(
             run_id,

@@ -180,7 +180,13 @@ def test_readiness_reports_explicit_shared_egress_route(tmp_path: Path) -> None:
     assert "1 explicit egress route" in account_check["detail"]
 
 
-def test_readiness_marks_missing_wsl_distribution_as_deferred(tmp_path: Path) -> None:
+def test_readiness_marks_missing_wsl_distribution_as_deferred(tmp_path: Path, monkeypatch) -> None:
+    # This fixture models Windows with WSL installed but no distribution; it
+    # must not depend on the test host having a Windows executable (Ubuntu CI).
+    import cbrs.readiness as readiness
+    original_which = readiness.shutil.which
+    monkeypatch.setattr(readiness.shutil, "which", lambda name:
+                        "wsl.exe" if name in {"wsl.exe", "wsl"} else original_which(name))
     _write_source_assets(tmp_path)
     pool_path = tmp_path / "account-pool.json"
     _write_pool(pool_path)

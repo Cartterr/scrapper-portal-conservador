@@ -173,6 +173,10 @@ class BrowserOwner:
                 error = {"reason": exc.reason.value, "status": exc.status,
                          "route_compromised": is_portal_error_dialog(exc),
                          "context": exc.context if exc.context in {"auth login", "auth navigation", "form search"} else "browser owner"} if isinstance(exc, SafetyStopException) else {"reason": "credentials_invalid" if isinstance(exc, CredentialsRejectedError) else "owner_operation_failed"}
+                if isinstance(exc, (SafetyStopException, CredentialsRejectedError)):
+                    from .safety import sanitized_portal_response_code
+                    error["status"] = exc.status
+                    error["response_code"] = sanitized_portal_response_code({"code": exc.response_code})
                 self.commands.finish(command["id"], error=error,
                     uncertain=command["operation"].startswith("search_") and not isinstance(exc, SafetyStopException))
             finally:

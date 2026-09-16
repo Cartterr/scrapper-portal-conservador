@@ -56,6 +56,27 @@ def test_owner_crash_never_replays_running_commands(tmp_path):
         q.submit("w", "a", "close_browser", {})
 
 
+@pytest.mark.parametrize("reason,code,status", [
+    ("captcha_rejected", "captcha-rechazado", 400),
+    ("credentials_invalid", "auth-exception", 401),
+])
+def test_remote_login_failure_keeps_classification_and_sanitized_code(tmp_path, monkeypatch, reason, code, status):
+    from cbrs.browser_session import CredentialsRejectedError
+    from cbrs.safety import SafetyStopException
+    settings, config, store, _ = runtime(tmp_path, monkeypatch)
+    store.acquire_lease(OWNER_LEASE, "test-owner")
+    remote = RemoteScraper(settings=settings, worker_id="worker-one", store_path=store.path,
+                           commands_path=command_path(settings))
+    monkeypatch.setattr(remote.commands, "submit", lambda *a, **k: "fixture")
+    monkeypatch.setattr(remote.commands, "read", lambda _: {
+        "state": "failed", "error": json.dumps({"reason": reason, "status": status,
+                                                 "context": "auth login", "response_code": code})})
+    with pytest.raises((SafetyStopException, CredentialsRejectedError)) as exc:
+        remote.ensure_authenticated()
+    assert exc.value.status == status
+    assert exc.value.response_code == code
+
+
 def test_worker_cannot_demote_or_close_owner_session(tmp_path, monkeypatch):
     settings, config, store, pool_store = runtime(tmp_path, monkeypatch)
     store.acquire_lease(OWNER_LEASE, "owner")

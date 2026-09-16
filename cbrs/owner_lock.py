@@ -4,8 +4,9 @@ from pathlib import Path
 
 
 class OwnerLock:
-    def __init__(self, path):
+    def __init__(self, path, *, label="browser owner"):
         self.path = Path(path)
+        self.label = label
         self.file = None
 
     def __enter__(self):
@@ -26,7 +27,7 @@ class OwnerLock:
         except OSError:
             self.file.close()
             self.file = None
-            raise RuntimeError('Another browser owner process still holds its lock') from None
+            raise RuntimeError(f'Another {self.label} process still holds its lock') from None
         return self
 
     def __exit__(self, *args):

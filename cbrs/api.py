@@ -137,14 +137,21 @@ class _LocalBackend:
 
     def check(self) -> None:
         if self.store is None or not self.store.active_lease():
-            raise ServiceUnavailable("Servicio no disponible. Ejecute: cbrs service start worker")
+            raise ServiceUnavailable(
+                "Servicio no disponible. Con systemd: cbrs service start worker. "
+                "Sin systemd: cbrs jobs worker (en otra terminal)."
+            )
 
     def status(self) -> dict[str, Any]:
         if self.store is None:
             return {"service": False, "accounts": [], "jobs": {"counts": {}}}
-        from .account_pool import load_account_pool_config
+        from .account_pool import AccountPoolStore, load_account_pool_config
         from .form_search import account_window, quota_hold
         pool = load_account_pool_config(self.settings)
+        pool_store = AccountPoolStore(self.store.path)
+        run = pool_store.latest_run(dry_run=False)
+        states = ({row["account_id"]: row for row in pool_store.accounts(run["run_id"])}
+                  if run else {})
         accounts = []
         for account in pool.accounts:
             if not account.enabled:
@@ -154,14 +161,24 @@ class _LocalBackend:
             check = self.store.account_check(account.account_id) or {}
             remaining = max(0, pool.quota_for(account) - window["used"] - window["reserved"])
             blocked = bool(hold and hold["blocked"])
+            state = states.get(account.account_id, {})
+            reason = state.get("paused_reason") or check.get("browser_last_auth_error")
+            unavailable = state.get("status") in {"paused", "captcha_pending", "captcha_solving"}
+            status = ("held" if blocked else
+                      "disabled" if unavailable and reason == "credentials_invalid" else
+                      state["status"] if unavailable else
+                      "egress_preflight_failed" if check.get("proxy_status") == "failed" else
+                      "estimated_quota_reached" if not remaining and pool.enforce_estimated_quota else
+                      "available" if check.get("browser_authenticated") else "login_pending")
             accounts.append({
                 "account": account.account_id, "remaining_estimated": remaining,
-                "status": "held" if blocked else ("estimated_quota_reached" if not remaining and pool.enforce_estimated_quota else
-                            ("available" if check.get("browser_authenticated") else "login_pending")),
+                "status": status,
                 "estimate_enforced": pool.enforce_estimated_quota,
-                "portal_quota": blocked, "resume_at": hold.get("next_check_at") if hold else None,
+                "portal_quota": blocked,
+                "resume_at": hold.get("next_check_at") if blocked else state.get("resume_at"),
                 "proxy": (self.store.dataimpulse_route(account.account_id) or {}).get("active_port", account.dataimpulse_port),
-                "error": check.get("browser_last_auth_error"),
+                "error": reason or ("egress_preflight_failed" if check.get("proxy_status") == "failed" else None),
+                "http_status": check.get("browser_last_auth_http_status"),
             })
         return {"service": bool(self.store.active_lease()), "accounts": accounts, "jobs": self.store.summary()}
 

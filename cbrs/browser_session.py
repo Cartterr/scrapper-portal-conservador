@@ -44,6 +44,16 @@ OFFSCREEN_CHROME_ARGS = [
     "--window-size=1366,900",
     "--window-position=-32000,-32000",
 ]
+# Restore normal Chrome background services and OS credential storage. Keep
+# Playwright's automation/transport flags: this is compatibility, not stealth,
+# and does not guarantee any portal-side CAPTCHA score.
+CHROME_IGNORED_DEFAULT_ARGS = [
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--metrics-recording-only",
+    "--password-store=basic",
+    "--use-mock-keychain",
+]
 _PLAYWRIGHT_RUNTIME = threading.local()
 
 
@@ -168,6 +178,7 @@ class BrowserSession:
                     chromium_sandbox=True,
                     proxy=proxy,
                     args=_chrome_launch_args(self.settings, headless=self.headless),
+                    ignore_default_args=CHROME_IGNORED_DEFAULT_ARGS,
                 )
             except Exception:
                 # A failed persistent-context launch otherwise leaves the sync
@@ -424,7 +435,23 @@ class BrowserSession:
             if self.has_active_login():
                 return "browser_form"
             form_error = RuntimeError("CBRS login completed without an active session.")
-        except (CredentialsRejectedError, SafetyStopException):
+        except SafetyStopException as exc:
+            if (exc.reason == StopReason.CAPTCHA_REJECTED
+                    and (self.settings.captcha_solver_mode in {"2captcha", "capsolver"}
+                         or self.has_external_recaptcha_fallback)):
+                # The form already received an explicit rejection. Use the
+                # configured, budgeted solver once on this same browser/route.
+                # No second native token and no retry of an accepted request.
+                self._login_with_fetch(username, password, external_only=True)
+                if self.has_active_login():
+                    return "browser_fetch"
+                raise SafetyStopException(
+                    StopReason.AUTH_REQUIRED,
+                    "Login response did not establish a protected session.",
+                    context="auth",
+                )
+            raise
+        except CredentialsRejectedError:
             raise
         except Exception as exc:
             form_error = exc
@@ -888,7 +915,7 @@ class BrowserSession:
             ),
         )
 
-    def _login_with_fetch(self, username: str, password: str) -> None:
+    def _login_with_fetch(self, username: str, password: str, *, external_only: bool = False) -> None:
         self.goto_index()
         home = self.fetch_json(
             "/api/v1/home/start",
@@ -897,7 +924,8 @@ class BrowserSession:
         )
         if home.status != 200:
             raise RuntimeError(f"CBRS home bootstrap returned HTTP {home.status}.")
-        solution = self.generate_recaptcha_solution("login")
+        solution = (self.generate_external_recaptcha_solution("login") if external_only
+                    else self.generate_recaptcha_solution("login"))
         response = self._fetch_login(username, password, solution.token)
         try:
             self._check_login_response(response)

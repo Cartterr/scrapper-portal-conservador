@@ -7,6 +7,7 @@ en 24.04 utiliza Python 3.12. El servicio conserva cuentas, cola y documentos
 en el repositorio. No requiere claves de resolución de CAPTCHA.
 
 Estado de validación: consulte [el reporte de aceptación](docs/acceptance-status.md).
+Correcciones del informe del 16 de septiembre: [alcance y pruebas pendientes](docs/handoff-fixes-2026-09-16.md).
 Las pruebas locales no certifican todavía una instalación limpia ni la descarga
 real y recuperación completa en el portal.
 
@@ -54,6 +55,17 @@ real y recuperación completa en el portal.
    Una instalación nueva con cuentas descubiertas no bloquea al llegar a la
    estimación de 8: espera la señal real del portal. Un JSON anterior con
    presupuesto explícito conserva su límite; no se migra automáticamente.
+
+   En `mobile_sticky`, la primera línea base se crea automáticamente por cuenta
+   después de validar país y proxy configurado. Una línea base existente no se
+   sobrescribe por esta inicialización. Para otros modos que exigen aprobación,
+   use `cbrs pool proxy-health --approve-egress-baseline`; `cbrs preflight` valida
+   el perfil individual, no todos los perfiles del pool.
+
+   `cbrs status` muestra el motivo y la reanudación de cuentas pausadas, además
+   de `captcha_pending`. `disabled` con `credentials_invalid` significa que el
+   worker excluyó la cuenta por rechazo de autenticación y necesita revisión;
+   un HTTP 401 por sí solo no demuestra que el portal haya dado de baja la cuenta.
 
 4. Descargar una inscripción y repetirla para comprobar la caché:
 
@@ -147,11 +159,33 @@ real y recuperación completa en el portal.
    todavía no está certificado. Los comandos de reinicio del propietario no
    forman parte del mantenimiento habitual.
 
+## Ejecución sin systemd
+
+Con Python 3.11+ y Chrome ya instalados: cree `.venv`, instale
+`pip install -r requirements-dev.txt` y `pip install --no-deps -e .`, complete
+`.env` y ejecute `.venv/bin/cbrs config validate`. En una terminal separada use
+`.venv/bin/cbrs jobs worker`; el cliente puede ejecutarse desde otra terminal.
+Este modo conserva la propiedad de Chrome dentro del worker y no tiene las
+garantías de separación del servicio con propietario independiente. No use
+`pkill chrome` para resolver errores ni sobre sesiones productivas.
+
+Los eventos del worker aparecen en stderr y en `.cbrs/runtime/logs/worker.log`
+(rotación de 5 MB, tres copias). El log emite nombres de eventos, cuenta y
+códigos de motivo; los detalles permanecen en SQLite. En systemd también puede
+usar los comandos de logs anteriores.
+
+Los valores actuales por defecto son 10 candidatos por recuperación y 30
+rotaciones por hora. Si un `.env` anterior fija 1 y 3, esos valores siguen
+teniendo prioridad: revise `CBRS_DATAIMPULSE_CANDIDATES_PER_RECOVERY` y
+`CBRS_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR`. No se eliminan los presupuestos.
+La recuperación de login con candidatos sigue limitada a los IDs explícitos
+de `CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS` y a evidencia visible de rechazo.
+
 ## Cinco errores frecuentes
 
 | Síntoma | Acción |
 |---|---|
-| Servicio no disponible | `cbrs service start worker`, luego `cbrs service logs` si no arranca. |
+| Servicio no disponible | Con systemd: `cbrs service start worker`, luego `cbrs service logs`; sin systemd: `cbrs jobs worker` en otra terminal. |
 | Campos faltantes | `cbrs config validate`; completar sólo las claves indicadas en `.env`. |
 | CSV inválido | Corregir encabezado, codificación o la línea indicada; las filas inválidas constan en el reporte. |
 | `pending_quota` | Consultar `resume_at`; el servicio revisará la cuota sin reenviar el lote. La hora es una estimación. |

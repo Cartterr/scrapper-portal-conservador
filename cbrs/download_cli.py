@@ -46,7 +46,8 @@ def run(args) -> int:
             if args.json:
                 print(json.dumps(data, ensure_ascii=False, default=str))
             else:
-                print("Servicio: " + ("arriba" if data["service"] else "abajo; ejecute cbrs service start worker"))
+                print("Servicio: " + ("arriba" if data["service"] else
+                      "abajo; con systemd: cbrs service start worker; sin systemd: cbrs jobs worker"))
                 for account in data["accounts"]:
                     print(f"{account['account']}: {account['status']} | cupos estimados {account['remaining_estimated']} | "
                           f"proxy {account['proxy']} | reanudación {account['resume_at'] or '-'} | error {account['error'] or '-'}")
