@@ -1,5 +1,9 @@
 # Informe de pruebas locales — 2026-09-15 / 2026-09-16
 
+> Continuación con los resultados del 17 de septiembre, incluidas las
+> correcciones del contratista y las de esta rama:
+> [INFORME-PRUEBAS-2026-09-17.md](INFORME-PRUEBAS-2026-09-17.md).
+
 Base probada: `origin/master` en `8692cbf` (rama local `handoff-review-fixes`,
 mismo código más dos documentos de handoff). Máquina: Ubuntu nativo, sin
 systemd, sin sudo. Criterios de referencia: `CRITERIOS-DE-ACEPTACION.md`.
