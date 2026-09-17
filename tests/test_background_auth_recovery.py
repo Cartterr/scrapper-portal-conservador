@@ -782,3 +782,50 @@ def test_background_credential_rejection_is_recorded_durably(tmp_path, monkeypat
     assert row and row["http_status"] == 401 and row["response_code"] == "auth-exception"
     assert store.credential_rejection("a2", credential_hash=jobs.credential_hash("a2", "other")) is None
 
+
+def test_discard_closed_contexts_drops_only_dead_pages(tmp_path, monkeypatch):
+    settings, config, store, pool_store, pool = setup_runtime(tmp_path, monkeypatch)
+    with pool.session("a1", settings, "a1", "test-only"):
+        pass
+    dead = SimpleNamespace(page=SimpleNamespace(is_closed=lambda: True))
+    dead.browser = dead
+    pool._entries["a2"] = jobs._ManagedAccountScraper(manager=SimpleNamespace(), scraper=dead)
+    assert pool.discard_closed_contexts() == ["a2"]
+    assert "a1" in pool._entries and "a2" not in pool._entries
+    check = store.account_check("a2") or {}
+    assert not check.get("browser_live") and check.get("browser_status") == "browser_context_closed"
+    assert any(e["event"] == "browser_context_closed_discarded" for e in store.recent_events(limit=20))
+
+
+def test_continuous_worker_recovers_loop_after_transient_error(tmp_path, monkeypatch):
+    settings, config, store, pool_store, pool = setup_runtime(tmp_path, monkeypatch)
+    calls = []
+    original = store.claim_next
+
+    def flaky(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("transient scheduler failure")
+        return original(*args, **kwargs)
+
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= 2:
+            pool_store.request_stop()
+
+    monkeypatch.setattr(store, "claim_next", flaky)
+    store.release_lease(jobs.WORKER_LEASE_NAME, "test-worker")
+    pool_store.update_run("test-run", status="stopped", finished=True)
+    result = jobs.run_job_worker(
+        settings=settings, config=config, store=store, pool_store=pool_store,
+        scraper_factory=pool.scraper_factory,
+        preflight_runner=lambda *a, **k: None, proxy_health_runner=lambda *a, **k: None,
+        sleep_fn=sleep,
+    )
+    assert len(calls) >= 2, "the loop must resume claiming jobs after the error"
+    events = [e["event"] for e in store.recent_events(limit=60)]
+    assert "worker_loop_failed" in events and "worker_loop_recovering" in events
+    assert result.status == "stopped"
+

@@ -542,6 +542,53 @@ class _PersistentAccountBrowsers:
         finally:
             self.capture_previews(force=True)
 
+    def discard_closed_contexts(self) -> list[str]:
+        """Forget entries whose Chrome page/context is already gone.
+
+        This never closes a living browser: only a page that reports itself
+        closed (or whose context can no longer be queried) is dropped, so the
+        normal reconcile loop can open a fresh session for that account.
+        """
+        closed: list[str] = []
+        for account_id, entry in tuple(self._entries.items()):
+            browser = getattr(entry.scraper, "browser", entry.scraper)
+            page = getattr(browser, "page", None)
+            dead = False
+            try:
+                if page is None:
+                    dead = True
+                elif callable(getattr(page, "is_closed", None)) and page.is_closed():
+                    dead = True
+                else:
+                    context = getattr(page, "context", None)
+                    if context is not None and callable(getattr(context, "pages", None)):
+                        context.pages()
+            except Exception:
+                dead = True
+            if not dead:
+                continue
+            self._entries.pop(account_id, None)
+            try:
+                if hasattr(entry.manager, "__exit__"):
+                    entry.manager.__exit__(None, None, None)
+                elif hasattr(entry.scraper, "close"):
+                    entry.scraper.close()
+            except Exception:
+                pass
+            try:
+                self.store.set_account_browser_state(
+                    account_id, live=False, authenticated=False, headless=self.headless,
+                    owner=self.worker_id, status="browser_context_closed",
+                )
+            except Exception:
+                pass
+            self.store.add_event(
+                "browser_context_closed_discarded", account_id=account_id, level="warning",
+                data={"policy": "dead_context_only"},
+            )
+            closed.append(account_id)
+        return closed
+
     def has_protected_session(self, account_id: str) -> bool:
         entries = [entry for key, entry in self._retained_entries if key == account_id]
         current = self._entries.get(account_id)
@@ -3388,140 +3435,174 @@ def run_job_worker(
             daemon=True,
         )
         heartbeat_thread.start()
-        while max_jobs is None or processed < max_jobs:
-            # Same owner/thread and browser objects; switch only before the next
-            # complete operation, never inside a search or PDF job.
-            updates.poll()
-            pool_store.reset_quota_day(run_id, local_today())
-            pool_store.reactivate_expired_cooldowns(run_id)
-            browser_pool.reconcile()
-            browser_pool.capture_previews()
-            if (
-                time.monotonic() - last_recovery_at >= COMPROMISED_RECOVERY_INTERVAL_SECONDS
-                and store.compromised_routes()
-            ):
-                last_recovery_at = time.monotonic()
-                _recover_compromised_routes(
-                    settings=settings,
-                    config=config,
-                    store=store,
-                    pool_store=pool_store,
-                    run_id=run_id,
-                    browser_pool=browser_pool,
-                    preflight_runner=preflight_runner,
-                    proxy_health_runner=proxy_health_runner,
-                )
-            # A replacement worker can acquire the global lease moments before
-            # the previous job lease expires. Recheck on every scheduler pass
-            # so that job is requeued once it becomes stale without requiring
-            # another process restart.
-            store.recover_abandoned_jobs()
-            if pool_store.stop_requested():
-                final_status = "stopped"
-                break
-            cooldown = store.global_cooldown()
-            if cooldown:
-                final_status = "cooldown"
-                pool_store.update_run(
-                    run_id,
-                    status="waiting",
-                    next_cycle_at=cooldown["resume_at"],
-                    blocked_reason=cooldown["reason"],
-                )
-                if once:
-                    break
-                sleep_fn(max(0.1, runtime_poll_seconds))
-                continue
-            if startup_gates_pending:
-                # A replacement worker must not touch account browsers while a
-                # global outage circuit is active. Run the live startup gates
-                # only after the circuit expires, then exactly once.
-                _run_startup_gates(
-                    settings,
-                    config,
-                    store,
-                    pool_store,
-                    run_id,
-                    preflight_runner,
-                    proxy_health_runner,
-                    browser_pool,
-                )
-                startup_gates_pending = False
-                if store.global_cooldown():
-                    if once:
-                        final_status = "cooldown"
+        recover_backoff = max(5.0, float(settings.env_value("CBRS_WORKER_RECOVER_SECONDS", "30") or 30))
+        while True:
+            try:
+                while max_jobs is None or processed < max_jobs:
+                    # Same owner/thread and browser objects; switch only before the next
+                    # complete operation, never inside a search or PDF job.
+                    updates.poll()
+                    pool_store.reset_quota_day(run_id, local_today())
+                    pool_store.reactivate_expired_cooldowns(run_id)
+                    browser_pool.reconcile()
+                    browser_pool.capture_previews()
+                    if (
+                        time.monotonic() - last_recovery_at >= COMPROMISED_RECOVERY_INTERVAL_SECONDS
+                        and store.compromised_routes()
+                    ):
+                        last_recovery_at = time.monotonic()
+                        _recover_compromised_routes(
+                            settings=settings,
+                            config=config,
+                            store=store,
+                            pool_store=pool_store,
+                            run_id=run_id,
+                            browser_pool=browser_pool,
+                            preflight_runner=preflight_runner,
+                            proxy_health_runner=proxy_health_runner,
+                        )
+                    # A replacement worker can acquire the global lease moments before
+                    # the previous job lease expires. Recheck on every scheduler pass
+                    # so that job is requeued once it becomes stale without requiring
+                    # another process restart.
+                    store.recover_abandoned_jobs()
+                    if pool_store.stop_requested():
+                        final_status = "stopped"
                         break
-                    continue
-            else:
-                # Accounts that never opened a browser must recover while the
-                # queue is idle, after their own cooldown expires.
-                _run_startup_gates(
-                    settings, config, store, pool_store, run_id,
-                    preflight_runner, proxy_health_runner, browser_pool,
-                    retry_only=True,
-                )
-            _process_requested_dataimpulse_rotation(
-                settings=settings,
-                config=config,
-                store=store,
-                pool_store=pool_store,
-                run_id=run_id,
-                browser_pool=browser_pool,
-                worker_id=worker_id,
-                preflight_runner=preflight_runner,
-                proxy_health_runner=proxy_health_runner,
-            )
-            endurance.maybe_enqueue()
-            job = store.claim_next(worker_id)
-            if job is None:
-                if once:
-                    final_status = "idle"
-                    break
-                pool_store.update_run(run_id, status="waiting", next_cycle_at="")
-                sleep_fn(max(0.1, runtime_poll_seconds))
-                continue
-            processed += 1
-            pool_store.update_run(run_id, status="running", next_cycle_at="")
-            outcome = _process_claimed_job(
-                job,
-                settings=settings,
-                config=config,
-                store=store,
-                pool_store=pool_store,
-                run_id=run_id,
-                browser_pool=browser_pool,
-                preflight_runner=preflight_runner,
-                proxy_health_runner=proxy_health_runner,
-                endurance_plan=endurance_plan,
-            )
-            if outcome == "cooldown":
-                final_status = outcome
-                if once:
-                    break
-                sleep_fn(max(0.1, runtime_poll_seconds))
-                continue
-            if job.source == "captcha_validation" and (once or max_jobs is not None):
-                final_status = outcome
-                break
-            if once:
-                final_status = outcome
-                break
-            if outcome in {"waiting_capacity", "waiting_captcha"}:
-                sleep_fn(max(0.1, runtime_poll_seconds))
-            elif (
-                config.human_like_behavior_enabled
-                and config.job_interval_max_seconds > 0
-            ):
-                sleep_fn(
-                    random.uniform(
-                        config.job_interval_min_seconds,
-                        config.job_interval_max_seconds,
+                    cooldown = store.global_cooldown()
+                    if cooldown:
+                        final_status = "cooldown"
+                        pool_store.update_run(
+                            run_id,
+                            status="waiting",
+                            next_cycle_at=cooldown["resume_at"],
+                            blocked_reason=cooldown["reason"],
+                        )
+                        if once:
+                            break
+                        sleep_fn(max(0.1, runtime_poll_seconds))
+                        continue
+                    if startup_gates_pending:
+                        # A replacement worker must not touch account browsers while a
+                        # global outage circuit is active. Run the live startup gates
+                        # only after the circuit expires, then exactly once.
+                        _run_startup_gates(
+                            settings,
+                            config,
+                            store,
+                            pool_store,
+                            run_id,
+                            preflight_runner,
+                            proxy_health_runner,
+                            browser_pool,
+                        )
+                        startup_gates_pending = False
+                        if store.global_cooldown():
+                            if once:
+                                final_status = "cooldown"
+                                break
+                            continue
+                    else:
+                        # Accounts that never opened a browser must recover while the
+                        # queue is idle, after their own cooldown expires.
+                        _run_startup_gates(
+                            settings, config, store, pool_store, run_id,
+                            preflight_runner, proxy_health_runner, browser_pool,
+                            retry_only=True,
+                        )
+                    _process_requested_dataimpulse_rotation(
+                        settings=settings,
+                        config=config,
+                        store=store,
+                        pool_store=pool_store,
+                        run_id=run_id,
+                        browser_pool=browser_pool,
+                        worker_id=worker_id,
+                        preflight_runner=preflight_runner,
+                        proxy_health_runner=proxy_health_runner,
                     )
-                )
-            elif config.interval_minutes > 0:
-                sleep_fn(config.interval_minutes * 60)
-        else:
-            final_status = "completed"
+                    endurance.maybe_enqueue()
+                    job = store.claim_next(worker_id)
+                    if job is None:
+                        if once:
+                            final_status = "idle"
+                            break
+                        pool_store.update_run(run_id, status="waiting", next_cycle_at="")
+                        sleep_fn(max(0.1, runtime_poll_seconds))
+                        continue
+                    processed += 1
+                    pool_store.update_run(run_id, status="running", next_cycle_at="")
+                    outcome = _process_claimed_job(
+                        job,
+                        settings=settings,
+                        config=config,
+                        store=store,
+                        pool_store=pool_store,
+                        run_id=run_id,
+                        browser_pool=browser_pool,
+                        preflight_runner=preflight_runner,
+                        proxy_health_runner=proxy_health_runner,
+                        endurance_plan=endurance_plan,
+                    )
+                    if outcome == "cooldown":
+                        final_status = outcome
+                        if once:
+                            break
+                        sleep_fn(max(0.1, runtime_poll_seconds))
+                        continue
+                    if job.source == "captcha_validation" and (once or max_jobs is not None):
+                        final_status = outcome
+                        break
+                    if once:
+                        final_status = outcome
+                        break
+                    if outcome in {"waiting_capacity", "waiting_captcha"}:
+                        sleep_fn(max(0.1, runtime_poll_seconds))
+                    elif (
+                        config.human_like_behavior_enabled
+                        and config.job_interval_max_seconds > 0
+                    ):
+                        sleep_fn(
+                            random.uniform(
+                                config.job_interval_min_seconds,
+                                config.job_interval_max_seconds,
+                            )
+                        )
+                    elif config.interval_minutes > 0:
+                        sleep_fn(config.interval_minutes * 60)
+                else:
+                    final_status = "completed"
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                if once or max_jobs is not None:
+                    raise
+                # R4: the service keeps itself alive. Drop only contexts that are
+                # already dead, keep every live session, and re-enter the loop
+                # after a bounded backoff instead of parking until a manual stop.
+                try:
+                    store.add_event("worker_loop_failed", level="error",
+                                    data={"error": redact_text(str(exc))})
+                except Exception:
+                    pass
+                if pool_store.stop_requested():
+                    final_status = "stopped"
+                    break
+                try:
+                    closed = browser_pool.discard_closed_contexts()
+                except Exception:
+                    closed = []
+                try:
+                    pool_store.update_run(run_id, status="waiting",
+                                         blocked_reason="worker_failed_recovering")
+                    store.add_event("worker_loop_recovering", level="warning",
+                                    data={"closed_contexts": closed,
+                                          "retry_seconds": recover_backoff})
+                except Exception:
+                    pass
+                sleep_fn(recover_backoff)
+                continue
+            break
     except KeyboardInterrupt:
         final_status = "stopped"
     except Exception as exc:
