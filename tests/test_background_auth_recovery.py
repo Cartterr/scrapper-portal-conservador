@@ -745,3 +745,40 @@ def test_fast_retry_never_reloads_a_previously_authenticated_unknown_context(tmp
     pool.reconcile()
     assert pending.scraper.calls == 0
     assert pool._entries["a2"] is pending
+
+
+def test_durably_rejected_credentials_skip_gate_and_browser_until_env_changes(tmp_path, monkeypatch):
+    settings, config, store, pool_store, pool = setup_runtime(tmp_path, monkeypatch)
+    gates = []
+    monkeypatch.setattr(jobs, "_ensure_account_gate",
+                        lambda account, *a, **k: gates.append(account.account_id) or True)
+    store.record_credential_rejection(
+        "a1", credential_hash=jobs.credential_hash("a1", "test-only"),
+        http_status=401, response_code="auth-exception",
+    )
+    jobs._run_startup_gates(settings, config, store, pool_store, "test-run",
+                            lambda: None, lambda: None, pool)
+    assert "a1" not in gates and "a1" not in pool._entries
+    state = {row["account_id"]: row for row in pool_store.accounts("test-run")}["a1"]
+    assert (state["status"], state["paused_reason"]) == ("paused", "credentials_invalid")
+    with store.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM job_events WHERE account_id='a1' "
+                          "AND event='account_credentials_rejected_durably'").fetchone()[0] == 1
+    # The operator fixes .env: the stale rejection is dropped and a1 is tried again.
+    monkeypatch.setenv("TEST_PASSWORD_1", "new-secret")
+    pool_store.mark_account_available("test-run", "a1")
+    jobs._run_startup_gates(settings, config, store, pool_store, "test-run",
+                            lambda: None, lambda: None, pool)
+    assert "a1" in gates and "a1" in pool._entries
+    assert store.credential_rejection("a1", credential_hash=jobs.credential_hash("a1", "new-secret")) is None
+
+
+def test_background_credential_rejection_is_recorded_durably(tmp_path, monkeypatch):
+    from cbrs.browser_session import CredentialsRejectedError
+    settings, config, store, pool_store, pool = setup_runtime(tmp_path, monkeypatch)
+    pool._known_accounts["a2"] = (settings, "a2", "test-only")
+    pool.on_auth_failure("a2", CredentialsRejectedError(status=401, response_code="auth-exception"))
+    row = store.credential_rejection("a2", credential_hash=jobs.credential_hash("a2", "test-only"))
+    assert row and row["http_status"] == 401 and row["response_code"] == "auth-exception"
+    assert store.credential_rejection("a2", credential_hash=jobs.credential_hash("a2", "other")) is None
+

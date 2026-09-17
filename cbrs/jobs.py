@@ -880,6 +880,14 @@ class JobStore:
                     expires_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS account_credential_rejections (
+                    account_id TEXT PRIMARY KEY,
+                    credential_hash TEXT NOT NULL,
+                    http_status INTEGER,
+                    response_code TEXT,
+                    rejected_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS job_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     job_id TEXT,
@@ -1867,6 +1875,53 @@ class JobStore:
                 (egress_hash, exclude_account),
             ).fetchone()
             return str(row["account_id"]) if row else None
+
+    def record_credential_rejection(
+        self,
+        account_id: str,
+        *,
+        credential_hash: str,
+        http_status: int | None = None,
+        response_code: str | None = None,
+    ) -> None:
+        """Remember that the portal rejected these exact credentials (hash only)."""
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO account_credential_rejections(
+                    account_id, credential_hash, http_status, response_code, rejected_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    credential_hash = excluded.credential_hash,
+                    http_status = excluded.http_status,
+                    response_code = excluded.response_code,
+                    rejected_at = excluded.rejected_at
+                """,
+                (account_id, credential_hash, http_status, response_code, utc_now()),
+            )
+
+    def credential_rejection(
+        self, account_id: str, *, credential_hash: str
+    ) -> dict[str, Any] | None:
+        """Return the durable rejection for the CURRENT credentials, if any.
+
+        A row recorded for different credentials is obsolete (the operator
+        changed .env) and is removed so the new credentials get a real try.
+        """
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM account_credential_rejections WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["credential_hash"] != credential_hash:
+                db.execute(
+                    "DELETE FROM account_credential_rejections WHERE account_id = ?",
+                    (account_id,),
+                )
+                return None
+            return dict(row)
 
     def account_check(self, account_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
@@ -3562,6 +3617,14 @@ def _wire_browser_auth_recovery(
                 run_id, account_id, reason=reason,
                 cooldown_seconds=None if isinstance(exc, CredentialsRejectedError) else 300,
             )
+            known = browser_pool._known_accounts.get(account_id)
+            if isinstance(exc, CredentialsRejectedError) and known:
+                store.record_credential_rejection(
+                    account_id,
+                    credential_hash=credential_hash(known[1], known[2]),
+                    http_status=getattr(exc, "status", None),
+                    response_code=getattr(exc, "response_code", None),
+                )
 
     def succeeded(account_id: str) -> None:
         pool_store.mark_account_available(run_id, account_id)
@@ -3598,6 +3661,24 @@ def _run_startup_gates(
                     or account.account_id in browser_pool._entries
                     or browser_pool.has_protected_session(account.account_id)):
                 continue
+        rejection = _durable_credential_rejection(store, account, settings)
+        if rejection:
+            # The portal already refused these exact credentials. Do not open a
+            # browser or spend a login per run; the operator must change .env.
+            pool_store.pause_account(
+                run_id, account.account_id, reason="credentials_invalid", cooldown_seconds=None,
+            )
+            store.add_event(
+                "account_credentials_rejected_durably",
+                account_id=account.account_id,
+                level="warning",
+                data={
+                    "http_status": rejection.get("http_status"),
+                    "response_code": rejection.get("response_code"),
+                    "rejected_at": rejection.get("rejected_at"),
+                },
+            )
+            continue
         try:
             runtime_settings = _runtime_account_settings(settings, account, store)
         except ValueError as exc:
@@ -3669,6 +3750,13 @@ def _run_startup_gates(
             browser_pool.discard(account.account_id, status="credentials_invalid")
             pool_store.pause_account(run_id, account.account_id, reason="credentials_invalid",
                                      cooldown_seconds=None)
+            if username and password:
+                store.record_credential_rejection(
+                    account.account_id,
+                    credential_hash=credential_hash(username, password),
+                    http_status=exc.status,
+                    response_code=exc.response_code,
+                )
             store.add_event(
                 "account_credentials_invalid",
                 account_id=account.account_id,
@@ -4784,6 +4872,23 @@ LOGIN_CAPTCHA_FAILURE_REASONS = frozenset({
     StopReason.CAPTCHA_REJECTED.value,
     StopReason.CAPTCHA_SOLVER.value,
 })
+
+
+def credential_hash(username: str, password: str) -> str:
+    """Opaque fingerprint of one credential pair; never stores the secret."""
+    return hashlib.sha256(f"{username}\n{password}".encode("utf-8")).hexdigest()
+
+
+def _durable_credential_rejection(
+    store: JobStore, account: PoolAccount, settings: Settings
+) -> dict[str, Any] | None:
+    try:
+        username, password = account_credentials(account, settings)
+    except ValueError:
+        return None
+    return store.credential_rejection(
+        account.account_id, credential_hash=credential_hash(username, password)
+    )
 
 
 def _explicit_login_captcha_rejection(exc: SafetyStopException) -> bool:
