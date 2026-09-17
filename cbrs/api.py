@@ -84,7 +84,7 @@ def _timeout(value: float) -> float:
     return number
 
 
-ALIASES = ({"foja", "fojas"}, {"numero", "número", "num"}, {"ano", "año", "year"})
+ALIASES = ({"foja", "fojas"}, {"numero", "número", "num"}, {"ano", "año", "anio", "year"})
 REPORT_FIELDS = ("status", "pdf_path", "error", "account", "attempts", "job_id", "finished_at")
 
 
