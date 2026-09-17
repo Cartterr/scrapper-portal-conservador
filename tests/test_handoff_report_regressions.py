@@ -172,13 +172,95 @@ def test_captcha_candidate_recovery_requires_all_preservation_gates(
     assert bool(calls) == expected
 
 
-@pytest.mark.parametrize("browsers_live,external,allowed", [(False, False, True),
-    (True, False, False), (True, True, True)])
+def test_explicit_portal_captcha_code_rotates_without_visible_form(tmp_path, monkeypatch):
+    settings, config, store, pool = runtime(tmp_path)
+    account = replace(config.accounts[0], proxy_provider="dataimpulse_mobile_sticky", dataimpulse_port=10001)
+    monkeypatch.setenv("CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS", "a1")
+    browsers = SimpleNamespace(can_replace_rejected_login=lambda _: False,
+                               has_protected_session=lambda _: False)
+    calls = []
+    monkeypatch.setattr(jobs, "_rotate_dataimpulse_route", lambda *a, **k: calls.append(k) or True)
+    outcome = jobs._handle_account_safety_stop(
+        SafetyStopException(StopReason.CAPTCHA_REJECTED, "rejected", status=400,
+                            context="auth login", response_code="captcha-rechazado"),
+        job_id=None, account=account, store=store, pool_store=pool, run_id="jobs-test",
+        config=config, settings=settings, browser_pool=browsers, preflight_runner=None, proxy_health_runner=None,
+    )
+    assert outcome == "retry_account"
+    assert [call["reason"] for call in calls] == ["login_captcha_rejected"]
+
+
+def test_explicit_portal_captcha_code_still_requires_replacement_scope(tmp_path, monkeypatch):
+    settings, config, store, pool = runtime(tmp_path)
+    account = replace(config.accounts[0], proxy_provider="dataimpulse_mobile_sticky", dataimpulse_port=10001)
+    monkeypatch.setenv("CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS", "")
+    browsers = SimpleNamespace(can_replace_rejected_login=lambda _: False,
+                               has_protected_session=lambda _: False)
+    calls = []
+    monkeypatch.setattr(jobs, "_rotate_dataimpulse_route", lambda *a, **k: calls.append(k) or True)
+    jobs._handle_account_safety_stop(
+        SafetyStopException(StopReason.CAPTCHA_REJECTED, "rejected", status=400,
+                            context="auth login", response_code="captcha-rechazado"),
+        job_id=None, account=account, store=store, pool_store=pool, run_id="jobs-test",
+        config=config, settings=settings, browser_pool=browsers, preflight_runner=None, proxy_health_runner=None,
+    )
+    assert not calls
+
+
+@pytest.mark.parametrize("failures,reason,expected_reason", [
+    (2, StopReason.CAPTCHA_REJECTED, None),
+    (3, StopReason.CAPTCHA_REJECTED, "login_captcha_rejected"),
+    (3, StopReason.CAPTCHA_SOLVER, "login_captcha_solver_failed"),
+])
+def test_repeated_login_captcha_failures_on_one_route_rotate(
+    tmp_path, monkeypatch, failures, reason, expected_reason,
+):
+    settings, config, store, pool = runtime(tmp_path)
+    account = replace(config.accounts[0], proxy_provider="dataimpulse_mobile_sticky", dataimpulse_port=10001)
+    monkeypatch.setenv("CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS", "a1")
+    for _ in range(failures):
+        store.add_event("background_auth_failed", account_id="a1", level="warning",
+                        data={"reason": "captcha_rejected"})
+    browsers = SimpleNamespace(can_replace_rejected_login=lambda _: False,
+                               has_protected_session=lambda _: False)
+    calls = []
+    monkeypatch.setattr(jobs, "_rotate_dataimpulse_route", lambda *a, **k: calls.append(k) or True)
+    context = "auth login" if reason is StopReason.CAPTCHA_REJECTED else "recaptcha solver"
+    jobs._handle_account_safety_stop(
+        SafetyStopException(reason, "failed", context=context),
+        job_id=None, account=account, store=store, pool_store=pool, run_id="jobs-test",
+        config=config, settings=settings, browser_pool=browsers, preflight_runner=None, proxy_health_runner=None,
+    )
+    assert [call["reason"] for call in calls] == ([expected_reason] if expected_reason else [])
+
+
+def test_login_captcha_failure_count_resets_at_last_rotation(tmp_path):
+    settings, config, store, pool = runtime(tmp_path)
+    for _ in range(3):
+        store.add_event("background_auth_failed", account_id="a1", level="warning",
+                        data={"reason": "captcha_rejected"})
+    assert jobs._login_captcha_failures_on_route(store, "a1") == 3
+    with store.connect() as db:
+        db.execute(
+            "INSERT INTO account_proxy_routes(account_id, active_port, updated_at) VALUES ('a1', 10002, ?)",
+            (jobs.utc_now(),),
+        )
+        db.execute(
+            "UPDATE account_proxy_routes SET last_rotated_at = ? WHERE account_id = 'a1'",
+            ("2999-01-01T00:00:00+00:00",),
+        )
+    assert jobs._login_captcha_failures_on_route(store, "a1") == 0
+
+
+@pytest.mark.parametrize("browsers_live,external,orphan_chrome,allowed", [
+    (False, False, False, True), (True, False, True, False), (True, False, False, True),
+    (True, True, True, True)])
 def test_proven_dead_worker_recovery_preserves_browser_ownership(
-    tmp_path, monkeypatch, browsers_live, external, allowed,
+    tmp_path, monkeypatch, browsers_live, external, orphan_chrome, allowed,
 ):
     settings, _, store, pool = runtime(tmp_path)
     monkeypatch.setenv("CBRS_BROWSER_OWNER_MODE", "external" if external else "embedded")
+    monkeypatch.setattr("cbrs.worker_lock.embedded_chrome_survives", lambda _settings: orphan_chrome)
     store.acquire_lease(jobs.WORKER_LEASE_NAME, "dead-fixture")
     if external:
         store.acquire_lease("browser_owner", "living-owner")
@@ -195,6 +277,10 @@ def test_proven_dead_worker_recovery_preserves_browser_ownership(
         assert calls == [True]
         assert store.lease(jobs.WORKER_LEASE_NAME) is None
         assert pool.latest_run()["status"] == "stale"
+        if browsers_live and not external:
+            check = store.account_check("a1") or {}
+            assert not check.get("browser_live")
+            assert check.get("browser_status") == "browser_closed"
     else:
         with pytest.raises(RuntimeError, match="ownership survives"):
             worker(settings=settings, store=store)

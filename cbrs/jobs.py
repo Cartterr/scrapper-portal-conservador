@@ -4639,13 +4639,13 @@ def _handle_account_safety_stop(
             reason=exc.reason.value,
             cooldown_seconds=SAFETY_COOLDOWN_SECONDS[exc.reason],
         )
-        if (exc.context == "auth login" and job_id is None
-                and _is_dataimpulse_account(account)
-                and _replacement_account_scoped(settings, account.account_id)
-                and browser_pool.can_replace_rejected_login(account.account_id)
-                and not browser_pool.has_protected_session(account.account_id)):
-            # Require an explicit response and visible rejected form. Existing
-            # candidate budgets and browser preservation still apply.
+        if _login_captcha_rotation_due(
+            exc, job_id=job_id, account=account, store=store, settings=settings,
+            browser_pool=browser_pool,
+        ):
+            # Evidence is either the visible rejected form, the portal's explicit
+            # ``captcha-rechazado`` login response, or repeated rejections on this
+            # same route. Existing candidate budgets and browser preservation apply.
             if _rotate_dataimpulse_route(
                 account, settings, store, pool_store, run_id, browser_pool,
                 preflight_runner, proxy_health_runner, reason="login_captcha_rejected",
@@ -4655,6 +4655,18 @@ def _handle_account_safety_stop(
                 account, settings, store, pool_store, run_id,
                 reason=exc.reason.value,
             )
+    elif (exc.reason == StopReason.CAPTCHA_SOLVER and job_id is None
+            and _login_captcha_rotation_due(
+                exc, job_id=job_id, account=account, store=store, settings=settings,
+                browser_pool=browser_pool, solver_failure=True,
+            )
+            and _rotate_dataimpulse_route(
+                account, settings, store, pool_store, run_id, browser_pool,
+                preflight_runner, proxy_health_runner, reason="login_captcha_solver_failed",
+            )):
+        # The external solver also failed on this route: a fresh exit is the
+        # bounded next step instead of paying for more tokens on the same one.
+        return "retry_account"
     else:
         pool_store.pause_account(
             run_id,
@@ -4766,6 +4778,76 @@ def _handle_account_safety_stop(
         data={"reason": exc.reason.value},
     )
     return "retry_account"
+
+
+LOGIN_CAPTCHA_FAILURE_REASONS = frozenset({
+    StopReason.CAPTCHA_REJECTED.value,
+    StopReason.CAPTCHA_SOLVER.value,
+})
+
+
+def _explicit_login_captcha_rejection(exc: SafetyStopException) -> bool:
+    """The portal itself answered the login with ``captcha-rechazado``."""
+    return (
+        exc.context == "auth login"
+        and exc.status == 400
+        and str(getattr(exc, "response_code", "") or "").lower() == "captcha-rechazado"
+    )
+
+
+def _login_captcha_failures_on_route(store: JobStore, account_id: str) -> int:
+    """Count login CAPTCHA failures recorded since the account's last rotation."""
+    route = store.dataimpulse_route(account_id) or {}
+    since = str(route.get("last_rotated_at") or "")
+    with store.connect() as db:
+        rows = db.execute(
+            "SELECT data_json FROM job_events WHERE account_id = ? "
+            "AND event = 'background_auth_failed' AND created_at > ?",
+            (account_id, since),
+        ).fetchall()
+    count = 0
+    for row in rows:
+        try:
+            reason = json.loads(row["data_json"]).get("reason")
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if reason in LOGIN_CAPTCHA_FAILURE_REASONS:
+            count += 1
+    return count
+
+
+def _login_captcha_rotation_due(
+    exc: SafetyStopException,
+    *,
+    job_id: str | None,
+    account: PoolAccount,
+    store: JobStore,
+    settings: Settings,
+    browser_pool: _PersistentAccountBrowsers,
+    solver_failure: bool = False,
+) -> bool:
+    """Decide whether a login CAPTCHA failure may replace the sticky route now.
+
+    Preservation gates never change: only idle DataImpulse accounts listed in
+    ``CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS`` without a protected session. The
+    evidence gate accepts any of: the visible rejected login form (original
+    rule), the portal's explicit ``captcha-rechazado`` login response, or at
+    least ``CBRS_LOGIN_CAPTCHA_ROTATE_AFTER`` recorded failures on this route.
+    """
+    if job_id is not None or not _is_dataimpulse_account(account):
+        return False
+    if not solver_failure and exc.context != "auth login":
+        return False
+    if not _replacement_account_scoped(settings, account.account_id):
+        return False
+    if browser_pool.has_protected_session(account.account_id):
+        return False
+    if browser_pool.can_replace_rejected_login(account.account_id):
+        return True
+    if _explicit_login_captcha_rejection(exc):
+        return True
+    threshold = max(1, int(getattr(settings, "login_captcha_rotate_after", 3) or 3))
+    return _login_captcha_failures_on_route(store, account.account_id) >= threshold
 
 
 def _align_login_pause_with_route(

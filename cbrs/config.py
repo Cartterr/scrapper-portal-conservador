@@ -71,6 +71,9 @@ DEFAULT_DATAIMPULSE_CANDIDATES_PER_RECOVERY = 10
 DEFAULT_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD = 2
 # A visibly rejected login on an explicitly scoped account recovers at once.
 DEFAULT_DATAIMPULSE_LOGIN_RECOVERY_THRESHOLD = 1
+# Login CAPTCHA rejections on one sticky route before a candidate rotation
+# is allowed without visible-form evidence (explicit portal codes rotate sooner).
+DEFAULT_LOGIN_CAPTCHA_ROTATE_AFTER = 3
 DEFAULT_DATAIMPULSE_CANARY_PER_HOUR = 12
 DEFAULT_DATAIMPULSE_CANARY_SPACING_SECONDS = 60.0
 ALLOWED_EGRESS_MODES = frozenset(
@@ -123,6 +126,7 @@ class Settings:
     dataimpulse_candidates_per_recovery: int
     dataimpulse_temp_unavailable_threshold: int
     dataimpulse_login_recovery_threshold: int
+    login_captcha_rotate_after: int
     dataimpulse_canary_per_hour: int
     dataimpulse_canary_spacing_seconds: float
     browser_healthcheck_seconds: float
@@ -406,6 +410,12 @@ def load_settings(
     )
     if dataimpulse_login_threshold < 1:
         raise ValueError("CBRS_DATAIMPULSE_LOGIN_RECOVERY_THRESHOLD must be positive")
+    login_captcha_rotate_after = _int(
+        env.get("CBRS_LOGIN_CAPTCHA_ROTATE_AFTER"),
+        default=DEFAULT_LOGIN_CAPTCHA_ROTATE_AFTER,
+    )
+    if login_captcha_rotate_after < 1:
+        raise ValueError("CBRS_LOGIN_CAPTCHA_ROTATE_AFTER must be positive")
     dataimpulse_canary_per_hour = _int(
         env.get("CBRS_DATAIMPULSE_CANARY_PER_HOUR"),
         default=DEFAULT_DATAIMPULSE_CANARY_PER_HOUR,
@@ -518,6 +528,7 @@ def load_settings(
         dataimpulse_candidates_per_recovery=dataimpulse_candidates_per_recovery,
         dataimpulse_temp_unavailable_threshold=dataimpulse_temporary_threshold,
         dataimpulse_login_recovery_threshold=dataimpulse_login_threshold,
+        login_captcha_rotate_after=login_captcha_rotate_after,
         dataimpulse_canary_per_hour=dataimpulse_canary_per_hour,
         dataimpulse_canary_spacing_seconds=dataimpulse_canary_spacing,
         browser_healthcheck_seconds=browser_healthcheck_seconds,
