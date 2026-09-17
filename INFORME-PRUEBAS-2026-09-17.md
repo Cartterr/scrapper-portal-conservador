@@ -56,6 +56,10 @@ informe anterior. Verificado en vivo:
   `daily_limit` (HTTP 400) en la búsqueda 11 a las 14:46 UTC; la cuenta 3
   igual a las 15:57 UTC. La ventana de 24 horas desde el primer éxito que
   implementa el servicio coincidió con el comportamiento observado.
+- Además del diálogo "Se ha detectado un problema, refresque la página",
+  el portal muestra "No se pudo realizar búsqueda, intente nuevamente por
+  favor" cuando la petición no llega a responderse. Captura en
+  `.cbrs/runtime/pool/error-screenshots/error-d6b96a78f276cb4a058158a39cb40607.jpg`.
 - Una inscripción inexistente (fojas 19428, nº 16043, 1993) devuelve lista
   vacía y el portal muestra el diálogo con el texto literal `null`. Se reporta
   `not_found` sin reintento.
@@ -91,6 +95,8 @@ informe anterior. Verificado en vivo:
 | D23 | Pausa fija de 5 minutos entre trabajos en instalaciones configuradas solo por `.env`. El JSON de ejemplo trae 0. | R1/R2 | Abierto |
 | D24 | La recuperación de rutas comprometidas prueba un candidato cada 5 minutos aunque haya 10 permitidos. La cuenta 3 estuvo 40 minutos fuera por tres candidatos rechazados. | R5 | Abierto |
 | D9 | Ctrl+C sigue sin detener el worker en menos de 30 s. | R4 | Abierto |
+| D25 | El diálogo del portal "Atención: No se pudo realizar búsqueda, intente nuevamente por favor" no se reconoce. Tras el clic, la búsqueda quedó con resultado desconocido y el trabajo exige conciliación manual. En la misma captura, el panel "Recientes" del portal no lista la inscripción, prueba de que no se registró ni consumió cuota: esa comprobación puede automatizarse. | R5 | Abierto |
+| D26 | `deploy/resume_unconfirmed_jobs.py`, la única vía documentada para conciliar, falla en modo embebido ("unable to open database file"): busca la base de comandos del propietario externo, que solo existe con systemd. Sin systemd no hay forma de destrabar el D22. | R5 | Abierto |
 
 ## 6. Cambios de código en esta rama, para revisión del contratista
 
@@ -129,9 +135,13 @@ En orden de prioridad:
    cuenta agotada el sistema puede quedar en bucle.
 3. D16: `pending_quota` y `resume_at` en el reporte cuando la espera es por
    cuota del portal.
-4. D22: definir qué pasa con una búsqueda ambigua. Si la conciliación manual
-   se mantiene, el reporte debe decirlo con un estado propio y el operador
-   debe recibir el comando exacto.
+4. D22, D25 y D26: reconocer el diálogo "No se pudo realizar búsqueda" como
+   fallo previo al envío; ante un resultado desconocido, comprobar en el panel
+   "Recientes" del portal si la inscripción quedó registrada y decidir solo el
+   reintento; y hacer que el script de conciliación funcione sin propietario
+   externo mientras exista. Si la conciliación manual se mantiene, el reporte
+   debe decirlo con un estado propio y el operador debe recibir el comando
+   exacto.
 5. D23 y D24: valores por defecto de ritmo. Sin pausa de 5 minutos entre
    trabajos cuando hay cuentas disponibles, y candidatos consecutivos sin
    esperar 5 minutos en la recuperación de rutas.
