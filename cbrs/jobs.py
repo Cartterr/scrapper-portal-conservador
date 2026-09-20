@@ -542,6 +542,53 @@ class _PersistentAccountBrowsers:
         finally:
             self.capture_previews(force=True)
 
+    def discard_closed_contexts(self) -> list[str]:
+        """Forget entries whose Chrome page/context is already gone.
+
+        This never closes a living browser: only a page that reports itself
+        closed (or whose context can no longer be queried) is dropped, so the
+        normal reconcile loop can open a fresh session for that account.
+        """
+        closed: list[str] = []
+        for account_id, entry in tuple(self._entries.items()):
+            browser = getattr(entry.scraper, "browser", entry.scraper)
+            page = getattr(browser, "page", None)
+            dead = False
+            try:
+                if page is None:
+                    dead = True
+                elif callable(getattr(page, "is_closed", None)) and page.is_closed():
+                    dead = True
+                else:
+                    context = getattr(page, "context", None)
+                    if context is not None and callable(getattr(context, "pages", None)):
+                        context.pages()
+            except Exception:
+                dead = True
+            if not dead:
+                continue
+            self._entries.pop(account_id, None)
+            try:
+                if hasattr(entry.manager, "__exit__"):
+                    entry.manager.__exit__(None, None, None)
+                elif hasattr(entry.scraper, "close"):
+                    entry.scraper.close()
+            except Exception:
+                pass
+            try:
+                self.store.set_account_browser_state(
+                    account_id, live=False, authenticated=False, headless=self.headless,
+                    owner=self.worker_id, status="browser_context_closed",
+                )
+            except Exception:
+                pass
+            self.store.add_event(
+                "browser_context_closed_discarded", account_id=account_id, level="warning",
+                data={"policy": "dead_context_only"},
+            )
+            closed.append(account_id)
+        return closed
+
     def has_protected_session(self, account_id: str) -> bool:
         entries = [entry for key, entry in self._retained_entries if key == account_id]
         current = self._entries.get(account_id)
@@ -878,6 +925,14 @@ class JobStore:
                     acquired_at TEXT NOT NULL,
                     heartbeat_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS account_credential_rejections (
+                    account_id TEXT PRIMARY KEY,
+                    credential_hash TEXT NOT NULL,
+                    http_status INTEGER,
+                    response_code TEXT,
+                    rejected_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS job_events (
@@ -1867,6 +1922,53 @@ class JobStore:
                 (egress_hash, exclude_account),
             ).fetchone()
             return str(row["account_id"]) if row else None
+
+    def record_credential_rejection(
+        self,
+        account_id: str,
+        *,
+        credential_hash: str,
+        http_status: int | None = None,
+        response_code: str | None = None,
+    ) -> None:
+        """Remember that the portal rejected these exact credentials (hash only)."""
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO account_credential_rejections(
+                    account_id, credential_hash, http_status, response_code, rejected_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    credential_hash = excluded.credential_hash,
+                    http_status = excluded.http_status,
+                    response_code = excluded.response_code,
+                    rejected_at = excluded.rejected_at
+                """,
+                (account_id, credential_hash, http_status, response_code, utc_now()),
+            )
+
+    def credential_rejection(
+        self, account_id: str, *, credential_hash: str
+    ) -> dict[str, Any] | None:
+        """Return the durable rejection for the CURRENT credentials, if any.
+
+        A row recorded for different credentials is obsolete (the operator
+        changed .env) and is removed so the new credentials get a real try.
+        """
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM account_credential_rejections WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["credential_hash"] != credential_hash:
+                db.execute(
+                    "DELETE FROM account_credential_rejections WHERE account_id = ?",
+                    (account_id,),
+                )
+                return None
+            return dict(row)
 
     def account_check(self, account_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
@@ -3333,140 +3435,174 @@ def run_job_worker(
             daemon=True,
         )
         heartbeat_thread.start()
-        while max_jobs is None or processed < max_jobs:
-            # Same owner/thread and browser objects; switch only before the next
-            # complete operation, never inside a search or PDF job.
-            updates.poll()
-            pool_store.reset_quota_day(run_id, local_today())
-            pool_store.reactivate_expired_cooldowns(run_id)
-            browser_pool.reconcile()
-            browser_pool.capture_previews()
-            if (
-                time.monotonic() - last_recovery_at >= COMPROMISED_RECOVERY_INTERVAL_SECONDS
-                and store.compromised_routes()
-            ):
-                last_recovery_at = time.monotonic()
-                _recover_compromised_routes(
-                    settings=settings,
-                    config=config,
-                    store=store,
-                    pool_store=pool_store,
-                    run_id=run_id,
-                    browser_pool=browser_pool,
-                    preflight_runner=preflight_runner,
-                    proxy_health_runner=proxy_health_runner,
-                )
-            # A replacement worker can acquire the global lease moments before
-            # the previous job lease expires. Recheck on every scheduler pass
-            # so that job is requeued once it becomes stale without requiring
-            # another process restart.
-            store.recover_abandoned_jobs()
-            if pool_store.stop_requested():
-                final_status = "stopped"
-                break
-            cooldown = store.global_cooldown()
-            if cooldown:
-                final_status = "cooldown"
-                pool_store.update_run(
-                    run_id,
-                    status="waiting",
-                    next_cycle_at=cooldown["resume_at"],
-                    blocked_reason=cooldown["reason"],
-                )
-                if once:
-                    break
-                sleep_fn(max(0.1, runtime_poll_seconds))
-                continue
-            if startup_gates_pending:
-                # A replacement worker must not touch account browsers while a
-                # global outage circuit is active. Run the live startup gates
-                # only after the circuit expires, then exactly once.
-                _run_startup_gates(
-                    settings,
-                    config,
-                    store,
-                    pool_store,
-                    run_id,
-                    preflight_runner,
-                    proxy_health_runner,
-                    browser_pool,
-                )
-                startup_gates_pending = False
-                if store.global_cooldown():
-                    if once:
-                        final_status = "cooldown"
+        recover_backoff = max(5.0, float(settings.env_value("CBRS_WORKER_RECOVER_SECONDS", "30") or 30))
+        while True:
+            try:
+                while max_jobs is None or processed < max_jobs:
+                    # Same owner/thread and browser objects; switch only before the next
+                    # complete operation, never inside a search or PDF job.
+                    updates.poll()
+                    pool_store.reset_quota_day(run_id, local_today())
+                    pool_store.reactivate_expired_cooldowns(run_id)
+                    browser_pool.reconcile()
+                    browser_pool.capture_previews()
+                    if (
+                        time.monotonic() - last_recovery_at >= COMPROMISED_RECOVERY_INTERVAL_SECONDS
+                        and store.compromised_routes()
+                    ):
+                        last_recovery_at = time.monotonic()
+                        _recover_compromised_routes(
+                            settings=settings,
+                            config=config,
+                            store=store,
+                            pool_store=pool_store,
+                            run_id=run_id,
+                            browser_pool=browser_pool,
+                            preflight_runner=preflight_runner,
+                            proxy_health_runner=proxy_health_runner,
+                        )
+                    # A replacement worker can acquire the global lease moments before
+                    # the previous job lease expires. Recheck on every scheduler pass
+                    # so that job is requeued once it becomes stale without requiring
+                    # another process restart.
+                    store.recover_abandoned_jobs()
+                    if pool_store.stop_requested():
+                        final_status = "stopped"
                         break
-                    continue
-            else:
-                # Accounts that never opened a browser must recover while the
-                # queue is idle, after their own cooldown expires.
-                _run_startup_gates(
-                    settings, config, store, pool_store, run_id,
-                    preflight_runner, proxy_health_runner, browser_pool,
-                    retry_only=True,
-                )
-            _process_requested_dataimpulse_rotation(
-                settings=settings,
-                config=config,
-                store=store,
-                pool_store=pool_store,
-                run_id=run_id,
-                browser_pool=browser_pool,
-                worker_id=worker_id,
-                preflight_runner=preflight_runner,
-                proxy_health_runner=proxy_health_runner,
-            )
-            endurance.maybe_enqueue()
-            job = store.claim_next(worker_id)
-            if job is None:
-                if once:
-                    final_status = "idle"
-                    break
-                pool_store.update_run(run_id, status="waiting", next_cycle_at="")
-                sleep_fn(max(0.1, runtime_poll_seconds))
-                continue
-            processed += 1
-            pool_store.update_run(run_id, status="running", next_cycle_at="")
-            outcome = _process_claimed_job(
-                job,
-                settings=settings,
-                config=config,
-                store=store,
-                pool_store=pool_store,
-                run_id=run_id,
-                browser_pool=browser_pool,
-                preflight_runner=preflight_runner,
-                proxy_health_runner=proxy_health_runner,
-                endurance_plan=endurance_plan,
-            )
-            if outcome == "cooldown":
-                final_status = outcome
-                if once:
-                    break
-                sleep_fn(max(0.1, runtime_poll_seconds))
-                continue
-            if job.source == "captcha_validation" and (once or max_jobs is not None):
-                final_status = outcome
-                break
-            if once:
-                final_status = outcome
-                break
-            if outcome in {"waiting_capacity", "waiting_captcha"}:
-                sleep_fn(max(0.1, runtime_poll_seconds))
-            elif (
-                config.human_like_behavior_enabled
-                and config.job_interval_max_seconds > 0
-            ):
-                sleep_fn(
-                    random.uniform(
-                        config.job_interval_min_seconds,
-                        config.job_interval_max_seconds,
+                    cooldown = store.global_cooldown()
+                    if cooldown:
+                        final_status = "cooldown"
+                        pool_store.update_run(
+                            run_id,
+                            status="waiting",
+                            next_cycle_at=cooldown["resume_at"],
+                            blocked_reason=cooldown["reason"],
+                        )
+                        if once:
+                            break
+                        sleep_fn(max(0.1, runtime_poll_seconds))
+                        continue
+                    if startup_gates_pending:
+                        # A replacement worker must not touch account browsers while a
+                        # global outage circuit is active. Run the live startup gates
+                        # only after the circuit expires, then exactly once.
+                        _run_startup_gates(
+                            settings,
+                            config,
+                            store,
+                            pool_store,
+                            run_id,
+                            preflight_runner,
+                            proxy_health_runner,
+                            browser_pool,
+                        )
+                        startup_gates_pending = False
+                        if store.global_cooldown():
+                            if once:
+                                final_status = "cooldown"
+                                break
+                            continue
+                    else:
+                        # Accounts that never opened a browser must recover while the
+                        # queue is idle, after their own cooldown expires.
+                        _run_startup_gates(
+                            settings, config, store, pool_store, run_id,
+                            preflight_runner, proxy_health_runner, browser_pool,
+                            retry_only=True,
+                        )
+                    _process_requested_dataimpulse_rotation(
+                        settings=settings,
+                        config=config,
+                        store=store,
+                        pool_store=pool_store,
+                        run_id=run_id,
+                        browser_pool=browser_pool,
+                        worker_id=worker_id,
+                        preflight_runner=preflight_runner,
+                        proxy_health_runner=proxy_health_runner,
                     )
-                )
-            elif config.interval_minutes > 0:
-                sleep_fn(config.interval_minutes * 60)
-        else:
-            final_status = "completed"
+                    endurance.maybe_enqueue()
+                    job = store.claim_next(worker_id)
+                    if job is None:
+                        if once:
+                            final_status = "idle"
+                            break
+                        pool_store.update_run(run_id, status="waiting", next_cycle_at="")
+                        sleep_fn(max(0.1, runtime_poll_seconds))
+                        continue
+                    processed += 1
+                    pool_store.update_run(run_id, status="running", next_cycle_at="")
+                    outcome = _process_claimed_job(
+                        job,
+                        settings=settings,
+                        config=config,
+                        store=store,
+                        pool_store=pool_store,
+                        run_id=run_id,
+                        browser_pool=browser_pool,
+                        preflight_runner=preflight_runner,
+                        proxy_health_runner=proxy_health_runner,
+                        endurance_plan=endurance_plan,
+                    )
+                    if outcome == "cooldown":
+                        final_status = outcome
+                        if once:
+                            break
+                        sleep_fn(max(0.1, runtime_poll_seconds))
+                        continue
+                    if job.source == "captcha_validation" and (once or max_jobs is not None):
+                        final_status = outcome
+                        break
+                    if once:
+                        final_status = outcome
+                        break
+                    if outcome in {"waiting_capacity", "waiting_captcha"}:
+                        sleep_fn(max(0.1, runtime_poll_seconds))
+                    elif (
+                        config.human_like_behavior_enabled
+                        and config.job_interval_max_seconds > 0
+                    ):
+                        sleep_fn(
+                            random.uniform(
+                                config.job_interval_min_seconds,
+                                config.job_interval_max_seconds,
+                            )
+                        )
+                    elif config.interval_minutes > 0:
+                        sleep_fn(config.interval_minutes * 60)
+                else:
+                    final_status = "completed"
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                if once or max_jobs is not None:
+                    raise
+                # R4: the service keeps itself alive. Drop only contexts that are
+                # already dead, keep every live session, and re-enter the loop
+                # after a bounded backoff instead of parking until a manual stop.
+                try:
+                    store.add_event("worker_loop_failed", level="error",
+                                    data={"error": redact_text(str(exc))})
+                except Exception:
+                    pass
+                if pool_store.stop_requested():
+                    final_status = "stopped"
+                    break
+                try:
+                    closed = browser_pool.discard_closed_contexts()
+                except Exception:
+                    closed = []
+                try:
+                    pool_store.update_run(run_id, status="waiting",
+                                         blocked_reason="worker_failed_recovering")
+                    store.add_event("worker_loop_recovering", level="warning",
+                                    data={"closed_contexts": closed,
+                                          "retry_seconds": recover_backoff})
+                except Exception:
+                    pass
+                sleep_fn(recover_backoff)
+                continue
+            break
     except KeyboardInterrupt:
         final_status = "stopped"
     except Exception as exc:
@@ -3562,6 +3698,14 @@ def _wire_browser_auth_recovery(
                 run_id, account_id, reason=reason,
                 cooldown_seconds=None if isinstance(exc, CredentialsRejectedError) else 300,
             )
+            known = browser_pool._known_accounts.get(account_id)
+            if isinstance(exc, CredentialsRejectedError) and known:
+                store.record_credential_rejection(
+                    account_id,
+                    credential_hash=credential_hash(known[1], known[2]),
+                    http_status=getattr(exc, "status", None),
+                    response_code=getattr(exc, "response_code", None),
+                )
 
     def succeeded(account_id: str) -> None:
         pool_store.mark_account_available(run_id, account_id)
@@ -3598,6 +3742,24 @@ def _run_startup_gates(
                     or account.account_id in browser_pool._entries
                     or browser_pool.has_protected_session(account.account_id)):
                 continue
+        rejection = _durable_credential_rejection(store, account, settings)
+        if rejection:
+            # The portal already refused these exact credentials. Do not open a
+            # browser or spend a login per run; the operator must change .env.
+            pool_store.pause_account(
+                run_id, account.account_id, reason="credentials_invalid", cooldown_seconds=None,
+            )
+            store.add_event(
+                "account_credentials_rejected_durably",
+                account_id=account.account_id,
+                level="warning",
+                data={
+                    "http_status": rejection.get("http_status"),
+                    "response_code": rejection.get("response_code"),
+                    "rejected_at": rejection.get("rejected_at"),
+                },
+            )
+            continue
         try:
             runtime_settings = _runtime_account_settings(settings, account, store)
         except ValueError as exc:
@@ -3669,6 +3831,13 @@ def _run_startup_gates(
             browser_pool.discard(account.account_id, status="credentials_invalid")
             pool_store.pause_account(run_id, account.account_id, reason="credentials_invalid",
                                      cooldown_seconds=None)
+            if username and password:
+                store.record_credential_rejection(
+                    account.account_id,
+                    credential_hash=credential_hash(username, password),
+                    http_status=exc.status,
+                    response_code=exc.response_code,
+                )
             store.add_event(
                 "account_credentials_invalid",
                 account_id=account.account_id,
@@ -4639,13 +4808,13 @@ def _handle_account_safety_stop(
             reason=exc.reason.value,
             cooldown_seconds=SAFETY_COOLDOWN_SECONDS[exc.reason],
         )
-        if (exc.context == "auth login" and job_id is None
-                and _is_dataimpulse_account(account)
-                and _replacement_account_scoped(settings, account.account_id)
-                and browser_pool.can_replace_rejected_login(account.account_id)
-                and not browser_pool.has_protected_session(account.account_id)):
-            # Require an explicit response and visible rejected form. Existing
-            # candidate budgets and browser preservation still apply.
+        if _login_captcha_rotation_due(
+            exc, job_id=job_id, account=account, store=store, settings=settings,
+            browser_pool=browser_pool,
+        ):
+            # Evidence is either the visible rejected form, the portal's explicit
+            # ``captcha-rechazado`` login response, or repeated rejections on this
+            # same route. Existing candidate budgets and browser preservation apply.
             if _rotate_dataimpulse_route(
                 account, settings, store, pool_store, run_id, browser_pool,
                 preflight_runner, proxy_health_runner, reason="login_captcha_rejected",
@@ -4655,6 +4824,18 @@ def _handle_account_safety_stop(
                 account, settings, store, pool_store, run_id,
                 reason=exc.reason.value,
             )
+    elif (exc.reason == StopReason.CAPTCHA_SOLVER and job_id is None
+            and _login_captcha_rotation_due(
+                exc, job_id=job_id, account=account, store=store, settings=settings,
+                browser_pool=browser_pool, solver_failure=True,
+            )
+            and _rotate_dataimpulse_route(
+                account, settings, store, pool_store, run_id, browser_pool,
+                preflight_runner, proxy_health_runner, reason="login_captcha_solver_failed",
+            )):
+        # The external solver also failed on this route: a fresh exit is the
+        # bounded next step instead of paying for more tokens on the same one.
+        return "retry_account"
     else:
         pool_store.pause_account(
             run_id,
@@ -4766,6 +4947,93 @@ def _handle_account_safety_stop(
         data={"reason": exc.reason.value},
     )
     return "retry_account"
+
+
+LOGIN_CAPTCHA_FAILURE_REASONS = frozenset({
+    StopReason.CAPTCHA_REJECTED.value,
+    StopReason.CAPTCHA_SOLVER.value,
+})
+
+
+def credential_hash(username: str, password: str) -> str:
+    """Opaque fingerprint of one credential pair; never stores the secret."""
+    return hashlib.sha256(f"{username}\n{password}".encode("utf-8")).hexdigest()
+
+
+def _durable_credential_rejection(
+    store: JobStore, account: PoolAccount, settings: Settings
+) -> dict[str, Any] | None:
+    try:
+        username, password = account_credentials(account, settings)
+    except ValueError:
+        return None
+    return store.credential_rejection(
+        account.account_id, credential_hash=credential_hash(username, password)
+    )
+
+
+def _explicit_login_captcha_rejection(exc: SafetyStopException) -> bool:
+    """The portal itself answered the login with ``captcha-rechazado``."""
+    return (
+        exc.context == "auth login"
+        and exc.status == 400
+        and str(getattr(exc, "response_code", "") or "").lower() == "captcha-rechazado"
+    )
+
+
+def _login_captcha_failures_on_route(store: JobStore, account_id: str) -> int:
+    """Count login CAPTCHA failures recorded since the account's last rotation."""
+    route = store.dataimpulse_route(account_id) or {}
+    since = str(route.get("last_rotated_at") or "")
+    with store.connect() as db:
+        rows = db.execute(
+            "SELECT data_json FROM job_events WHERE account_id = ? "
+            "AND event = 'background_auth_failed' AND created_at > ?",
+            (account_id, since),
+        ).fetchall()
+    count = 0
+    for row in rows:
+        try:
+            reason = json.loads(row["data_json"]).get("reason")
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if reason in LOGIN_CAPTCHA_FAILURE_REASONS:
+            count += 1
+    return count
+
+
+def _login_captcha_rotation_due(
+    exc: SafetyStopException,
+    *,
+    job_id: str | None,
+    account: PoolAccount,
+    store: JobStore,
+    settings: Settings,
+    browser_pool: _PersistentAccountBrowsers,
+    solver_failure: bool = False,
+) -> bool:
+    """Decide whether a login CAPTCHA failure may replace the sticky route now.
+
+    Preservation gates never change: only idle DataImpulse accounts listed in
+    ``CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS`` without a protected session. The
+    evidence gate accepts any of: the visible rejected login form (original
+    rule), the portal's explicit ``captcha-rechazado`` login response, or at
+    least ``CBRS_LOGIN_CAPTCHA_ROTATE_AFTER`` recorded failures on this route.
+    """
+    if job_id is not None or not _is_dataimpulse_account(account):
+        return False
+    if not solver_failure and exc.context != "auth login":
+        return False
+    if not _replacement_account_scoped(settings, account.account_id):
+        return False
+    if browser_pool.has_protected_session(account.account_id):
+        return False
+    if browser_pool.can_replace_rejected_login(account.account_id):
+        return True
+    if _explicit_login_captcha_rejection(exc):
+        return True
+    threshold = max(1, int(getattr(settings, "login_captcha_rotate_after", 3) or 3))
+    return _login_captcha_failures_on_route(store, account.account_id) >= threshold
 
 
 def _align_login_pause_with_route(

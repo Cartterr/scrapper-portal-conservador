@@ -41,6 +41,36 @@ def local_owner_is_dead(owner: str) -> bool:
     return False
 
 
+def embedded_chrome_survives(settings) -> bool:
+    """True when some live process still uses one of this runtime's account profiles.
+
+    Linux-only proof via /proc command lines; any other platform, or a scan
+    failure, answers True so browser ownership is preserved by default.
+    """
+    try:
+        accounts_dir = str((settings.profile_dir.parent / "accounts").resolve())
+    except Exception:
+        return True
+    proc = "/proc"
+    if not os.path.isdir(proc):
+        return True
+    try:
+        pids = [name for name in os.listdir(proc) if name.isdigit()]
+    except OSError:
+        return True
+    for pid in pids:
+        if int(pid) == os.getpid():
+            continue
+        try:
+            with open(os.path.join(proc, pid, "cmdline"), "rb") as handle:
+                cmdline = handle.read().replace(b"\0", b" ").decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "--user-data-dir=" in cmdline and accounts_dir in cmdline:
+            return True
+    return False
+
+
 def exclusive_worker(function):
     @wraps(function)
     def guarded(*args, **kwargs):
@@ -76,6 +106,27 @@ def exclusive_worker(function):
                                 "WHERE dry_run=0 AND finished_at IS NULL AND run_id LIKE 'jobs-%'",
                                 (utc_now(),),
                             )
+                elif dead and browser_alive and not embedded_chrome_survives(settings):
+                    # The dead worker's Chrome is gone too (no process uses any
+                    # account profile). Its browser marks are stale bookkeeping,
+                    # not live ownership: clear them and take the lease over.
+                    with store.connect() as db:
+                        # No process uses any account profile, so every live
+                        # mark is stale regardless of which owner wrote it.
+                        db.execute(
+                            "UPDATE account_checks SET browser_live=0, browser_authenticated=0, "
+                            "browser_status='browser_closed' WHERE browser_live=1"
+                        )
+                        db.execute(
+                            "DELETE FROM leases WHERE lease_name=? AND owner=?",
+                            (WORKER_LEASE_NAME, lease["owner"]),
+                        )
+                        db.execute(
+                            "UPDATE runs SET status='stale', finished_at=?, "
+                            "blocked_reason='worker and its browsers no longer exist' "
+                            "WHERE dry_run=0 AND finished_at IS NULL AND run_id LIKE 'jobs-%'",
+                            (utc_now(),),
+                        )
                 elif dead and browser_alive:
                     raise RuntimeError(
                         "Previous embedded worker is absent but browser ownership survives; "

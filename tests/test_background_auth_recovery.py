@@ -745,3 +745,87 @@ def test_fast_retry_never_reloads_a_previously_authenticated_unknown_context(tmp
     pool.reconcile()
     assert pending.scraper.calls == 0
     assert pool._entries["a2"] is pending
+
+
+def test_durably_rejected_credentials_skip_gate_and_browser_until_env_changes(tmp_path, monkeypatch):
+    settings, config, store, pool_store, pool = setup_runtime(tmp_path, monkeypatch)
+    gates = []
+    monkeypatch.setattr(jobs, "_ensure_account_gate",
+                        lambda account, *a, **k: gates.append(account.account_id) or True)
+    store.record_credential_rejection(
+        "a1", credential_hash=jobs.credential_hash("a1", "test-only"),
+        http_status=401, response_code="auth-exception",
+    )
+    jobs._run_startup_gates(settings, config, store, pool_store, "test-run",
+                            lambda: None, lambda: None, pool)
+    assert "a1" not in gates and "a1" not in pool._entries
+    state = {row["account_id"]: row for row in pool_store.accounts("test-run")}["a1"]
+    assert (state["status"], state["paused_reason"]) == ("paused", "credentials_invalid")
+    with store.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM job_events WHERE account_id='a1' "
+                          "AND event='account_credentials_rejected_durably'").fetchone()[0] == 1
+    # The operator fixes .env: the stale rejection is dropped and a1 is tried again.
+    monkeypatch.setenv("TEST_PASSWORD_1", "new-secret")
+    pool_store.mark_account_available("test-run", "a1")
+    jobs._run_startup_gates(settings, config, store, pool_store, "test-run",
+                            lambda: None, lambda: None, pool)
+    assert "a1" in gates and "a1" in pool._entries
+    assert store.credential_rejection("a1", credential_hash=jobs.credential_hash("a1", "new-secret")) is None
+
+
+def test_background_credential_rejection_is_recorded_durably(tmp_path, monkeypatch):
+    from cbrs.browser_session import CredentialsRejectedError
+    settings, config, store, pool_store, pool = setup_runtime(tmp_path, monkeypatch)
+    pool._known_accounts["a2"] = (settings, "a2", "test-only")
+    pool.on_auth_failure("a2", CredentialsRejectedError(status=401, response_code="auth-exception"))
+    row = store.credential_rejection("a2", credential_hash=jobs.credential_hash("a2", "test-only"))
+    assert row and row["http_status"] == 401 and row["response_code"] == "auth-exception"
+    assert store.credential_rejection("a2", credential_hash=jobs.credential_hash("a2", "other")) is None
+
+
+def test_discard_closed_contexts_drops_only_dead_pages(tmp_path, monkeypatch):
+    settings, config, store, pool_store, pool = setup_runtime(tmp_path, monkeypatch)
+    with pool.session("a1", settings, "a1", "test-only"):
+        pass
+    dead = SimpleNamespace(page=SimpleNamespace(is_closed=lambda: True))
+    dead.browser = dead
+    pool._entries["a2"] = jobs._ManagedAccountScraper(manager=SimpleNamespace(), scraper=dead)
+    assert pool.discard_closed_contexts() == ["a2"]
+    assert "a1" in pool._entries and "a2" not in pool._entries
+    check = store.account_check("a2") or {}
+    assert not check.get("browser_live") and check.get("browser_status") == "browser_context_closed"
+    assert any(e["event"] == "browser_context_closed_discarded" for e in store.recent_events(limit=20))
+
+
+def test_continuous_worker_recovers_loop_after_transient_error(tmp_path, monkeypatch):
+    settings, config, store, pool_store, pool = setup_runtime(tmp_path, monkeypatch)
+    calls = []
+    original = store.claim_next
+
+    def flaky(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("transient scheduler failure")
+        return original(*args, **kwargs)
+
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= 2:
+            pool_store.request_stop()
+
+    monkeypatch.setattr(store, "claim_next", flaky)
+    store.release_lease(jobs.WORKER_LEASE_NAME, "test-worker")
+    pool_store.update_run("test-run", status="stopped", finished=True)
+    result = jobs.run_job_worker(
+        settings=settings, config=config, store=store, pool_store=pool_store,
+        scraper_factory=pool.scraper_factory,
+        preflight_runner=lambda *a, **k: None, proxy_health_runner=lambda *a, **k: None,
+        sleep_fn=sleep,
+    )
+    assert len(calls) >= 2, "the loop must resume claiming jobs after the error"
+    events = [e["event"] for e in store.recent_events(limit=60)]
+    assert "worker_loop_failed" in events and "worker_loop_recovering" in events
+    assert result.status == "stopped"
+
