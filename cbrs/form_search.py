@@ -234,6 +234,13 @@ def portal_recent_searches(page):
         found = page.evaluate('''() => {
             const visible=e=>e && e.getClientRects().length>0 && getComputedStyle(e).visibility!=='hidden';
             const normalize=s=>(s||'').normalize('NFD').replace(/[\\u0300-\\u036f]/g,'').replace(/\\s+/g,' ').trim().toLowerCase();
+            // Preferred: the portal stamps every chip with a structured signature
+            // (data-firma="fna|foja|numero|ano|"); the text below is the fallback.
+            const firmas=[...document.querySelectorAll('[data-firma^="fna|"]')]
+                .map(e=>(e.getAttribute('data-firma')||'').split('|'))
+                .filter(p=>p.length>=4 && /^\d+$/.test(p[1]) && /^\d+$/.test(p[2]) && /^\d{4}$/.test(p[3]))
+                .map(p=>[Number(p[1]),Number(p[2]),Number(p[3])]);
+            if(firmas.length) return {found:true, entries:firmas, source:'data-firma'};
             const titles=[...document.querySelectorAll('h1,h2,h3,h4,h5,h6,span,p,div,button,legend')]
                 .filter(e=>visible(e) && e.children.length<=1 && normalize(e.textContent)==='recientes');
             for(const title of titles){
@@ -257,7 +264,8 @@ def portal_recent_searches(page):
         return None
     if not found or not found.get('found'):
         return None
-    return [tuple(int(value) for value in entry) for entry in found.get('entries', [])]
+    # Each chip also carries a screen-reader "Quitar ..." label: keep first occurrences only.
+    return list(dict.fromkeys(tuple(int(value) for value in entry) for entry in found.get('entries', [])))
 
 
 def portal_history_lists(page, foja, numero, ano):

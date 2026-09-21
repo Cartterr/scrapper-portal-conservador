@@ -53,11 +53,17 @@ def modal(message, *, heading="Atención", close="Cerrar"):
     )
 
 
+# Mirrors the portal markup observed on 2026-09-20: header with "Borrar historial",
+# chips with a label plus a screen-reader "Quitar ..." duplicate, and the footer note.
 RECIENTES = (
     '<div id="recientes"><div><span>Recientes</span><button>Borrar historial</button></div>'
-    "<div><button>Foja 30282 · N° 12784 · 2024</button><button>Foja 2297 · N° 1224 · 1988</button></div>"
+    '<div><div class="m3-chip-reciente"><button>Foja 30282 · N° 12784 · 2024</button>'
+    '<button><span class="sr-only">Quitar Foja 30282 · N° 12784 · 2024 de las búsquedas recientes</span>x</button></div>'
+    '<div class="m3-chip-reciente"><button>Foja 2297 · N° 1224 · 1988</button></div></div>'
     "<p>Se conservan las últimas 10 búsquedas.</p></div>"
 )
+RECIENTES_FIRMA = RECIENTES.replace('class="m3-chip-reciente"><button>Foja 30282', 'class="m3-chip-reciente" data-firma="fna|30282|12784|2024|"><button>Foja 30282').replace(
+    'class="m3-chip-reciente"><button>Foja 2297', 'class="m3-chip-reciente" data-firma="fna|2297|1224|1988|"><button>Foja 2297')
 FAIL_MESSAGE = "No se pudo realizar búsqueda, intente nuevamente por favor"
 
 
@@ -182,7 +188,9 @@ def test_recientes_panel_parsing(chrome):
     page = chrome.new_page()
     try:
         page.set_content(form(extra=RECIENTES))
-        assert portal_recent_searches(page) == [(30282, 12784, 2024), (2297, 1224, 1988)]
+        assert portal_recent_searches(page) == [(30282, 12784, 2024), (2297, 1224, 1988)]  # deduplicated
+        page.set_content(form(extra=RECIENTES_FIRMA))
+        assert portal_recent_searches(page) == [(30282, 12784, 2024), (2297, 1224, 1988)]  # data-firma path
         assert portal_history_lists(page, "2297", "1224", "1988") is True
         assert portal_history_lists(page, 1, 2, 2000) is False
         page.set_content(form())
