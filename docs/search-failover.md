@@ -41,9 +41,14 @@ historial del portal, el operador puede validar primero sin mutar y luego
 autorizar exactamente ese job para una cuenta distinta:
 
 ```bash
-.venv/bin/python deploy/resume_unconfirmed_jobs.py JOB_ID
-.venv/bin/python deploy/resume_unconfirmed_jobs.py JOB_ID --apply
+cbrs jobs reconcile JOB_ID
+cbrs jobs reconcile JOB_ID --apply
 ```
+
+(`deploy/resume_unconfirmed_jobs.py` sigue disponible y hace lo mismo; ambos
+funcionan con y sin propietario de navegador independiente.) El worker ya
+consulta «Recientes» automáticamente tras un resultado desconocido y sólo deja
+el trabajo en conciliación cuando la inscripción figura o el panel no se pudo leer.
 
 No ejecutar `--apply` si el historial muestra la búsqueda: en ese caso se debe
 recuperar el resultado/recibo existente sin repetir el POST.

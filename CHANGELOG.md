@@ -1,5 +1,40 @@
 # Cambios
 
+## 0.3.0 — informe de pruebas del 17 de septiembre, 2026-09-20
+
+- Diálogos del portal reconocidos por frase, no por oración exacta: el modal de
+  límite diario que bloquea el formulario marca la cuenta `held` sin enviar
+  otra búsqueda; un modal desconocido se registra con su título y mensaje
+  (`search_form_blocked_by_dialog`) y se cierra en vez de repetirse cada minuto (D17).
+- «No se pudo realizar búsqueda, intente nuevamente por favor» se reconoce como
+  fallo previo al registro: se cierra el modal y la búsqueda vuelve a intentarse
+  sin consumir cuota (D25).
+- Ante un resultado desconocido, el panel «Recientes» del portal decide: si la
+  inscripción no figura, el reintento es automático; si figura o el panel no
+  puede leerse, el trabajo queda en `pending_reconciliation` con el comando
+  exacto en el reporte (D22).
+- `cbrs jobs reconcile JOB_ID [--apply]` reemplaza al script de despliegue y
+  funciona con y sin propietario de navegador independiente (D26).
+- Con todas las cuentas utilizables retenidas por cuota, el trabajo espera hasta
+  la liberación más próxima (sin reclamos cada minuto) y el reporte muestra
+  `pending_quota` con `resume_at`, ignorando cuentas deshabilitadas (D16).
+- Sin pausa fija entre trabajos en instalaciones configuradas sólo por `.env`
+  (`interval_minutes` 0 por defecto) (D23).
+- La recuperación de rutas comprometidas prueba todos los candidatos configurados
+  de forma consecutiva cuando la cola está vacía; uno por pase cuando otras
+  cuentas tienen trabajo pendiente (D24).
+- SIGTERM sigue el mismo camino que Ctrl+C; el cierre del Chrome embebido tiene
+  plazo máximo y termina cualquier proceso que use los perfiles del runtime, sin
+  huérfanos. El propietario independiente conserva sus navegadores (D9).
+- El mensaje de servicio detenido indica el comando exacto del modo instalado (D12).
+- Un HTTP 404 al descargar las páginas de una búsqueda aceptada revalida el ticket
+  una vez y luego termina el trabajo como `failed` / `document_unavailable` con la
+  indicación de `--force`, en lugar de pausar la cuenta y reintentar cada dos
+  minutos de forma indefinida.
+- Integrados los cuatro cambios del mandante: rotación por CAPTCHA rechazado en
+  login y toma del lease con Chrome muerto, alias `anio`, credenciales rechazadas
+  durables y recuperación del ciclo del worker (D15, D18, D19, D20, D21).
+
 ## 0.2.0 — diálogo de error del portal como proxy comprometido, 2026-09-13
 
 - El diálogo visible `Atención / Se ha detectado un problema, refresque la

@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import socket
+import time
 from functools import wraps
+from pathlib import Path
 
 from .owner_lock import OwnerLock
 
@@ -41,34 +44,70 @@ def local_owner_is_dead(owner: str) -> bool:
     return False
 
 
-def embedded_chrome_survives(settings) -> bool:
-    """True when some live process still uses one of this runtime's account profiles.
+def chrome_pids_using_profiles(accounts_dir) -> list[int] | None:
+    """PIDs whose command line opens a Chrome profile under ``accounts_dir``.
 
-    Linux-only proof via /proc command lines; any other platform, or a scan
-    failure, answers True so browser ownership is preserved by default.
+    Linux-only proof via /proc command lines; ``None`` on any other platform or
+    scan failure so callers preserve browser ownership by default.
     """
     try:
-        accounts_dir = str((settings.profile_dir.parent / "accounts").resolve())
+        accounts = str(Path(accounts_dir).resolve())
     except Exception:
-        return True
+        return None
     proc = "/proc"
     if not os.path.isdir(proc):
-        return True
+        return None
     try:
-        pids = [name for name in os.listdir(proc) if name.isdigit()]
+        names = [name for name in os.listdir(proc) if name.isdigit()]
     except OSError:
-        return True
-    for pid in pids:
-        if int(pid) == os.getpid():
+        return None
+    pids: list[int] = []
+    for name in names:
+        pid = int(name)
+        if pid == os.getpid():
             continue
         try:
-            with open(os.path.join(proc, pid, "cmdline"), "rb") as handle:
+            with open(os.path.join(proc, name, "cmdline"), "rb") as handle:
                 cmdline = handle.read().replace(b"\0", b" ").decode("utf-8", "replace")
         except OSError:
             continue
-        if "--user-data-dir=" in cmdline and accounts_dir in cmdline:
-            return True
-    return False
+        if "--user-data-dir=" in cmdline and accounts in cmdline:
+            pids.append(pid)
+    return pids
+
+
+def embedded_chrome_survives(settings) -> bool:
+    """True when some live process still uses one of this runtime's account profiles."""
+    try:
+        accounts_dir = settings.profile_dir.parent / "accounts"
+    except Exception:
+        return True
+    pids = chrome_pids_using_profiles(accounts_dir)
+    return pids is None or bool(pids)
+
+
+def terminate_profile_chrome(accounts_dir, *, grace: float = 5.0) -> int:
+    """Stop every Chrome process using these profiles: SIGTERM, then SIGKILL (D9).
+
+    Used only at embedded-worker shutdown, where the worker owns those Chrome
+    processes; an independent owner's browsers live under a different mode and
+    are never touched. Returns how many processes were signalled.
+    """
+    pids = chrome_pids_using_profiles(accounts_dir) or []
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = time.monotonic() + max(0.0, grace)
+    while pids and time.monotonic() < deadline and chrome_pids_using_profiles(accounts_dir):
+        time.sleep(0.2)
+    for pid in chrome_pids_using_profiles(accounts_dir) or []:
+        try:
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        except (ProcessLookupError, PermissionError):
+            pass
+    return len(pids)
 
 
 def exclusive_worker(function):

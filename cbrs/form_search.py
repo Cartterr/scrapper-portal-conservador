@@ -130,30 +130,50 @@ def browser_quota_path(browser):
     return SETTINGS.profile_dir.parent / 'pool' / 'pool.sqlite3'
 
 
+# Visible portal modals. Matching is by phrase, never by an exact sentence, so
+# a trailing period, a heading variant or a second paragraph cannot hide a known
+# dialog behind the generic "form could not submit" classification (D17).
+CLOSE_BUTTON_TEXTS = ('cerrar', 'aceptar', 'entendido', 'ok', 'continuar')
+SEARCH_FAILED_DIALOG = 'search_failed_retry'
+UNKNOWN_DIALOG = 'unknown_dialog'
+
+
 def portal_dialog_evidence(page):
-    """Return only recognized modal structure; never capture unrelated page text."""
+    """Return only recognized modal structure; never capture unrelated page text.
+
+    Every visible modal with a heading and a close button is reported. Known
+    messages get their reason; anything else is ``unknown_dialog`` with its
+    heading and first line, so an unrecognized portal message is diagnosable
+    from the event log instead of surfacing as a mysterious blocked form.
+    """
+    close_texts = ', '.join(repr(text) for text in CLOSE_BUTTON_TEXTS)
     return page.evaluate('''() => {
+        const closeTexts=[''' + close_texts + '''];
         const visible=e=>e && e.getClientRects().length>0 && getComputedStyle(e).visibility!=='hidden';
         const normalize=s=>(s||'').normalize('NFD').replace(/[\\u0300-\\u036f]/g,'').replace(/\\s+/g,' ').trim().toLowerCase();
+        const clean=s=>(s||'').replace(/\\s+/g,' ').trim();
         const reasons=[];
         const panels=[...document.querySelectorAll('[id^="headlessui-dialog-panel-"][data-headlessui-state~="open"]'), ...document.querySelectorAll('[role="dialog"]')];
         for(const panel of panels){
             if(!visible(panel)) continue;
-            const heading=[...panel.querySelectorAll('h2,h3')].some(e=>visible(e)&&normalize(e.textContent)==='atencion');
-            const close=[...panel.querySelectorAll('button')].some(e=>visible(e)&&normalize(e.textContent)==='cerrar');
-            const emptyHeading=[...panel.querySelectorAll('h2,h3')].some(e=>visible(e)&&normalize(e.textContent)==='no se encontraron resultados');
-            if((!heading && !emptyHeading) || !close) continue;
+            const headingEl=[...panel.querySelectorAll('h1,h2,h3,h4')].find(visible);
+            const heading=clean(headingEl && headingEl.textContent);
+            const closeEl=[...panel.querySelectorAll('button')].find(e=>visible(e)&&closeTexts.includes(normalize(e.textContent)));
+            if(!heading || !closeEl) continue;
             const texts=[...panel.querySelectorAll('p')].filter(visible).map(e=>normalize(e.textContent));
-            let reason=null;
-            if(emptyHeading && texts.some(t=>/^no se encontraron resultados para la busqueda de texto "[^"]*"[.]?$/.test(t))) reason='empty_results';
-            else if(heading && texts.includes('se han agotado las consultas disponibles por hoy.')) reason='daily_limit';
-            else if(heading && texts.includes('se ha detectado un problema, refresque la pagina e intente nuevamente.')) reason='temporary_unavailable';
-            if(reason) reasons.push({reason, panel_selector: panel.id.startsWith('headlessui-dialog-panel-')
+            const all=texts.join(' ');
+            const nh=normalize(heading);
+            let reason='unknown_dialog';
+            if(nh==='no se encontraron resultados' && texts.some(t=>/^no se encontraron resultados para la busqueda de texto "[^"]*"[.]?$/.test(t))) reason='empty_results';
+            else if(all.includes('se han agotado las consultas') || (all.includes('consultas') && /limite (diario|de consultas)/.test(all))) reason='daily_limit';
+            else if(nh==='atencion' && all.includes('se ha detectado un problema') && all.includes('refresque')) reason='temporary_unavailable';
+            else if(/no se pudo realizar (la )?busqueda/.test(all)) reason='search_failed_retry';
+            reasons.push({reason, panel_selector: panel.id.startsWith('headlessui-dialog-panel-')
                 ? '[id^="headlessui-dialog-panel-"][data-headlessui-state~="open"]' : '[role="dialog"]',
-                panel_id: panel.id || null,
-                heading: emptyHeading ? 'No se encontraron resultados' : 'Atención', close_button: 'Cerrar', message_element: 'p'});
+                panel_id: panel.id || null, heading, close_button: clean(closeEl.textContent),
+                message_element: 'p', message: (texts[0]||'').slice(0,160)});
         }
-        return reasons.find(e=>e.reason==='daily_limit') || reasons[0] || null;
+        return reasons.find(e=>e.reason==='daily_limit') || reasons.find(e=>e.reason!=='unknown_dialog') || reasons[0] || null;
     }''')
 
 
@@ -180,24 +200,101 @@ def portal_error_dialog_stop(evidence, *, message, status=None, response_code=No
     return stop
 
 
-def dismiss_previous_empty_dialog(page):
-    """Dismiss only the recognized old empty modal; never infer this job's result."""
-    evidence = portal_dialog_evidence(page)
-    if not evidence or evidence['reason'] != 'empty_results':
-        return False
+def dismiss_dialog(page, evidence, *, timeout_ms=5000):
+    """Close only the exact recognized panel; refuse ambiguous matches."""
     selector = evidence['panel_selector']
     panel_id = evidence.get('panel_id')
     if panel_id and panel_id.startswith('headlessui-dialog-panel-') and all(c.isalnum() or c in '-_:' for c in panel_id):
         selector = '[id="' + panel_id + '"]'
     panel = page.locator(selector).filter(
-        has=page.get_by_role('heading', name='No se encontraron resultados', exact=True)
+        has=page.get_by_role('heading', name=evidence['heading'], exact=True)
     ).filter(visible=True)
-    # Refuse ambiguous matches rather than click a different dialog.
     if panel.count() != 1:
-        raise RuntimeError('Ambiguous empty-result dialog; no search submitted')
-    panel.get_by_role('button', name='Cerrar', exact=True).click(timeout=5000)
-    panel.wait_for(state='hidden', timeout=5000)
+        raise RuntimeError('Ambiguous portal dialog; nothing dismissed, no search submitted')
+    panel.get_by_role('button', name=evidence['close_button'], exact=True).click(timeout=timeout_ms)
+    panel.wait_for(state='hidden', timeout=timeout_ms)
     return True
+
+
+def dismiss_previous_empty_dialog(page):
+    """Dismiss only the recognized old empty modal; never infer this job's result."""
+    evidence = portal_dialog_evidence(page)
+    if not evidence or evidence['reason'] != 'empty_results':
+        return False
+    return dismiss_dialog(page, evidence)
+
+
+def portal_recent_searches(page):
+    """Parse the portal's own "Recientes" panel (its last 10 searches) into tuples.
+
+    Returns ``None`` when the panel is not on the page, so callers can tell
+    "not listed" from "could not check". Only foja/numero/ano triples are read.
+    """
+    try:
+        found = page.evaluate('''() => {
+            const visible=e=>e && e.getClientRects().length>0 && getComputedStyle(e).visibility!=='hidden';
+            const normalize=s=>(s||'').normalize('NFD').replace(/[\\u0300-\\u036f]/g,'').replace(/\\s+/g,' ').trim().toLowerCase();
+            const titles=[...document.querySelectorAll('h1,h2,h3,h4,h5,h6,span,p,div,button,legend')]
+                .filter(e=>visible(e) && e.children.length<=1 && normalize(e.textContent)==='recientes');
+            for(const title of titles){
+                let node=title;
+                for(let depth=0; depth<8 && node; depth++, node=node.parentElement){
+                    const text=normalize(node.innerText||node.textContent);
+                    // The panel header alone also says "Borrar historial": keep
+                    // climbing until the chips or the panel footer are included,
+                    // so an empty parse never passes for an empty history.
+                    if(!text.includes('borrar historial')) continue;
+                    const entries=[...text.matchAll(/foja\\s*(\\d+)\\s*[^\\da-z]{1,3}\\s*n[°ºo.]*\\s*(\\d+)\\s*[^\\da-z]{1,3}\\s*(\\d{4})(?!\\d)/g)]
+                        .map(m=>[Number(m[1]),Number(m[2]),Number(m[3])]);
+                    if(entries.length || text.includes('se conservan las ultimas')){
+                        return {found:true, entries};
+                    }
+                }
+            }
+            return {found:false, entries:[]};
+        }''')
+    except Exception:
+        return None
+    if not found or not found.get('found'):
+        return None
+    return [tuple(int(value) for value in entry) for entry in found.get('entries', [])]
+
+
+def portal_history_lists(page, foja, numero, ano):
+    """True/False when the Recientes panel is readable, None when it is not."""
+    entries = portal_recent_searches(page)
+    if entries is None:
+        return None
+    return (int(foja), int(numero), int(ano)) in entries
+
+
+def _history_verdict(page, values, *, evidence):
+    """Decide whether an unobserved outcome was registered by the portal.
+
+    Returns ``(listed, stop)``. ``stop`` is the retry-safe
+    ``SEARCH_NOT_SUBMITTED`` when the portal itself proves nothing was
+    registered: its "No se pudo realizar búsqueda" modal, or a readable
+    "Recientes" history that does not list the tuple (D22/D25). A listed
+    tuple, or an unreadable history without that modal, keeps the outcome
+    unknown so reconciliation stays explicit and quota is never charged twice.
+    """
+    listed = portal_history_lists(page, values['foja'], values['numero'], values['ano'])
+    failed_dialog = bool(evidence and evidence['reason'] == SEARCH_FAILED_DIALOG)
+    if failed_dialog:
+        try:
+            dismiss_dialog(page, evidence)
+        except Exception:
+            pass
+    if listed is True or (listed is None and not failed_dialog):
+        return listed, None
+    stop = SafetyStopException(
+        StopReason.SEARCH_NOT_SUBMITTED,
+        'Portal did not register the search (failure dialog and/or absent from Recientes); '
+        'no quota consumed, retry allowed',
+        context='commerce form search')
+    stop.portal_dialog = dict(evidence) if failed_dialog else None
+    stop.portal_history = listed
+    return listed, stop
 
 
 def search_fna_form(browser, foja, numero, ano, *, client, pace):
@@ -261,6 +358,17 @@ def search_fna_form(browser, foja, numero, ano, *, client, pace):
                 record_quota_hold(path, account_id)
             notify_browser_error(browser, exc)
             raise
+        if exc.reason == StopReason.SEARCH_NOT_SUBMITTED and path and hasattr(exc, 'portal_history'):
+            from .jobs import JobStore
+            JobStore(path).add_event('search_not_registered', account_id=account_id, data={
+                'portal_history_listed': exc.portal_history,
+                'failure_dialog': bool(getattr(exc, 'portal_dialog', None)),
+                'request_dispatched': bool(getattr(exc, 'request_dispatched', False)),
+                'foja': foja, 'numero': numero, 'ano': ano})
+        if exc.reason == StopReason.SEARCH_NOT_SUBMITTED and path and getattr(exc, 'blocking_dialog', None):
+            from .jobs import JobStore
+            JobStore(path).add_event('search_form_blocked_by_dialog', account_id=account_id,
+                level='warning', data=dict(exc.blocking_dialog))
         if exc.reason == StopReason.TEMPORARY_UNAVAILABLE and not getattr(exc, 'portal_dialog', None):
             # A definitive matching rejection plus its visible modal identifies
             # a compromised exit. No reload, no same-search replay: the caller
@@ -272,6 +380,13 @@ def search_fna_form(browser, foja, numero, ano, *, client, pace):
                     message='Portal error dialog after a confirmed rejection; route compromised, no replay')
                 notify_browser_error(browser, stop)
                 raise stop from exc
+        raise
+    except Exception as exc:
+        if path and hasattr(exc, 'portal_history'):
+            from .jobs import JobStore
+            JobStore(path).add_event('search_outcome_unknown_history', account_id=account_id,
+                level='warning', data={'portal_history_listed': exc.portal_history,
+                                       'foja': foja, 'numero': numero, 'ano': ano})
         raise
 
 
@@ -340,6 +455,7 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
         )
         submission_deadline = time.monotonic() + submission_timeout
         response_deadline = None
+        next_dialog_check = time.monotonic() + 1.0
         while not observed:
             if not submitted and runtime_module('runtime_observation').visible_login_gate(page):
                 raise SafetyStopException(StopReason.AUTH_REQUIRED,
@@ -354,6 +470,22 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
                         'Portal left the protected search route before dispatching the commerce request',
                         context='commerce form search',
                     )
+            if time.monotonic() >= next_dialog_check:
+                # The portal reports a failed dispatch or an exhausted quota with
+                # its own modal instead of a response we could observe.
+                next_dialog_check = time.monotonic() + 1.0
+                try:
+                    evidence = portal_dialog_evidence(page)
+                except Exception:
+                    evidence = None
+                if evidence and evidence['reason'] == 'daily_limit':
+                    raise SafetyStopException(StopReason.DAILY_LIMIT, 'Portal daily quota exhausted',
+                                              context='commerce form search')
+                if evidence and evidence['reason'] == SEARCH_FAILED_DIALOG:
+                    _listed, stop = _history_verdict(page, values, evidence=evidence)
+                    if stop is not None:
+                        stop.request_dispatched = bool(submitted)
+                        raise stop
             if submitted and response_deadline is None:
                 response_deadline = time.monotonic() + response_timeout
             if not submitted and time.monotonic() >= submission_deadline:
@@ -390,6 +522,9 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
         if not isinstance(result, list) or not all(isinstance(row, dict) for row in result):
             raise RuntimeError("Search response did not contain a result list")
         return result
+    except SafetyStopException as exc:
+        notify_browser_error(browser, exc)
+        raise
     except Exception as exc:
         if not submitted and runtime_module('runtime_observation').visible_login_gate(page):
             auth = SafetyStopException(StopReason.AUTH_REQUIRED,
@@ -397,25 +532,47 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
             notify_browser_error(browser, auth)
             raise auth from exc
         notify_browser_error(browser, exc)
-        if not submitted and not clicked and not isinstance(exc, SafetyStopException):
+        try:
+            evidence = portal_dialog_evidence(page)
+        except Exception:
+            evidence = None
+        if not submitted and not clicked:
             # The dialog can open between the pre-submission check and the
             # first keystroke. It then blocks the React-controlled inputs and
-            # the field read-back fails. Nothing was submitted, so attribute
-            # the failure to the exit that produced the dialog rather than
-            # handing the same bad route another query later.
-            try:
-                evidence = portal_dialog_evidence(page)
-            except Exception:
-                evidence = None
+            # the field read-back fails. Nothing was submitted, so classify by
+            # the modal that blocked the form instead of handing the same
+            # route another query later (D17).
             if evidence and evidence['reason'] == PORTAL_ERROR_DIALOG:
                 stop = portal_error_dialog_stop(evidence, after_submission=False,
                     message='Portal error dialog blocked the search form; route compromised, nothing submitted')
                 notify_browser_error(browser, stop)
                 raise stop from exc
-            raise SafetyStopException(StopReason.SEARCH_NOT_SUBMITTED,
+            if evidence and evidence['reason'] == 'daily_limit':
+                raise SafetyStopException(StopReason.DAILY_LIMIT,
+                    'Portal daily-limit dialog blocked the search form; nothing submitted',
+                    context='commerce form search') from exc
+            if evidence and evidence['close_button'].strip().lower() == 'cerrar':
+                # A retryable or unrecognized portal modal: close it so the route
+                # is usable on the next pass, and report what blocked the form.
+                try:
+                    dismiss_dialog(page, evidence)
+                except Exception:
+                    pass
+            stop = SafetyStopException(StopReason.SEARCH_NOT_SUBMITTED,
                 'Form could not submit a commerce request; alternate account required',
-                context='commerce form search') from exc
-        # In particular, a timeout never causes another click or API replay.
+                context='commerce form search')
+            stop.blocking_dialog = dict(evidence) if evidence else None
+            raise stop from exc
+        # Clicked (and maybe dispatched) with no observable outcome. The portal's
+        # own history decides: absent means nothing was registered and the job
+        # may continue elsewhere; listed or unreadable keeps the outcome unknown
+        # for explicit reconciliation. A timeout never causes another click or
+        # API replay.
+        listed, stop = _history_verdict(page, values, evidence=evidence)
+        if stop is not None:
+            stop.request_dispatched = bool(submitted)
+            raise stop from exc
+        exc.portal_history = listed
         raise
     finally:
         page.remove_listener('request', request_sent)

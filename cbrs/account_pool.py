@@ -37,7 +37,9 @@ DEFAULT_ACCOUNT_POOL_CONFIG = ".cbrs/runtime/account-pool.json"
 # unverified historical contract assumption of 20; deployments may override it
 # only with an account-specific confirmed allowance.
 DEFAULT_DAILY_QUOTA_PER_ACCOUNT = 8
-DEFAULT_INTERVAL_MINUTES = 5.0
+# No fixed pause between jobs: request pacing already separates portal calls,
+# and idling five minutes per PDF while accounts have quota violates R1/R5 (D23).
+DEFAULT_INTERVAL_MINUTES = 0.0
 DEFAULT_DASHBOARD_HOST = "127.0.0.1"
 DEFAULT_DASHBOARD_PORT = 8765
 DEFAULT_TARGET_LABEL = "default_safe_query"

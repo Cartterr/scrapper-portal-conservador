@@ -75,7 +75,7 @@ def modal(message, hidden=False):
     ('Se han agotado las consultas disponibles por hoy.', False, 'daily_limit'),
     ('Se ha detectado un problema, refresque la página e intente nuevamente.', False, 'temporary_unavailable'),
     ('Se han agotado las consultas disponibles por hoy.', True, None),
-    ('Un mensaje diferente', False, None),
+    ('Un mensaje diferente', False, 'unknown_dialog'),  # reported, never acted on
 ])
 def test_visible_modal_signature(test_chrome, message, hidden, expected):
     page = test_chrome.new_page()

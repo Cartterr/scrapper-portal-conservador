@@ -83,6 +83,27 @@ def finish_for_review(store, job_id, reason):
             store._add_event_db(db,job_id,'document_retry_pending' if reason == 'document_retrieval_deferred' else 'job_requires_review',{'reason':reason,'replayed':False})
     return bool(changed)
 
+def _all_accounts_quota_held(store, pool_store, run_id, config, quota_policy):
+    """Earliest hold release when every usable account is portal-held, else None.
+
+    Accounts disabled by rejected credentials never come back on their own, so
+    they do not count; one account with capacity (or a probe already due) means
+    the job must keep flowing instead of waiting on the quota clock.
+    """
+    states = {str(row['account_id']): dict(row) for row in pool_store.accounts(run_id)}
+    releases = []
+    for account in config.accounts:
+        if not account.enabled:
+            continue
+        if states.get(account.account_id, {}).get('paused_reason') == 'credentials_invalid':
+            continue
+        hold = quota_policy.quota_hold(store.path, account.account_id)
+        if not (hold and hold.get('blocked')):
+            return None
+        releases.append(str(hold['next_check_at']))
+    return min(releases) if releases else None
+
+
 def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobStore, pool_store: AccountPoolStore, run_id: str, browser_pool: _PersistentAccountBrowsers, preflight_runner: Callable[..., Any], proxy_health_runner: Callable[..., Any], endurance_plan: Any | None=None) -> str:
     target_account_id = str(job.input.get('target_account_id') or '') if job.source == 'captcha_validation' else ''
     excluded: set[str] = {account.account_id for account in config.accounts if account.account_id != target_account_id} if target_account_id else set()
@@ -174,6 +195,15 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                 # Do not monopolize the one endurance slot while its original
                 # account cannot retrieve documents. Keep its accepted receipt.
                 return store.get_job(job.job_id)['status']
+            resume = None if checkpoint['saved'] else _all_accounts_quota_held(store, pool_store, run_id, config, quota_policy)
+            if resume:
+                # Every usable account is held by the portal's daily limit: wait
+                # for the earliest release instead of re-claiming every minute,
+                # and say so in the job itself so reports show pending_quota (D16/D17).
+                store.set_waiting(job.job_id, 'waiting_capacity', reason='portal_quota_exhausted', next_run_at=resume)
+                pool_store.update_run(run_id, status='waiting_capacity', next_cycle_at=resume,
+                                      blocked_reason='portal_quota_exhausted')
+                return 'waiting_capacity'
             if target_account_id:
                 target_state = next((str(row['status']) for row in pool_store.accounts(run_id) if str(row['account_id']) == target_account_id), 'paused')
                 status = 'waiting_captcha' if target_state == core.CAPTCHA_PENDING_STATUS else 'waiting_capacity'
@@ -269,6 +299,13 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                         store.complete_item(str(item['item_id']), expected_pages=page_count, output_path=final_path, sha256=sha256, bytes_count=size)
                     except core.SafetyStopException:
                         raise
+                    except core.DocumentUnavailable as exc:
+                        # A definitive portal answer for this receipt, not an account
+                        # or route condition: no pause and no endless document retry
+                        # (one 2026-09-14 job looped 1,872 times on HTTP 404).
+                        store.add_event('document_unavailable', job_id=job.job_id, account_id=account.account_id,
+                                        level='error', data={'http_status': 404, 'item_id': str(item['item_id'])})
+                        store.fail_item(str(item['item_id']), code='document_unavailable', message=str(exc))
                     except Exception as exc:
                         core.capture_error(store, account.account_id, getattr(scraper, 'browser', scraper), exc)
                         if core._looks_like_connection_failure(exc):
@@ -276,7 +313,15 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                         store.fail_item(str(item['item_id']), code='download_failed', message=str(exc))
                 if attempt_id:
                     store.finish_attempt(attempt_id, status='completed')
-                if any(i['status'] != 'completed' for i in store.items(job.job_id, public=False)):
+                remaining = store.items(job.job_id, public=False)
+                if any(i['status'] != 'completed' for i in remaining):
+                    if any(i['status'] == 'failed' and i.get('error_code') == 'document_unavailable' for i in remaining):
+                        status = store.finalize_job(job.job_id)
+                        if status == 'failed':
+                            store.fail_job(job.job_id, code='document_unavailable',
+                                message='El portal ya no entrega las páginas de esta inscripción (HTTP 404). '
+                                        'Repita con --force para una búsqueda nueva.')
+                        return status
                     if finish_for_review(store, job.job_id, 'document_retrieval_deferred'):
                         return store.get_job(job.job_id)['status']
                 return store.finalize_job(job.job_id)

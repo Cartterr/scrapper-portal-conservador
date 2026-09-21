@@ -105,7 +105,11 @@ real y recuperación completa en el portal.
 
    El lote espera por defecto hasta resultados terminales o cuota agotada en
    todas las cuentas. Puede limitar la espera con `--timeout 900`; las filas
-   restantes quedan `pending`. `--no-wait` devuelve los IDs inmediatamente
+   restantes quedan `pending`. Una fila `pending_reconciliation` es una búsqueda
+   enviada sin resultado confirmado: el reporte trae el comando exacto
+   (`cbrs jobs reconcile JOB_ID --apply`) para autorizar otra cuenta después de
+   comprobar en «Recientes» del portal que la inscripción no quedó registrada.
+   `--no-wait` devuelve los IDs inmediatamente
    después de encolar. El reporte es una foto del estado al salir: vuelva a
    ejecutar el comando para actualizarlo y copiar los PDFs que terminaron
    después. No se repiten búsquedas aceptadas. No hay un límite de 100 filas
@@ -167,7 +171,11 @@ Con Python 3.11+ y Chrome ya instalados: cree `.venv`, instale
 `.venv/bin/cbrs jobs worker`; el cliente puede ejecutarse desde otra terminal.
 Este modo conserva la propiedad de Chrome dentro del worker y no tiene las
 garantías de separación del servicio con propietario independiente. No use
-`pkill chrome` para resolver errores ni sobre sesiones productivas.
+`pkill chrome` para resolver errores ni sobre sesiones productivas. Ctrl+C o
+SIGTERM detienen el worker en menos de 30 segundos y cierran el Chrome que
+abrió; las sesiones autenticadas persisten en el perfil y se reutilizan al
+volver a arrancar. No hay pausa fija entre trabajos: `interval_minutes` es 0
+por defecto y sólo `CBRS_REQUEST_DELAY_SECONDS` separa las peticiones.
 
 Los eventos del worker aparecen en stderr y en `.cbrs/runtime/logs/worker.log`
 (rotación de 5 MB, tres copias). El log emite nombres de eventos, cuenta y
@@ -175,7 +183,9 @@ códigos de motivo; los detalles permanecen en SQLite. En systemd también puede
 usar los comandos de logs anteriores.
 
 Los valores actuales por defecto son 10 candidatos por recuperación y 30
-rotaciones por hora. Si un `.env` anterior fija 1 y 3, esos valores siguen
+rotaciones por hora; con la cola vacía, una ruta comprometida prueba sus
+candidatos de forma consecutiva y, con trabajos pendientes en otras cuentas, uno
+por pase para no bloquearlos. Si un `.env` anterior fija 1 y 3, esos valores siguen
 teniendo prioridad: revise `CBRS_DATAIMPULSE_CANDIDATES_PER_RECOVERY` y
 `CBRS_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR`. No se eliminan los presupuestos.
 La recuperación de login con candidatos sigue limitada a los IDs explícitos
@@ -185,11 +195,12 @@ de `CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS` y a evidencia visible de rechazo.
 
 | Síntoma | Acción |
 |---|---|
-| Servicio no disponible | Con systemd: `cbrs service start worker`, luego `cbrs service logs`; sin systemd: `cbrs jobs worker` en otra terminal. |
+| Servicio no disponible | El mensaje indica el comando exacto según la instalación: `cbrs service start worker` con systemd, `cbrs jobs worker` en otra terminal sin systemd. |
 | Campos faltantes | `cbrs config validate`; completar sólo las claves indicadas en `.env`. |
 | CSV inválido | Corregir encabezado, codificación o la línea indicada; las filas inválidas constan en el reporte. |
 | `pending_quota` | Consultar `resume_at`; el servicio revisará la cuota sin reenviar el lote. La hora es una estimación. |
-| `pending` por login, proxy o conciliación | Revisar `cbrs status` y logs; conservar las sesiones autenticadas. Una búsqueda de resultado ambiguo requiere conciliar el historial antes de autorizar otro intento. |
+| `pending` por login o proxy | Revisar `cbrs status` y logs; conservar las sesiones autenticadas. El servicio reintenta solo. |
+| `pending_reconciliation` | Búsqueda enviada sin resultado confirmado. El servicio ya consultó «Recientes» en el portal: si la inscripción hubiera faltado habría reintentado solo. Revise «Recientes» de esa cuenta: si la inscripción no figura, `cbrs jobs reconcile JOB_ID --apply`; si figura, la cuota se consumió y el resultado debe recuperarse a mano. |
 
 CLI: `get` retorna 0 con PDF, 1 sin PDF y 2 por argumentos/servicio. Batch
 retorna 0 si todas las filas son `done`/`not_found`, 1 si alguna es pendiente o

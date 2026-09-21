@@ -7,6 +7,7 @@ import os
 import random
 import re
 import secrets
+import signal
 import socket
 import sqlite3
 import threading
@@ -1230,6 +1231,17 @@ class JobStore:
             self._add_event_db(db, str(row["job_id"]), "job_claimed", {})
             return _row_to_job(claimed)
 
+    def has_claimable_job(self) -> bool:
+        """True when some job could be claimed right now; paces route recovery."""
+        placeholders = ",".join("?" for _ in CLAIMABLE_JOB_STATES)
+        with self.connect() as db:
+            row = db.execute(
+                f"SELECT 1 FROM jobs WHERE status IN ({placeholders}) AND cancel_requested = 0 "
+                "AND (next_run_at IS NULL OR next_run_at <= ?) LIMIT 1",
+                (*CLAIMABLE_JOB_STATES, utc_now()),
+            ).fetchone()
+            return row is not None
+
     def heartbeat_job(self, job_id: str, owner: str, *, lease_seconds: int = JOB_LEASE_SECONDS) -> None:
         with self.connect() as db:
             db.execute(
@@ -1403,6 +1415,46 @@ class JobStore:
                 self._add_event_db(db, job_id, 'alternate_search_authorized',
                     {'same_account_retry': False, 'uncertainty_retained': True})
             return True
+
+    def reconcile_unconfirmed(self, job_id: str, *, apply: bool,
+                              owner_commands_path: Path | None = None) -> dict[str, Any]:
+        """Preview or apply an operator-confirmed retry of one unconfirmed search.
+
+        Works without the independent browser owner: its command ledger is
+        consulted only when it exists (D26). ``apply`` authorizes a single
+        alternate-account retry and requeues the job; attempts, evidence and
+        the quota reservation of the uncertain attempt are all retained.
+        """
+        job = self.get_job(job_id)
+        historical = bool(job and job["status"] == "failed"
+                          and job["error_code"] == "search_outcome_unknown")
+        awaiting = bool(job and job["status"] == "waiting_capacity"
+                        and job["error_code"] == "search_reconciliation_required")
+        if not historical and not awaiting:
+            raise ValueError("Only named unconfirmed jobs awaiting explicit reconciliation can be resumed")
+        if owner_commands_path is not None and Path(owner_commands_path).exists():
+            with sqlite3.connect(f"{Path(owner_commands_path).as_uri()}?mode=ro", uri=True) as db:
+                if db.execute("SELECT 1 FROM owner_commands WHERE job_id=? AND state IN ('queued','running')",
+                              (job_id,)).fetchone():
+                    raise RuntimeError("Existing owner command must finish first")
+        applied = False
+        if apply:
+            if not self.authorize_alternate_search(job_id):
+                raise RuntimeError("Receipt, cancellation or live operation prevents retry")
+            with self.connect() as db:
+                changed = db.execute("""UPDATE jobs SET status='queued', finished_at=NULL,
+                    error_code=NULL, error_message=NULL, next_run_at=?, updated_at=?,
+                    worker_owner=NULL, lease_expires_at=NULL, current_account_id=NULL
+                    WHERE job_id=? AND result_count IS NULL AND cancel_requested=0
+                      AND ((status='failed' AND error_code='search_outcome_unknown')
+                        OR (status='waiting_capacity' AND error_code='search_reconciliation_required'))""",
+                    (utc_now(), utc_now(), job_id)).rowcount
+                if changed:
+                    self._add_event_db(db, job_id, "uncertain_job_reconciled",
+                                       {"policy": "alternate_account_only", "attempt_history_preserved": True})
+                applied = bool(changed)
+        return {"job_id": job_id, "eligible": True, "prior_status": job["status"],
+                "prior_reason": job["error_code"], "applied": applied}
 
     def add_results(
         self, job_id: str, results: list[dict[str, Any]], *, attempt_id: str | None = None,
@@ -1977,14 +2029,20 @@ class JobStore:
             ).fetchone()
             return dict(row) if row else None
 
-    def set_waiting(self, job_id: str, status: str, *, reason: str) -> None:
+    def set_waiting(self, job_id: str, status: str, *, reason: str,
+                    next_run_at: str | None = None) -> None:
         if status not in {"queued", "waiting_capacity", "waiting_captcha"}:
             raise ValueError(f"invalid waiting status: {status}")
-        next_run_at = (
-            _utc_after(60)
-            if status == "waiting_capacity"
-            else _utc_after(30) if status == "waiting_captcha" else None
-        )
+        if next_run_at is None:
+            # An unconfirmed search changes only when an operator or the portal
+            # history check acts on it; re-claiming it every minute merely floods
+            # the log (D17/D22). Other waits keep the short cadence unless the
+            # caller supplies the real resume time (portal quota release).
+            next_run_at = (
+                _utc_after(600) if reason == "search_reconciliation_required"
+                else _utc_after(60) if status == "waiting_capacity"
+                else _utc_after(30) if status == "waiting_captcha" else None
+            )
         with self.connect() as db:
             db.execute(
                 """
@@ -3252,6 +3310,39 @@ def validate_pdf(path: Path, *, expected_pages: int) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+class DocumentUnavailable(RuntimeError):
+    """The portal no longer serves the pages of an accepted search (HTTP 404)."""
+
+
+def _document_gone(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, SafetyStopException)
+        and exc.reason is StopReason.UNEXPECTED_STATUS
+        and exc.status == 404
+        and exc.context in {"image download", "image reference lookup", "ticket validation"}
+    )
+
+
+def _document_refs(scraper: Any, ticket: str, manifest: Path, *, sample_pages: int | None,
+                   refresh: bool) -> tuple[list[dict[str, Any]], bool]:
+    """Return ``(refs, cached)``; a cached manifest is reused unless refreshed."""
+    if not refresh and manifest.exists():
+        try:
+            cached = json.loads(manifest.read_text(encoding="utf-8"))
+            if cached.get("ticket") == str(ticket) and cached.get("sample_pages") == sample_pages:
+                return cached["refs"], True
+        except (ValueError, KeyError):
+            pass
+    _ticket_info, refs = scraper.get_image_refs(str(ticket))
+    if sample_pages is not None:
+        refs = refs[:sample_pages]
+    manifest_tmp = manifest.with_suffix(".tmp")
+    manifest_tmp.write_text(json.dumps({"ticket": str(ticket), "sample_pages": sample_pages, "refs": refs}),
+                            encoding="utf-8")
+    os.replace(manifest_tmp, manifest)
+    return refs, False
+
+
 def download_job_item(
     scraper: Any,
     item: Mapping[str, Any],
@@ -3270,32 +3361,40 @@ def download_job_item(
     job_dir = output_root / "jobs" / job_id
     image_dir = job_dir / ".staging" / str(item["item_id"])
     final_path = job_dir / f"{stem}.pdf"
-    temp_path = job_dir / f".{stem}.{secrets.token_hex(4)}.tmp"
     job_dir.mkdir(parents=True, exist_ok=True)
     image_dir.mkdir(parents=True, exist_ok=True)
-
     manifest = image_dir / "manifest.json"
-    refs = None
-    if manifest.exists():
+    refresh = False
+    cached = False
+    while True:
         try:
-            cached = json.loads(manifest.read_text(encoding="utf-8"))
-            if cached.get("ticket") == str(ticket) and cached.get("sample_pages") == sample_pages:
-                refs = cached["refs"]
-        except (ValueError, KeyError):
-            pass
-    if refs is None:
-        _ticket_info, refs = scraper.get_image_refs(str(ticket))
-        if sample_pages is not None:
-            refs = refs[:sample_pages]
-        manifest_tmp = manifest.with_suffix('.tmp')
-        manifest_tmp.write_text(json.dumps({'ticket': str(ticket), 'sample_pages': sample_pages, 'refs': refs}), encoding='utf-8')
-        os.replace(manifest_tmp, manifest)
-    if not refs:
-        raise RuntimeError("No image references returned for this inscription.")
-    if sample_pages is not None:
-        refs = refs[:sample_pages]
-    if on_expected_pages:
-        on_expected_pages(len(refs))
+            refs, cached = _document_refs(scraper, str(ticket), manifest, sample_pages=sample_pages,
+                                          refresh=refresh)
+            if not refs:
+                raise RuntimeError("No image references returned for this inscription.")
+            if sample_pages is not None:
+                refs = refs[:sample_pages]
+            if on_expected_pages:
+                on_expected_pages(len(refs))
+            return _assemble_document(scraper, refs, image_dir=image_dir, final_path=final_path,
+                                      stem=stem, job_dir=job_dir)
+        except SafetyStopException as exc:
+            if not _document_gone(exc):
+                raise
+            if cached and not refresh:
+                # Cached page references can outlive the portal's own copies.
+                # Re-validate the ticket once before declaring the document gone.
+                refresh = True
+                continue
+            raise DocumentUnavailable(
+                "El portal respondió HTTP 404 para las páginas de esta inscripción; la búsqueda "
+                "aceptada ya no puede materializarse. Repita con --force para una búsqueda nueva."
+            ) from exc
+
+
+def _assemble_document(scraper: Any, refs: list[dict[str, Any]], *, image_dir: Path,
+                       final_path: Path, stem: str, job_dir: Path) -> tuple[Path, int, str, int]:
+    temp_path = job_dir / f".{stem}.{secrets.token_hex(4)}.tmp"
     images: list[Path] = []
     try:
         for ref in refs:
@@ -3312,7 +3411,7 @@ def download_job_item(
                 except (OSError, ValueError):
                     pass
             if not valid:
-                pending = image_path.with_suffix('.download.jpg')
+                pending = image_path.with_suffix(".download.jpg")
                 scraper.download_image(data_ref, pending)
                 with Image.open(pending) as image:
                     image.verify()
@@ -3379,6 +3478,9 @@ def run_job_worker(
                                   store_path=store.path, commands_path=command_path(settings))
     if not store.acquire_lease(WORKER_LEASE_NAME, worker_id):
         raise RuntimeError("Another CBRS job worker has an active lease.")
+    # D9: SIGTERM takes the same graceful path as Ctrl+C, so an embedded Chrome
+    # is closed instead of orphaned when the service or terminal stops the worker.
+    previous_sigterm = _install_terminate_handler()
 
     run_id: str | None = None
     processed = 0
@@ -3628,7 +3730,8 @@ def run_job_worker(
             sleep_fn(5)
         final_status = "stopped"
     finally:
-        browser_pool.close_all(service_shutdown=True)
+        _shutdown_browser_pool(browser_pool, settings, owner_mode)
+        _restore_terminate_handler(previous_sigterm)
         if updates is not None:
             updates.close()
         heartbeat_stop.set()
@@ -3643,6 +3746,59 @@ def run_job_worker(
             )
         store.release_lease(WORKER_LEASE_NAME, worker_id)
     return WorkerResult(exit_code, worker_id, run_id, final_status, processed)
+
+
+SHUTDOWN_DEADLINE_SECONDS = 20.0
+
+
+def _install_terminate_handler() -> Any:
+    """Route SIGTERM into KeyboardInterrupt on the main thread; return the old handler."""
+    if threading.current_thread() is not threading.main_thread():
+        return None
+
+    def _terminate(signum, frame):  # noqa: ARG001 - signal handler signature
+        raise KeyboardInterrupt
+
+    try:
+        return signal.signal(signal.SIGTERM, _terminate)
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def _restore_terminate_handler(previous: Any) -> None:
+    if previous is None or threading.current_thread() is not threading.main_thread():
+        return
+    try:
+        signal.signal(signal.SIGTERM, previous)
+    except (ValueError, OSError, TypeError):
+        pass
+
+
+def _shutdown_browser_pool(browser_pool: _PersistentAccountBrowsers, settings: Settings,
+                           owner_mode: str, *, deadline: float = SHUTDOWN_DEADLINE_SECONDS) -> None:
+    """Close embedded Chrome within a bounded time and never leave orphans (D9).
+
+    The graceful Playwright close runs first. If it has not returned within
+    ``deadline`` seconds (a dead proxy or a wedged renderer can stall it), the
+    Chrome processes that use this runtime's account profiles are terminated,
+    which also makes the pending close return. An independent owner keeps its
+    Chrome: the worker never touches profiles it does not own.
+    """
+    from .worker_lock import terminate_profile_chrome
+    accounts_dir = settings.profile_dir.parent / "accounts"
+    embedded = owner_mode != "external"
+    watchdog = None
+    if embedded:
+        watchdog = threading.Timer(deadline, terminate_profile_chrome, args=(accounts_dir,))
+        watchdog.daemon = True
+        watchdog.start()
+    try:
+        browser_pool.close_all(service_shutdown=True)
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+        if embedded:
+            terminate_profile_chrome(accounts_dir)
 
 
 def _process_claimed_job(*args, **kwargs):
@@ -4534,6 +4690,7 @@ def _recover_compromised_route(
     proxy_health_runner: Callable[..., Any],
     *,
     reason: str = PROXY_COMPROMISED_RECOVERY_REASON,
+    candidates_per_pass: int = COMPROMISED_RECOVERY_CANDIDATES_PER_PASS,
 ) -> bool:
     """Ditch the compromised browser and adopt a proven replacement exit.
 
@@ -4560,11 +4717,12 @@ def _recover_compromised_route(
             )
             return False
     failure = None
-    # One candidate per pass. The route's own pacing (candidate retry delay,
-    # rotation cooldown, hourly allowance) still governs how often this runs.
+    # ``candidates_per_pass`` candidates back to back: one while other accounts
+    # have queued work, the full configured batch when the queue is idle (D24).
+    # The route's own pacing (candidate retry delay, hourly allowance) applies.
     paced = replace(
         settings,
-        dataimpulse_candidates_per_recovery=COMPROMISED_RECOVERY_CANDIDATES_PER_PASS,
+        dataimpulse_candidates_per_recovery=max(1, int(candidates_per_pass or 1)),
     )
     try:
         recovered = _rotate_dataimpulse_route(
@@ -4658,6 +4816,19 @@ def _recover_compromised_routes(
         return 0
     accounts = {account.account_id: account for account in config.accounts if account.enabled}
     now = utc_now()
+    # One candidate per pass while a queued search could run on a healthy
+    # account (it must not wait behind a candidate sweep on the shared browser
+    # owner). When nothing else can run, prove the whole configured batch back
+    # to back instead of one candidate per pass (D24).
+    healthy = [acct for acct in accounts.values() if acct.account_id not in quarantined]
+    states = {str(row["account_id"]): str(row["status"]) for row in pool_store.accounts(run_id)}
+    queue_busy = store.has_claimable_job() and any(
+        states.get(acct.account_id) == "available" for acct in healthy
+    )
+    per_pass = (
+        COMPROMISED_RECOVERY_CANDIDATES_PER_PASS if queue_busy
+        else max(1, int(getattr(settings, "dataimpulse_candidates_per_recovery", 1) or 1))
+    )
     for account_id in quarantined:
         account = accounts.get(account_id)
         if account is None:
@@ -4670,7 +4841,7 @@ def _recover_compromised_routes(
         try:
             return int(_recover_compromised_route(
                 account, settings, store, pool_store, run_id, browser_pool,
-                preflight_runner, proxy_health_runner,
+                preflight_runner, proxy_health_runner, candidates_per_pass=per_pass,
             ))
         except Exception:
             return 0  # quarantine stands; the next pass retries

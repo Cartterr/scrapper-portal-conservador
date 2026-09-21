@@ -92,7 +92,7 @@ def test_invalid_inscription_does_not_enqueue(client, value):
 def test_unavailable_fails_before_enqueue_even_for_cache(client, tmp_path):
     complete(client, tmp_path)
     client._db.store.release_lease(WORKER_LEASE_NAME, "offline-test")
-    with pytest.raises(ServiceUnavailable, match="cbrs service start worker"):
+    with pytest.raises(ServiceUnavailable, match=r"cbrs (service start|jobs) worker"):
         client.get(fojas=12, numero=34, ano=2020)
     assert client._db.store.summary()["counts"] == {"completed": 1}
 
@@ -193,7 +193,8 @@ def test_cli_result_contracts(client, tmp_path, monkeypatch, capsys):
     assert capsys.readouterr().out.strip() == str(tmp_path / "original.pdf")
     client._db.store.release_lease(WORKER_LEASE_NAME, "offline-test")
     assert main(["get", "--fojas", "12", "--numero", "34", "--ano", "2020"]) == 2
-    assert "cbrs service start worker" in capsys.readouterr().err
+    from cbrs.api import service_start_hint
+    assert service_start_hint() in capsys.readouterr().err
 
 
 def test_batch_cli_mixed_outcomes_and_repeat(client, tmp_path, monkeypatch, capsys):

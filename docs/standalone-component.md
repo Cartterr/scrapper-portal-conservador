@@ -50,7 +50,7 @@ conserva la reserva y el scheduler exige reconciliación explícita antes de
 autorizar otra cuenta.
 
 Tras confirmar en el historial del portal que el primer POST no fue aceptado,
-usar `deploy/resume_unconfirmed_jobs.py JOB_ID` como validación de solo lectura y
+usar `cbrs jobs reconcile JOB_ID` como validación de solo lectura y
 repetir con `--apply` para autorizar una única cuenta distinta. Nunca aplicar la
 autorización si la inscripción ya figura en el historial.
 

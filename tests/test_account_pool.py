@@ -32,7 +32,7 @@ def test_pool_config_defaults_to_three_nominal_accounts(tmp_path: Path) -> None:
     ]
     assert config.daily_quota_per_account == 8
     assert config.pool_daily_quota == 24
-    assert config.interval_minutes == 5
+    assert config.interval_minutes == 0
     assert config.allow_live_repetition is False
     assert (
         account_settings(settings, config.accounts[0]).profile_dir

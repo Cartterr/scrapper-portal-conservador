@@ -7,7 +7,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from .api import Client, DownloadFailed, InvalidInscription, ServiceUnavailable
+from .api import Client, DownloadFailed, InvalidInscription, ServiceUnavailable, service_start_hint
 
 
 class PublicArgumentParser(argparse.ArgumentParser):
@@ -46,8 +46,7 @@ def run(args) -> int:
             if args.json:
                 print(json.dumps(data, ensure_ascii=False, default=str))
             else:
-                print("Servicio: " + ("arriba" if data["service"] else
-                      "abajo; con systemd: cbrs service start worker; sin systemd: cbrs jobs worker"))
+                print("Servicio: " + ("arriba" if data["service"] else "abajo; ejecute: " + service_start_hint()))
                 for account in data["accounts"]:
                     print(f"{account['account']}: {account['status']} | cupos estimados {account['remaining_estimated']} | "
                           f"proxy {account['proxy']} | reanudación {account['resume_at'] or '-'} | error {account['error'] or '-'}")
@@ -70,7 +69,8 @@ def run(args) -> int:
         results = client.get_batch(args.input, output_dir=args.output, report=args.report,
                                    no_wait=args.no_wait, timeout=args.timeout)
         counts = Counter(result.status for result in results)
-        summary = {key: counts[key] for key in ("done", "not_found", "pending_quota", "pending", "failed")}
+        summary = {key: counts[key] for key in ("done", "not_found", "pending_quota", "pending_reconciliation",
+                                                "pending", "failed")}
         summary.update(total=len(results), report=str(args.report.resolve()),
                        job_ids=[result.job_id for result in results],
                        resume_at=min((result.resume_at for result in results if result.resume_at), default=None))

@@ -829,6 +829,12 @@ def cmd_jobs(args: argparse.Namespace) -> int:
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get("ok") else 1
+    if args.jobs_command == "reconcile":
+        from .owner_protocol import command_path
+        for job_id in args.job_ids:
+            print(json.dumps(store.reconcile_unconfirmed(
+                job_id, apply=args.apply, owner_commands_path=command_path(config.SETTINGS)), ensure_ascii=False))
+        return 0
     if args.jobs_command == "recover":
         payload = {
             "expired_worker_lease_cleared": store.clear_expired_lease(),
@@ -1546,6 +1552,16 @@ def build_parser() -> argparse.ArgumentParser:
     jobs_cancel = jobs_subparsers.add_parser("cancel", help="Cancel a queued or active job")
     jobs_cancel.add_argument("job_id")
     jobs_cancel.add_argument("--config", default=None, help=argparse.SUPPRESS)
+    jobs_reconcile = jobs_subparsers.add_parser(
+        "reconcile",
+        help="Preview or authorize the retry of an unconfirmed search after checking the portal history",
+    )
+    jobs_reconcile.add_argument("job_ids", nargs="+")
+    jobs_reconcile.add_argument(
+        "--apply", action="store_true",
+        help="Authorize one alternate-account retry; only when 'Recientes' shows the search was NOT registered",
+    )
+    jobs_reconcile.add_argument("--config", default=None, help=argparse.SUPPRESS)
     jobs_status = jobs_subparsers.add_parser("status", help="Show queue and worker status")
     jobs_status.add_argument("--config", default=None, help=argparse.SUPPRESS)
     jobs_recover = jobs_subparsers.add_parser(

@@ -31,6 +31,16 @@ class DownloadFailed(RuntimeError):
     """Raised for local output errors or by Result.raise_for_status."""
 
 
+SYSTEMD_UNIT = Path("/etc/systemd/system/cbrs-worker.service")
+
+
+def service_start_hint() -> str:
+    """The exact start command for this installation's execution mode (D12)."""
+    if SYSTEMD_UNIT.exists():
+        return "cbrs service start worker"
+    return "cbrs jobs worker (en otra terminal)"
+
+
 @dataclass
 class Result:
     """One inscription outcome; pending results retain their durable job_id."""
@@ -137,10 +147,7 @@ class _LocalBackend:
 
     def check(self) -> None:
         if self.store is None or not self.store.active_lease():
-            raise ServiceUnavailable(
-                "Servicio no disponible. Con systemd: cbrs service start worker. "
-                "Sin systemd: cbrs jobs worker (en otra terminal)."
-            )
+            raise ServiceUnavailable(f"Servicio no disponible. Ejecute: {service_start_hint()}")
 
     def status(self) -> dict[str, Any]:
         if self.store is None:
@@ -237,7 +244,7 @@ class _LocalBackend:
 
     def job(self, job_id: str) -> dict[str, Any]:
         if self.store is None:
-            raise ServiceUnavailable("Servicio no disponible. Ejecute: cbrs service start worker")
+            raise ServiceUnavailable(f"Servicio no disponible. Ejecute: {service_start_hint()}")
         job = self.store.get_job(job_id)
         if job is None:
             raise InvalidInscription("job_id desconocido")
@@ -302,11 +309,23 @@ class Client:
                 result.status, result.error = "failed", "PDF registrado ausente o inválido; requiere recuperación del documento."
         elif job["status"] in {"failed", "partial", "cancelled"}:
             result.status = "failed"
+        elif job.get("error_code") == "search_reconciliation_required":
+            # The single click may have reached the portal and its history lists
+            # the tuple (or could not be read): quota may be spent, so only an
+            # operator authorizes another account. Say so, with the exact command.
+            unknown = next((a.get("account_id") for a in reversed(job.get("attempts") or [])
+                            if a.get("reason") == "search_outcome_unknown" or a.get("status") == "failed"), None)
+            result.status = "pending_reconciliation"
+            result.error = (f"Búsqueda enviada sin resultado confirmado en {unknown or 'la cuenta'}; revise "
+                            "'Recientes' en el portal y, si la inscripción no figura, ejecute: "
+                            f"cbrs jobs reconcile {job['job_id']} --apply")
         else:
             accounts = self.status()["accounts"]
-            if accounts and all(account.get("portal_quota") for account in accounts):
+            usable = [a for a in accounts if a.get("status") != "disabled"]
+            held = [a for a in usable if a.get("portal_quota") or a.get("status") == "held"]
+            if job.get("error_code") == "portal_quota_exhausted" or (usable and len(held) == len(usable)):
                 result.status = "pending_quota"
-                dates = [account["resume_at"] for account in accounts if account.get("resume_at")]
+                dates = [a["resume_at"] for a in held if a.get("resume_at")]
                 result.resume_at = min(dates) if dates else None
                 result.error = "Todas las cuentas tienen cuota del portal agotada."
         return result
