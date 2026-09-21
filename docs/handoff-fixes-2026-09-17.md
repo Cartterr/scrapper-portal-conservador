@@ -37,7 +37,10 @@ tenía referencias de página en caché y el portal respondía HTTP 404 al
 descargarlas; cada intento pausaba la cuenta dos minutos y volvía a encolarse.
 Ahora un 404 en la descarga del documento revalida el ticket una vez (descarta
 las referencias en caché) y, si persiste, termina el trabajo como `failed` con
-`document_unavailable` y la indicación de `--force`, sin pausar la cuenta.
+`document_unavailable` y la indicación de `--force`, sin pausar la cuenta. En
+producción la revalidación bastó: las referencias en caché eran las caducas y el
+trabajo terminó `completed` con su PDF de cinco páginas a los cinco minutos del
+despliegue.
 
 ## Comportamiento nuevo visible para el operador
 
@@ -60,7 +63,21 @@ Windows, Python 3.14.3: 609 pruebas pasaron, 4 omitidas (la terminación por
 de la tabla y el bucle del 404. Los diálogos y el panel «Recientes» se prueban
 con Chrome real sobre HTML local que reproduce la estructura observada en las
 capturas del servicio (`headlessui-dialog-panel`, `Atención` / `Cerrar`, chips
-`Foja X · N° Y · Z`, «Se conservan las últimas 10 búsquedas»).
+`Foja X · N° Y · Z` con su atributo `data-firma="fna|foja|numero|ano|"`,
+«Se conservan las últimas 10 búsquedas»).
+
+Linux (servicio WSL Ubuntu 24.04, Python 3.14.6, despliegue autorizado del 20 de
+septiembre): `tests/test_informe_2026_09_17.py` más las regresiones del mandante,
+93 pruebas pasaron, incluida la terminación de procesos por `/proc`. Comprobado
+en vivo sobre la página real, con el propietario detenido: el panel «Recientes»
+lo sirve `/api/v1/user/recientes/clave/indice_com_recientes` (historial del
+servidor, no del navegador) y el lector devolvió sus diez entradas. Los tres
+trabajos en conciliación desde el 14 de septiembre no figuraban en el historial de
+`ejecutivo_2`; se autorizaron con `cbrs jobs reconcile --apply` y terminaron
+`completed` con PDF en otras cuentas en menos de seis minutos. En ese intervalo
+`ejecutivo_1` mostró el diálogo de error del portal y la ruta se reemplazó por un
+puerto nuevo con formulario autenticado en 50 segundos. Cola vacía al cierre:
+81 trabajos completados, ninguno en espera.
 
 ## Límites que siguen vigentes
 
