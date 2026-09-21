@@ -3315,11 +3315,16 @@ class DocumentUnavailable(RuntimeError):
 
 
 def _document_gone(exc: BaseException) -> bool:
+    """HTTP 404 from the ticket/page requests of an accepted search.
+
+    Only those requests run inside ``download_job_item``, so the status alone
+    identifies the case; the independent browser owner relays its own context
+    label, which must not hide it.
+    """
     return (
         isinstance(exc, SafetyStopException)
         and exc.reason is StopReason.UNEXPECTED_STATUS
         and exc.status == 404
-        and exc.context in {"image download", "image reference lookup", "ticket validation"}
     )
 
 

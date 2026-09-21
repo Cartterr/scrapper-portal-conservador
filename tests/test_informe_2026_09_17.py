@@ -336,6 +336,15 @@ def test_document_404_revalidates_cached_refs_once_then_fails_terminally(tmp_pat
     with pytest.raises(DocumentUnavailable):
         download_job_item(_TicketGone(), item, job_id="job-1", output_root=tmp_path)
 
+    class _RelayedByOwner(_GoneScraper):
+        def download_image(self, ref, path):
+            # The independent owner relays the stop under its own context label.
+            raise SafetyStopException(StopReason.UNEXPECTED_STATUS, "Browser owner reported a portal failure",
+                                      status=404, context="browser owner")
+    (staging / "manifest.json").unlink(missing_ok=True)
+    with pytest.raises(DocumentUnavailable):
+        download_job_item(_RelayedByOwner(), item, job_id="job-1", output_root=tmp_path)
+
 
 def test_document_unavailable_job_is_terminal_and_not_requeued(tmp_path, monkeypatch):
     settings, config, store, _ = runtime(tmp_path)

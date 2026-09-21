@@ -12,6 +12,14 @@ from .browser_session import CommerceAuthState, CredentialsRejectedError
 from .safety import SafetyStopException
 
 
+# Portal-operation labels the owner relays verbatim so the worker can tell a
+# login failure from a document page that is gone; anything else is "browser owner".
+RELAYED_CONTEXTS = frozenset({
+    "auth login", "auth navigation", "form search", "commerce form search",
+    "ticket validation", "image reference lookup", "image download",
+})
+
+
 class BrowserOwner:
     def __init__(self, settings, config, store, *, scraper_factory=None):
         from .jobs import _PersistentAccountBrowsers
@@ -172,7 +180,7 @@ class BrowserOwner:
                         pass  # Evidence failure must not strand the command.
                 error = {"reason": exc.reason.value, "status": exc.status,
                          "route_compromised": is_portal_error_dialog(exc),
-                         "context": exc.context if exc.context in {"auth login", "auth navigation", "form search"} else "browser owner"} if isinstance(exc, SafetyStopException) else {"reason": "credentials_invalid" if isinstance(exc, CredentialsRejectedError) else "owner_operation_failed"}
+                         "context": exc.context if exc.context in RELAYED_CONTEXTS else "browser owner"} if isinstance(exc, SafetyStopException) else {"reason": "credentials_invalid" if isinstance(exc, CredentialsRejectedError) else "owner_operation_failed"}
                 if isinstance(exc, (SafetyStopException, CredentialsRejectedError)):
                     from .safety import sanitized_portal_response_code
                     error["status"] = exc.status
