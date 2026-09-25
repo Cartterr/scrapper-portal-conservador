@@ -165,8 +165,9 @@ las dos cuentas sin perfil:
 
 Ningún PDF y ninguna cuota consumida. Al comprobarlo a mano en Firefox, el
 portal muestra «Usuario dado de baja» para `ejecutivo_3`: el 401 era real y el
-servicio lo clasificó bien. La última vez que es seguro que la cuenta
-funcionaba es el 22-09 a las 23:07 (sección 8). Se quitó de `.env` y de
+servicio lo clasificó bien. Su última búsqueda aceptada fue el 22-09 a las
+23:07, y el servidor todavía aceptaba su sesión el 24-09 a las 16:07
+(sección 8). Se quitó de `.env` y de
 `account-pool.json`; queda sólo `ejecutivo_2`.
 
 Actividad de la cuenta el 24, antes de la baja, como contexto y sin atribuir
@@ -230,15 +231,26 @@ Ninguna de las pruebas manuales del 24 (sección 6.2) usó `ejecutivo_3`.
 | 22-09 23:06:43 | Ruta 18325 promovida con `authenticated_form: true` | Sí |
 | 22-09 23:06:49 | PDF obtenido: décima búsqueda aceptada del día | **Sí: última certeza** |
 | 22-09 23:07:19 | El portal respondió `daily_limit` a una búsqueda autenticada | Sí |
-| 23-09 22:39:40 | Diálogo «No se pudo realizar búsqueda»; se leyó «Recientes» (historial del servidor por usuario) | Probable, no seguro |
-| 24-09 11:08:25 | Búsqueda headless: `temporary_unavailable` (HTTP 400) | No concluyente |
-| 24-09 16:07:59 | Búsqueda headful: `captcha_rejected`; diálogo de error; perfil borrado | No concluyente |
+| 23-09 22:39:40 | Diálogo «No se pudo realizar búsqueda». La captura muestra la sesión iniciada y «Recientes» cargado | Sesión aceptada por el servidor |
+| 24-09 11:08:25 | Búsqueda headless: HTTP 400, diálogo «Problemas obteniendo índice de comercio, intente más tarde.» La captura muestra la sesión iniciada y «Recientes» cargado | Sesión aceptada por el servidor |
+| 24-09 16:07:59 | Búsqueda headful: `captcha_rejected`, diálogo de error y perfil borrado. La captura muestra la sesión iniciada y «Recientes» cargado | Sesión aceptada por el servidor |
 | 24-09 19:36:10 | Candidato 10491: `captcha-rechazado` en el login | No concluyente |
 | 24-09 19:37:00 | Candidato 14435: HTTP 401 `auth-exception` | **Primera evidencia de baja** |
 | 24-09 ~20:00 | Firefox manual: «Usuario dado de baja» | Confirmado |
 
-La baja ocurrió entre el 22-09 a las 23:07 y el 24-09 a las 19:37;
-probablemente después del 23-09 a las 22:39.
+Las capturas de error del 23 y del 24 (en el paquete de evidencia) muestran el
+encabezado con el usuario conectado y el panel «Recientes», que el portal sirve
+desde `/api/v1/user/recientes`. Las páginas se cargaron después de arrancar
+Chrome, así que el servidor aceptó la sesión de `ejecutivo_3` el 24 a las 11:08
+y a las 16:07. O la baja ocurrió entre las 16:08 y las 19:37 del 24, o una baja
+anterior no invalida las sesiones ya abiertas y sólo se nota en un login nuevo.
+El desarrollador o el portal pueden saber cuál de las dos.
+
+«Recientes» muestra las mismas diez búsquedas el 23 a las 22:39 y el 24 a las
+11:08 y 16:07: ninguna búsqueda quedó registrada para la cuenta después del 22.
+En una captura del 22 a las 22:37, antes del lote, el panel ya listaba
+búsquedas que esta máquina nunca hizo (por ejemplo `70523/41124/2015`): la
+cuenta también se usó en otra instalación antes del 22.
 
 ### 8.3 Observaciones para buscar el patrón
 
