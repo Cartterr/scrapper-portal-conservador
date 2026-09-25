@@ -137,6 +137,13 @@ def _request_status(
             **(headers or {}),
         },
     )
+    status, detail = _send(settings, request)
+    from . import request_log
+    request_log.record_outside_browser(settings, url, method, status, client="proxy_health")
+    return status, detail
+
+
+def _send(settings: Settings, request: Request) -> tuple[int | None, str]:
     opener = _proxy_opener(settings.proxy_url)
     open_fn = opener.open if opener else urlopen
     try:

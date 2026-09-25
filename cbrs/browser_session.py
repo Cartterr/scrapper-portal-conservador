@@ -193,7 +193,7 @@ class BrowserSession:
                 raise
             try:
                 from . import request_log
-                request_log.attach(self._context, self.settings)
+                request_log.attach(self._context, self.settings, headless=self.headless)
             except Exception:
                 logger.warning("Portal request log unavailable for this context", exc_info=True)
             return self

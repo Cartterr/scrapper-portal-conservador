@@ -112,12 +112,21 @@ la cuenta cae. Lo proponemos como siguiente paso si el mandante lo considera
 Hasta ahora el servicio registraba eventos, no peticiones, y por eso nadie pudo
 contar qué pidió `ejecutivo_3` antes de la baja. Desde este cambio, cada
 contexto de Chrome (worker, propietario externo y candidatos de ruta) agrega una
-línea por cada carga de página y llamada a `*.conservador.cl` en
-`.cbrs/runtime/logs/requests/<cuenta>/<fecha UTC>.jsonl`: hora, método, ruta,
-tipo y estado HTTP (o `failed`). Nunca se guardan parámetros de consulta,
+línea por cada carga de página y llamada a `*.conservador.cl` y a reCAPTCHA
+(scripts, marcos y verificaciones de Google, que son lo que ve el puntaje
+anti-bot del portal) en `.cbrs/runtime/logs/requests/<cuenta>/<fecha UTC>.jsonl`:
+hora, método, ruta, tipo, estado HTTP (o `failed`) y la sesión que la hizo
+(perfil, puerto del proxy y modo headless o headful). También se registra la
+comprobación de salud del proxy, que llama al portal fuera de Chrome por la
+misma salida (`client: proxy_health`). Nunca se guardan parámetros de consulta,
 encabezados, cookies ni cuerpos, y los segmentos largos de la ruta (tickets,
 tokens) se enmascaran como `:id`. Son archivos planos, no la base de trabajos,
 para no competir con sus escrituras.
+
+Límites: registra lo que envía esta instalación, no lo que hacen otras
+personas o instalaciones con la misma cuenta, ni por qué el portal decide una
+baja. La IP exacta de cada petición tampoco queda: sólo el puerto; la salida
+real por sesión figura en los informes de preflight.
 
 Para contar por endpoint en una ventana (horas UTC):
 

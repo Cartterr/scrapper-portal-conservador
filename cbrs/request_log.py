@@ -15,12 +15,16 @@ import re
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 PORTAL_HOST_SUFFIX = "conservador.cl"
-# Page loads and API calls; static assets would only add noise.
-RECORDED_TYPES = frozenset({"document", "xhr", "fetch", "other"})
+RECAPTCHA_HOST_SUFFIXES = ("google.com", "gstatic.com", "recaptcha.net")
+# Page loads and API calls; static assets would only add noise. reCAPTCHA also
+# keeps its scripts and frames: they are what the portal's bot scoring sees.
+RECORDED_TYPES = frozenset({"document", "xhr", "fetch", "other", "health"})
+RECAPTCHA_TYPES = RECORDED_TYPES | {"script"}
 _OPAQUE_SEGMENT = re.compile(r"^[A-Za-z0-9_\-.=+%]{24,}$")
 
 
@@ -34,16 +38,31 @@ def request_log_dir(settings: Any) -> Path:
 
 # ponytail: files are never pruned (roughly 1 MB per account per month); add a
 # retention sweep if the log directory ever matters for disk space.
-def record(directory: Path, request: Any, status: int | str, *, now: datetime | None = None) -> None:
-    if request.resource_type not in RECORDED_TYPES:
-        return
+def _recorded(host: str, path: str, resource_type: str) -> bool:
+    if host.endswith(PORTAL_HOST_SUFFIX):
+        return resource_type in RECORDED_TYPES
+    return "/recaptcha/" in path and host.endswith(RECAPTCHA_HOST_SUFFIXES) and resource_type in RECAPTCHA_TYPES
+
+
+def session_of(settings: Any, *, headless: bool | None, client: str = "chrome") -> dict:
+    """Which browser/route made the request: profile, proxy port and mode."""
+    proxy = getattr(settings, "proxy_url", None)
+    try:
+        port = urlsplit(proxy).port if proxy else None
+    except ValueError:
+        port = None
+    return {"client": client, "profile": Path(settings.profile_dir).name, "port": port, "headless": headless}
+
+
+def record(directory: Path, request: Any, status: int | str, *, now: datetime | None = None,
+           session: dict | None = None) -> None:
     parts = urlsplit(request.url)
-    if not (parts.hostname or "").endswith(PORTAL_HOST_SUFFIX):
+    if not _recorded(parts.hostname or "", parts.path, request.resource_type):
         return
     now = now or datetime.now(timezone.utc)
     line = json.dumps({"at": now.isoformat(timespec="milliseconds"), "method": request.method,
                        "host": parts.hostname, "path": redact_path(parts.path),
-                       "type": request.resource_type, "status": status})
+                       "type": request.resource_type, "status": status, **(session or {})})
     try:
         directory.mkdir(parents=True, exist_ok=True)
         with (directory / f"{now:%Y-%m-%d}.jsonl").open("a", encoding="utf-8") as stream:
@@ -52,11 +71,17 @@ def record(directory: Path, request: Any, status: int | str, *, now: datetime | 
         pass  # Evidence must never break a portal operation.
 
 
-def attach(context: Any, settings: Any) -> None:
-    """Record every portal request of this context (responses and failures)."""
-    directory = request_log_dir(settings)
-    context.on("response", lambda response: record(directory, response.request, response.status))
-    context.on("requestfailed", lambda request: record(directory, request, "failed"))
+def attach(context: Any, settings: Any, *, headless: bool | None = None) -> None:
+    """Record every portal and reCAPTCHA request of this context (responses and failures)."""
+    directory, session = request_log_dir(settings), session_of(settings, headless=headless)
+    context.on("response", lambda response: record(directory, response.request, response.status, session=session))
+    context.on("requestfailed", lambda request: record(directory, request, "failed", session=session))
+
+
+def record_outside_browser(settings: Any, url: str, method: str, status: int | None, *, client: str) -> None:
+    """Portal calls made without Chrome (proxy health) through the account's exit."""
+    record(request_log_dir(settings), SimpleNamespace(url=url, method=method, resource_type="health"),
+           status if status is not None else "failed", session=session_of(settings, headless=None, client=client))
 
 
 def read(settings: Any, account_id: str, *, since: str | None = None, until: str | None = None) -> Iterable[dict]:
