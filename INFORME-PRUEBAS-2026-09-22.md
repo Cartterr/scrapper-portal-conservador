@@ -6,7 +6,7 @@ Base probada: `master` en `5e9183d`, sin cambios locales de código. Máquina:
 Ubuntu nativo, sin systemd, `cbrs jobs worker` en primer plano, Chrome visible.
 
 **Resultado global: las correcciones del 17 funcionan en vivo.** D9, D16, D17,
-D22, D23 y D24 se observaron con tráfico real y se comportaron como se
+D22, D23, D24 y D25 se observaron con tráfico real y se comportaron como se
 describe. A11 también pasa: el trabajo retenido por cuota terminó solo al día
 siguiente. Quedan dos defectos menores (D27, D28).
 
@@ -48,9 +48,10 @@ cuenta activa. Además, SIGINT cuelga el worker durante una recuperación de rut
 | D17 | Pasa | `ejecutivo_2` (23:01:14) y `ejecutivo_3` (23:07:19) recibieron `daily_limit`: cuota liberada, `portal_quota_exhausted`, cuenta `held` en menos de 1 s y el trabajo pasó a la otra cuenta. Ningún bucle: sin líneas nuevas en el log entre 23:07 y 22:36 del día siguiente. El diálogo «Se han agotado las consultas disponibles por hoy» quedó visible en ambas ventanas, sin efecto. |
 | D16 | Pasa, con D27 | La última fila queda `pending_quota` con «Todas las cuentas tienen cuota del portal agotada». `get-batch` terminó con código 1 e imprimió `resume_at=2026-09-24T01:36:51+00:00`. El trabajo espera con `next_run_at` sin reclamos cada minuto. |
 | D24 | Pasa | Cuatro reemplazos de ruta comprometida: 78 s, ~3 min, ~5 min y 1 min 44 s. Los candidatos se prueban con 1 o 2 minutos de separación, no 5. |
-| D22 | Pasa | 23-09 22:39:40, `ejecutivo_3`: `search_not_submitted` → lectura de «Recientes» → `search_not_registered`, cuota liberada y reintento automático, sin conciliación manual. |
+| D22 | Pasa | 23-09 22:39:40, `ejecutivo_3`: `search_not_submitted` → lectura de «Recientes» → `search_not_registered` (`portal_history_listed: false`), cuota liberada y reintento automático, sin conciliación manual. |
+| D25 | Pasa | Mismo evento: `failure_dialog: true`, es decir, el portal mostró «No se pudo realizar búsqueda». El diálogo se reconoció y se cerró, y la búsqueda se trató como no registrada. |
 | D9 | Pasa | SIGINT: el worker salió en 1,0 s. SIGTERM: salió en 1,0 s. En los dos casos no quedó ningún proceso de Chrome con perfiles de `.cbrs/runtime`. Al reiniciar, las cuentas conservaron `held`. |
-| D25, D26 | No observadas | El portal no mostró «No se pudo realizar búsqueda» ni hubo filas `pending_reconciliation`. |
+| D26 | No observada | No hubo filas `pending_reconciliation`. |
 | A11 | Pasa, con D28 | Ver sección 5. |
 
 ## 3. Datos de la jornada
@@ -164,8 +165,9 @@ las dos cuentas sin perfil:
 
 Ningún PDF y ninguna cuota consumida. Al comprobarlo a mano en Firefox, el
 portal muestra «Usuario dado de baja» para `ejecutivo_3`: el 401 era real y el
-servicio lo clasificó bien. A las 16:08 esa cuenta todavía tenía sesión. Se
-quitó de `.env` y de `account-pool.json`; queda sólo `ejecutivo_2`.
+servicio lo clasificó bien. La última vez que es seguro que la cuenta
+funcionaba es el 22-09 a las 23:07 (sección 8). Se quitó de `.env` y de
+`account-pool.json`; queda sólo `ejecutivo_2`.
 
 Actividad de la cuenta el 24, antes de la baja, como contexto y sin atribuir
 causa: sesión headless detectada, unos seis logins desde IP distintas de
@@ -200,3 +202,78 @@ D7).
    muchas IP distintas en poco tiempo, puede provocarlas, y fijar un tope de
    logins por cuenta y por día. Hasta tener una respuesta, conviene limitar la
    rotación automática en la única cuenta activa.
+
+## 8. Caso `ejecutivo_3`: cronología completa
+
+Pedido al desarrollador: **escribir toda la información que tenga de este caso**
+(y del de `ejecutivo_1`): qué hizo la cuenta en su instalación y en la
+producción WSL, desde qué rutas, en qué modo y con qué resultado. Esta máquina
+sólo ve su propia actividad; la cuenta también se usó en las pruebas del 16 y
+el 17 y en la producción del desarrollador.
+
+Fuente: `pool.sqlite3` y `worker.log` de esta máquina. Horas locales (UTC−3).
+Ninguna de las pruebas manuales del 24 (sección 6.2) usó `ejecutivo_3`.
+
+### 8.1 Actividad por día en esta máquina
+
+| Día (UTC, cupo) | Intentos de búsqueda | Aceptadas | Rutas y candidatos | Diálogos de error | Perfiles borrados |
+|---|---|---|---|---|---|
+| 10/11-09 (prueba de estrés) | 21 | 7 | ruta fija 15215 | – | – |
+| 22-09 (lote del informe) | 13 | 10 | 2 promovidos (17959, 18325), 2 rechazados (18761 CAPTCHA, 17844 `auth_required`) | 3 | 2 |
+| 23-09 | 1 (no enviada, D25) | 0 | – | – | – |
+| 24-09 | 2 | 0 | 2 rechazados (10491 CAPTCHA, 14435 **401**) | 2 | 1 |
+
+### 8.2 Cuándo funcionaba con certeza
+
+| Hora local | Evento | ¿Prueba que la cuenta funcionaba? |
+|---|---|---|
+| 22-09 23:06:43 | Ruta 18325 promovida con `authenticated_form: true` | Sí |
+| 22-09 23:06:49 | PDF obtenido: décima búsqueda aceptada del día | **Sí: última certeza** |
+| 22-09 23:07:19 | El portal respondió `daily_limit` a una búsqueda autenticada | Sí |
+| 23-09 22:39:40 | Diálogo «No se pudo realizar búsqueda»; se leyó «Recientes» (historial del servidor por usuario) | Probable, no seguro |
+| 24-09 11:08:25 | Búsqueda headless: `temporary_unavailable` (HTTP 400) | No concluyente |
+| 24-09 16:07:59 | Búsqueda headful: `captcha_rejected`; diálogo de error; perfil borrado | No concluyente |
+| 24-09 19:36:10 | Candidato 10491: `captcha-rechazado` en el login | No concluyente |
+| 24-09 19:37:00 | Candidato 14435: HTTP 401 `auth-exception` | **Primera evidencia de baja** |
+| 24-09 ~20:00 | Firefox manual: «Usuario dado de baja» | Confirmado |
+
+La baja ocurrió entre el 22-09 a las 23:07 y el 24-09 a las 19:37;
+probablemente después del 23-09 a las 22:39.
+
+### 8.3 Observaciones para buscar el patrón
+
+- Cada diálogo de error borra el perfil autenticado y obliga a un login nuevo
+  desde otra IP (D30). El 22 y el 24, `ejecutivo_3` inició sesión desde al
+  menos 6 salidas distintas de DataImpulse.
+- La sesión headless del 24 a las 11:07 fue la primera de la cuenta en ese
+  modo; el portal la rechaza (sección 6.2).
+- El 24 a las 11:08, `ejecutivo_2` probó el puerto candidato 15215, que fue la
+  ruta de `ejecutivo_3` hasta el 22. Con una sesión sticky viva, dos cuentas
+  podrían haber salido por la misma IP. El servicio guarda sólo el hash de la
+  salida, así que desde aquí no se puede confirmar.
+- `ejecutivo_2`, que sigue activa, tuvo más rotaciones que `ejecutivo_3` en el
+  mismo período (13 intentos de candidato contra 6), más cuatro búsquedas
+  manuales. El volumen de rotación por sí solo no explica la diferencia.
+- El perfil autenticado de la ventana de la baja ya no existe: el servicio lo
+  borró el 24 a las 16:08. Quedan sólo los perfiles de candidatos 18761, 17844,
+  10491 y 14435, casi todos de logins fallidos.
+- El servicio registra eventos (login, búsqueda, CAPTCHA, diálogo), no cada
+  petición HTTP. Para analizar patrones de peticiones haría falta un registro
+  por petición (método, ruta, estado, hora y cuenta), sin cuerpos ni tokens.
+
+### 8.4 Paquete de evidencia
+
+Se entrega por separado, fuera del repositorio, un paquete saneado para
+`ejecutivo_2` y `ejecutivo_3`:
+
+- todas las filas de `pool.sqlite3` de cada cuenta, en JSON y CSV;
+- una cronología combinada de eventos, intentos y candidatos de ruta;
+- `worker.log` e informes de preflight y salud de proxy;
+- líneas base de salida (país y hash);
+- capturas de error vinculadas a cada cuenta;
+- el historial de navegación (URL y hora) de los perfiles que quedan.
+
+Se excluyen cookies, tokens, caché y almacenamiento de los perfiles,
+credenciales de cuentas y de proxy, el hash de credenciales rechazadas y los
+correos. Si el análisis necesita los perfiles completos, pedirlos
+directamente al operador.
