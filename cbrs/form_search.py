@@ -116,6 +116,23 @@ def admit_quota_check(path, account_id, *, now=None):
         return True
 
 
+# Stops that end a due probe before the portal said anything about quota: a
+# rejected CAPTCHA, an unsent search, a lost login or a compromised route (D28).
+PROBE_UNANSWERED = frozenset({StopReason.AUTH_REQUIRED, StopReason.SEARCH_NOT_SUBMITTED,
+    StopReason.CAPTCHA_REJECTED, StopReason.CAPTCHA_SOLVER, StopReason.TEMPORARY_UNAVAILABLE})
+
+
+def restore_quota_check(path, account_id, previous_hold):
+    """Give back a due probe's admission without overwriting a newer check."""
+    if not previous_hold or previous_hold['blocked']:
+        return
+    with quota_db(path) as db:
+        db.execute('UPDATE portal_quota_holds SET next_check_at=?,probe_count=? '
+            'WHERE account_id=? AND probe_count=?',
+            (previous_hold['next_check_at'], previous_hold['probe_count'],
+             account_id, previous_hold['probe_count'] + 1))
+
+
 def clear_quota_hold(path, account_id):
     with quota_db(path) as db:
         db.execute('DELETE FROM portal_quota_holds WHERE account_id=?', (account_id,))
@@ -238,7 +255,7 @@ def portal_recent_searches(page):
             // (data-firma="fna|foja|numero|ano|"); the text below is the fallback.
             const firmas=[...document.querySelectorAll('[data-firma^="fna|"]')]
                 .map(e=>(e.getAttribute('data-firma')||'').split('|'))
-                .filter(p=>p.length>=4 && /^\d+$/.test(p[1]) && /^\d+$/.test(p[2]) && /^\d{4}$/.test(p[3]))
+                .filter(p=>p.length>=4 && /^\\d+$/.test(p[1]) && /^\\d+$/.test(p[2]) && /^\\d{4}$/.test(p[3]))
                 .map(p=>[Number(p[1]),Number(p[2]),Number(p[3])]);
             if(firmas.length) return {found:true, entries:firmas, source:'data-firma'};
             const titles=[...document.querySelectorAll('h1,h2,h3,h4,h5,h6,span,p,div,button,legend')]
@@ -315,36 +332,36 @@ def search_fna_form(browser, foja, numero, ano, *, client, pace):
     previous_hold = quota_hold(path, account_id) if path else None
     if path and not admit_quota_check(path, account_id):
         raise SafetyStopException(StopReason.DAILY_LIMIT, 'Portal quota hold remains active', context='commerce form search')
-    initial = portal_dialog_evidence(browser.page)
-    if initial and initial['reason'] == 'empty_results':
-        # This predates our submission and belongs to a previous query. The
-        # portal uses the literal text "null" even for tuple searches.
-        from .jobs import JobStore
-        try:
-            dismiss_previous_empty_dialog(browser.page)
-        except Exception as exc:
-            if path:
-                JobStore(path).add_event('previous_empty_dialog_dismiss_failed', account_id=account_id,
-                    data={'error_type': type(exc).__name__})
-            raise
-        if path:
-            JobStore(path).add_event('previous_empty_dialog_dismissed', account_id=account_id,
-                data={'panel_selector': initial['panel_selector'], 'panel_id': initial.get('panel_id'),
-                      'new_search_result_inferred': False})
-    if initial and initial['reason'] == PORTAL_ERROR_DIALOG:
-        # The portal error dialog is already open on this route. It is never
-        # refreshed away: the exit is compromised and another account must take
-        # this search while the route is replaced.
-        stop = portal_error_dialog_stop(initial, after_submission=False,
-            message='Portal error dialog visible before submission; route compromised, no search submitted')
-        notify_browser_error(browser, stop)
-        raise stop
     due_probe = bool(previous_hold and not previous_hold['blocked'])
-    if due_probe:
-        # A due probe has its own atomic hourly admission; render a fresh page
-        # so yesterday's daily-limit modal cannot mask the outcome.
-        browser.page.reload(wait_until='domcontentloaded', timeout=60000)
     try:
+        initial = portal_dialog_evidence(browser.page)
+        if initial and initial['reason'] == 'empty_results':
+            # This predates our submission and belongs to a previous query. The
+            # portal uses the literal text "null" even for tuple searches.
+            from .jobs import JobStore
+            try:
+                dismiss_previous_empty_dialog(browser.page)
+            except Exception as exc:
+                if path:
+                    JobStore(path).add_event('previous_empty_dialog_dismiss_failed', account_id=account_id,
+                        data={'error_type': type(exc).__name__})
+                raise
+            if path:
+                JobStore(path).add_event('previous_empty_dialog_dismissed', account_id=account_id,
+                    data={'panel_selector': initial['panel_selector'], 'panel_id': initial.get('panel_id'),
+                          'new_search_result_inferred': False})
+        if initial and initial['reason'] == PORTAL_ERROR_DIALOG:
+            # The portal error dialog is already open on this route. It is never
+            # refreshed away: the exit is compromised and another account must take
+            # this search while the route is replaced.
+            stop = portal_error_dialog_stop(initial, after_submission=False,
+                message='Portal error dialog visible before submission; route compromised, no search submitted')
+            notify_browser_error(browser, stop)
+            raise stop
+        if due_probe:
+            # A due probe has its own atomic hourly admission; render a fresh page
+            # so yesterday's daily-limit modal cannot mask the outcome.
+            browser.page.reload(wait_until='domcontentloaded', timeout=60000)
         if portal_dialog_reason(browser.page) == 'daily_limit':
             raise SafetyStopException(StopReason.DAILY_LIMIT, 'Portal daily quota exhausted', context='commerce form search')
         result = _search_fna_once(browser, foja, numero, ano, client=client, pace=pace)
@@ -352,15 +369,8 @@ def search_fna_form(browser, foja, numero, ano, *, client, pace):
             clear_quota_hold(path, account_id)
         return result
     except SafetyStopException as exc:
-        if exc.reason == StopReason.AUTH_REQUIRED and due_probe and path:
-            # Admission reserved a probe, but the refreshed page never
-            # submitted it. Preserve the historical hold and restore its
-            # eligibility, without overwriting a newer concurrent check.
-            with quota_db(path) as db:
-                db.execute('UPDATE portal_quota_holds SET next_check_at=?,probe_count=? '
-                    'WHERE account_id=? AND probe_count=?',
-                    (previous_hold['next_check_at'], previous_hold['probe_count'],
-                     account_id, previous_hold['probe_count'] + 1))
+        if exc.reason in PROBE_UNANSWERED and due_probe and path:
+            restore_quota_check(path, account_id, previous_hold)
         if exc.reason == StopReason.DAILY_LIMIT:
             if path:
                 record_quota_hold(path, account_id)

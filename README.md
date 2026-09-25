@@ -79,8 +79,10 @@ Startup, creación de sesiones y candidatos validan esta política; una ruta a
 otro ejecutable se rechaza antes de lanzar el navegador.
 
 `CBRS_BROWSER_BACKEND=chrome` y `CBRS_BROWSER_EXECUTABLE_PATH` deben apuntar a
-Google Chrome instalado. `CBRS_HEADLESS=1` sigue siendo el valor por defecto;
-`0` habilita una ventana visible. Los éxitos diagnósticos recientes en modo
+Google Chrome instalado. El valor por defecto es `CBRS_HEADLESS=0` (ventana
+visible): el portal rechaza el reCAPTCHA de búsqueda de Chrome headless
+(`captcha-rechazado`, pruebas del 2026-09-24). En Linux sin pantalla, la forma
+soportada es headful sobre Xvfb (`deploy/cbrs-display.service`, `DISPLAY=:99`). Los éxitos diagnósticos recientes en modo
 visible no prueban estabilidad indefinida ni se transfieren automáticamente al
 worker. No cerrar una sesión aceptada para cambiar su modo: activar cambios que
 requieren reiniciar sólo con autorización explícita de reinicio de TODO el servicio.

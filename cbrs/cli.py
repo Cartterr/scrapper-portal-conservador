@@ -813,6 +813,9 @@ def cmd_jobs(args: argparse.Namespace) -> int:
     from .endurance import EnduranceController, load_endurance_plan
     from .jobs import IdempotencyConflictError, default_job_store, run_job_worker
 
+    if args.jobs_command == "worker" and _runtime_headless(args):
+        print(config.HEADLESS_UNSUPPORTED, file=sys.stderr)
+        return 2
     store = default_job_store(config.SETTINGS)
     if args.jobs_command == "backup":
         from .backup import run_backup

@@ -25,7 +25,17 @@ DEFAULT_RECAPTCHA_SITEKEY = "6Le-eiksAAAAANU-0ITcjxvGfFoHsz40juvUVI_-"
 MIN_SAFE_DELAY_SECONDS = 3.5
 DEFAULT_REQUEST_DELAY_SECONDS = 5.0
 DEFAULT_BROWSER_BACKEND = "chrome"
-DEFAULT_HEADLESS = True
+# The portal rejects the search reCAPTCHA of headless Chrome (D29, 2026-09-24);
+# run headed, on Xvfb when no screen is available.
+DEFAULT_HEADLESS = False
+# D30: the rejection also shows the portal error dialog, which the service reads
+# as a compromised exit and answers by deleting profiles and rotating routes.
+HEADLESS_UNSUPPORTED = (
+    "Chrome headless no es compatible con el portal: rechaza el reCAPTCHA de "
+    "búsqueda (captcha-rechazado) y el diálogo de error resultante se tomaría como "
+    "ruta comprometida. Use CBRS_HEADLESS=0; en Linux sin pantalla, sobre Xvfb "
+    "(DISPLAY=:99, deploy/cbrs-display.service)."
+)
 DEFAULT_WINDOW_MODE = "normal"
 DEFAULT_EXPECTED_EGRESS_COUNTRY = "CL"
 DEFAULT_CAPTCHA_SOLVER_MODE = "browser"
@@ -67,6 +77,11 @@ DEFAULT_DATAIMPULSE_ROTATION_COOLDOWN_SECONDS = 60.0
 DEFAULT_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR = 30
 DEFAULT_DATAIMPULSE_CANDIDATE_RETRY_SECONDS = 10.0
 DEFAULT_DATAIMPULSE_CANDIDATES_PER_RECOVERY = 10
+# Fresh portal logins per account per rolling 24 h through replacement exits:
+# one full recovery pass (an 8th exit was once needed), never the 52-login
+# marathon of 2026-09-14. Two of three accounts were later deactivated; the
+# cause is unconfirmed (2026-09-24 report, point 6), so recovery stays bounded.
+DEFAULT_DATAIMPULSE_MAX_CANDIDATE_LOGINS_PER_DAY = 10
 # Query-scope failures still fail over to another account first.
 DEFAULT_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD = 2
 # A visibly rejected login on an explicitly scoped account recovers at once.
@@ -124,6 +139,7 @@ class Settings:
     dataimpulse_max_rotations_per_hour: int
     dataimpulse_candidate_retry_seconds: float
     dataimpulse_candidates_per_recovery: int
+    dataimpulse_max_candidate_logins_per_day: int
     dataimpulse_temp_unavailable_threshold: int
     dataimpulse_login_recovery_threshold: int
     login_captcha_rotate_after: int
@@ -398,6 +414,12 @@ def load_settings(
     )
     if dataimpulse_candidates_per_recovery < 1:
         raise ValueError("CBRS_DATAIMPULSE_CANDIDATES_PER_RECOVERY must be positive")
+    dataimpulse_max_candidate_logins = _int(
+        env.get("CBRS_DATAIMPULSE_MAX_CANDIDATE_LOGINS_PER_DAY"),
+        default=DEFAULT_DATAIMPULSE_MAX_CANDIDATE_LOGINS_PER_DAY,
+    )
+    if dataimpulse_max_candidate_logins < 1:
+        raise ValueError("CBRS_DATAIMPULSE_MAX_CANDIDATE_LOGINS_PER_DAY must be positive")
     dataimpulse_temporary_threshold = _int(
         env.get("CBRS_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD"),
         default=DEFAULT_DATAIMPULSE_TEMP_UNAVAILABLE_THRESHOLD,
@@ -526,6 +548,7 @@ def load_settings(
         dataimpulse_max_rotations_per_hour=dataimpulse_max_rotations,
         dataimpulse_candidate_retry_seconds=dataimpulse_candidate_retry,
         dataimpulse_candidates_per_recovery=dataimpulse_candidates_per_recovery,
+        dataimpulse_max_candidate_logins_per_day=dataimpulse_max_candidate_logins,
         dataimpulse_temp_unavailable_threshold=dataimpulse_temporary_threshold,
         dataimpulse_login_recovery_threshold=dataimpulse_login_threshold,
         login_captcha_rotate_after=login_captcha_rotate_after,

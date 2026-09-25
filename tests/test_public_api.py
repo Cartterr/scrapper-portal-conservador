@@ -137,7 +137,7 @@ def test_output_never_overwrites_different_file(client, tmp_path):
     assert target.read_bytes() == b"user document"
 
 
-def test_quota_requires_all_accounts_and_never_confuses_login_failure(client, monkeypatch):
+def test_quota_requires_all_accounts_and_never_confuses_login_failure(client, monkeypatch, tmp_path):
     monkeypatch.setattr(client._db, "status", lambda: {"accounts": [
         {"portal_quota": True, "resume_at": "2030-01-01"},
         {"portal_quota": False, "status": "login_pending"},
@@ -150,6 +150,12 @@ def test_quota_requires_all_accounts_and_never_confuses_login_failure(client, mo
     assert result.status == "pending_quota" and result.resume_at == "2030-01-01"
     with pytest.raises(QuotaExhausted):
         result.raise_for_status()
+    # D27: whoever only receives the CSV must see when to come back.
+    from cbrs.api import write_report
+    report = tmp_path / "report.csv"
+    write_report(report, [], [result])
+    with report.open(encoding="utf-8", newline="") as stream:
+        assert next(csv.DictReader(stream))["resume_at"] == "2030-01-01"
 
 
 def test_missing_pdf_is_not_reported_done(client, tmp_path):

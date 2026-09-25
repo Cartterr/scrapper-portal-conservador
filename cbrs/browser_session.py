@@ -179,6 +179,11 @@ class BrowserSession:
                     proxy=proxy,
                     args=_chrome_launch_args(self.settings, headless=self.headless),
                     ignore_default_args=CHROME_IGNORED_DEFAULT_ARGS,
+                    # D31: by default the Playwright driver answers a terminal
+                    # Ctrl+C by closing every Chrome and exiting, which strands
+                    # the worker mid-call. Only Python must see SIGINT, so it
+                    # takes the same bounded shutdown as SIGTERM.
+                    handle_sigint=False,
                 )
             except Exception:
                 # A failed persistent-context launch otherwise leaves the sync

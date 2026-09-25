@@ -286,6 +286,9 @@ def main():
     else:
         if SETTINGS.env_value("CBRS_BROWSER_OWNER_MODE") != "external":
             raise RuntimeError("Independent owner requires explicit external mode")
+        if SETTINGS.headless:
+            from .config import HEADLESS_UNSUPPORTED
+            raise RuntimeError(HEADLESS_UNSUPPORTED)
         BrowserOwner(SETTINGS, load_account_pool_config(SETTINGS), default_job_store(SETTINGS)).run()
 
 

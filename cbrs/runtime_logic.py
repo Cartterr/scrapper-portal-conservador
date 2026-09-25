@@ -246,11 +246,15 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                     attempt_id = store.begin_attempt(job_id=job.job_id, account_id=account.account_id, quota_date=quota_date, quota=config.search_limit_for(account), run_id=run_id, consume_quota=True)
                     if not attempt_id:
                         continue
+                    # fna searches admit their own probe inside search_fna_form.
+                    text_hold = quota_policy.quota_hold(store.path, account.account_id) if job.kind != 'fna' else None
                     try:
                         if job.kind != 'fna' and not quota_policy.admit_quota_check(store.path, account.account_id):
                             raise core.SafetyStopException(core.StopReason.DAILY_LIMIT, 'Portal quota hold remains active')
                         results = core._search_job(scraper, job)
                     except core.SafetyStopException as exc:
+                        if text_hold and exc.reason in quota_policy.PROBE_UNANSWERED:
+                            quota_policy.restore_quota_check(store.path, account.account_id, text_hold)
                         if exc.reason in {core.StopReason.AUTH_REQUIRED, core.StopReason.SEARCH_NOT_SUBMITTED}:
                             store.finish_attempt(attempt_id, status='auth_expired' if exc.reason == core.StopReason.AUTH_REQUIRED else 'not_submitted', safety_stop=exc.reason.value, error=str(exc))
                             attempt_id = None

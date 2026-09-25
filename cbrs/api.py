@@ -95,7 +95,7 @@ def _timeout(value: float) -> float:
 
 
 ALIASES = ({"foja", "fojas"}, {"numero", "número", "num"}, {"ano", "año", "anio", "year"})
-REPORT_FIELDS = ("status", "pdf_path", "error", "account", "attempts", "job_id", "finished_at")
+REPORT_FIELDS = ("status", "pdf_path", "error", "account", "attempts", "job_id", "finished_at", "resume_at")
 
 
 def read_csv(path: str | Path) -> tuple[list[str], list[tuple[dict[str, Any], Any, str | None]]]:

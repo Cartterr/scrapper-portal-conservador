@@ -34,12 +34,12 @@ def test_service_owned_browser_ignores_generic_close_and_context_manager_exit(tm
     assert session._context is None
 
 
-def test_browser_session_defaults_to_headless_settings(tmp_path: Path) -> None:
+def test_browser_session_defaults_to_headed_settings(tmp_path: Path) -> None:
     settings = load_settings({}, root=tmp_path)
 
     session = BrowserSession(settings)
 
-    assert session.headless is True
+    assert session.headless is False
 
 
 def test_browser_session_launches_chrome_persistent_context(tmp_path: Path, monkeypatch) -> None:
@@ -88,6 +88,7 @@ def test_browser_session_launches_chrome_persistent_context(tmp_path: Path, monk
     assert captured["user_data_dir"] == str(settings.profile_dir)
     assert captured["kwargs"]["executable_path"] == str(browser)
     assert captured["kwargs"]["headless"] is False
+    assert captured["kwargs"]["handle_sigint"] is False
     assert captured["kwargs"]["accept_downloads"] is True
     assert captured["kwargs"]["bypass_csp"] is False
     assert captured["kwargs"]["chromium_sandbox"] is True

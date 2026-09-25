@@ -118,7 +118,7 @@ def test_settings_parse_production_defaults(tmp_path: Path) -> None:
 
     assert settings.browser_backend == "chrome"
     assert settings.browser_executable_path is None
-    assert settings.headless is True
+    assert settings.headless is False
     assert settings.egress_mode == ""
     assert settings.allow_personal_egress is False
     assert settings.expected_egress_country == "CL"

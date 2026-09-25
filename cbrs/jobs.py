@@ -2439,6 +2439,7 @@ class JobStore:
         cooldown_seconds: float,
         max_rotations_per_hour: int,
         randomize: bool = False,
+        max_candidate_logins_per_day: int | None = None,
     ) -> dict[str, Any]:
         now_dt = datetime.now(timezone.utc)
         now = now_dt.replace(microsecond=0).isoformat()
@@ -2472,13 +2473,30 @@ class JobStore:
                 rotation_count = 0
             else:
                 rotation_count = int(state.get("rotation_count") or 0)
+            logins = []
+            if max_candidate_logins_per_day:
+                logins = [row[0] for row in db.execute(
+                    f"""
+                    SELECT started_at FROM proxy_candidate_attempts
+                    WHERE account_id = ? AND started_at >= ?
+                    AND outcome NOT IN ({",".join("?" * len(NO_LOGIN_CANDIDATE_OUTCOMES))})
+                    ORDER BY started_at
+                    """,
+                    (account_id, (now_dt - timedelta(days=1)).replace(microsecond=0).isoformat(),
+                     *sorted(NO_LOGIN_CANDIDATE_OUTCOMES)),
+                ).fetchall()]
+            deadlines = []
             if rotation_count >= max_rotations_per_hour:
                 # The allowance resets at the window boundary, not one full
                 # hour after whichever attempt happened to notice exhaustion.
-                next_eligible = (
-                    datetime.fromisoformat(window_started.replace("Z", "+00:00"))
-                    + timedelta(seconds=ROTATION_WINDOW_SECONDS)
-                ).replace(microsecond=0).isoformat()
+                deadlines.append(datetime.fromisoformat(window_started.replace("Z", "+00:00"))
+                                 + timedelta(seconds=ROTATION_WINDOW_SECONDS))
+            if max_candidate_logins_per_day and len(logins) >= max_candidate_logins_per_day:
+                # The daily login cap frees up 24 h after its oldest login.
+                deadlines.append(datetime.fromisoformat(logins[0].replace("Z", "+00:00"))
+                                 + timedelta(days=1))
+            if deadlines:
+                next_eligible = max(deadlines).replace(microsecond=0).isoformat()
                 db.execute(
                     """
                     UPDATE account_proxy_routes
@@ -2495,6 +2513,7 @@ class JobStore:
                     "next_eligible_at": next_eligible,
                     "rotation_count": rotation_count,
                     "rotation_window_started_at": window_started,
+                    "candidate_logins_24h": len(logins),
                 }
             used_ports = {
                 int(value)
@@ -3483,9 +3502,9 @@ def run_job_worker(
                                   store_path=store.path, commands_path=command_path(settings))
     if not store.acquire_lease(WORKER_LEASE_NAME, worker_id):
         raise RuntimeError("Another CBRS job worker has an active lease.")
-    # D9: SIGTERM takes the same graceful path as Ctrl+C, so an embedded Chrome
-    # is closed instead of orphaned when the service or terminal stops the worker.
-    previous_sigterm = _install_terminate_handler()
+    # D9/D31: SIGTERM and Ctrl+C take the same graceful path, so an embedded
+    # Chrome is closed instead of orphaned when the service or terminal stops it.
+    previous_signals = _install_terminate_handler()
 
     run_id: str | None = None
     processed = 0
@@ -3736,7 +3755,7 @@ def run_job_worker(
         final_status = "stopped"
     finally:
         _shutdown_browser_pool(browser_pool, settings, owner_mode)
-        _restore_terminate_handler(previous_sigterm)
+        _restore_terminate_handler(previous_signals)
         if updates is not None:
             updates.close()
         heartbeat_stop.set()
@@ -3756,27 +3775,48 @@ def run_job_worker(
 SHUTDOWN_DEADLINE_SECONDS = 20.0
 
 
+def _interrupt(signum, frame):  # noqa: ARG001 - signal handler signature
+    """Raise KeyboardInterrupt in the waiting caller, never inside Playwright (D31).
+
+    A signal usually lands while sync Playwright runs its event loop in a
+    dispatcher greenlet. Raising there kills that greenlet, and every later
+    Playwright call, the shutdown close included, then switches to it forever at
+    100% CPU. Throwing into the caller keeps the dispatcher alive.
+    """
+    try:
+        from greenlet import getcurrent
+    except ImportError:
+        raise KeyboardInterrupt from None
+    current = getcurrent()
+    if current.parent is not None:
+        current.parent.throw(KeyboardInterrupt)
+        return
+    raise KeyboardInterrupt
+
+
 def _install_terminate_handler() -> Any:
-    """Route SIGTERM into KeyboardInterrupt on the main thread; return the old handler."""
+    """Route SIGINT and SIGTERM into KeyboardInterrupt; return the old handlers."""
     if threading.current_thread() is not threading.main_thread():
         return None
-
-    def _terminate(signum, frame):  # noqa: ARG001 - signal handler signature
-        raise KeyboardInterrupt
-
-    try:
-        return signal.signal(signal.SIGTERM, _terminate)
-    except (ValueError, OSError, AttributeError):
-        return None
+    previous = {}
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            # A SIGINT ignored at launch (nohup, background job) stays ignored.
+            if signal.getsignal(signum) is not signal.SIG_IGN:
+                previous[signum] = signal.signal(signum, _interrupt)
+        except (ValueError, OSError, AttributeError):
+            pass
+    return previous or None
 
 
 def _restore_terminate_handler(previous: Any) -> None:
-    if previous is None or threading.current_thread() is not threading.main_thread():
+    if not previous or threading.current_thread() is not threading.main_thread():
         return
-    try:
-        signal.signal(signal.SIGTERM, previous)
-    except (ValueError, OSError, TypeError):
-        pass
+    for signum, handler in previous.items():
+        try:
+            signal.signal(signum, handler)
+        except (ValueError, OSError, TypeError):
+            pass
 
 
 def _shutdown_browser_pool(browser_pool: _PersistentAccountBrowsers, settings: Settings,
@@ -4297,6 +4337,13 @@ TERMINAL_CANDIDATE_OUTCOMES = frozenset({
     CANDIDATE_CREDENTIALS_REJECTED,
     CANDIDATE_PROVEN_UNPERSISTED,
 })
+# Candidates that never reached the portal login form.
+NO_LOGIN_CANDIDATE_OUTCOMES = frozenset({
+    CANDIDATE_CONNECTIVITY_FAILED,
+    CANDIDATE_EXIT_REUSED,
+    CANDIDATE_LAUNCH_FAILED,
+    CANDIDATE_PROVIDER_TERMINAL,
+})
 # Portal-side rejections: wait the candidate retry delay before the next port.
 # Transport-side failures move to the next port immediately.
 PORTAL_CANDIDATE_OUTCOMES = frozenset({
@@ -4429,6 +4476,7 @@ def _try_dataimpulse_candidate(
         cooldown_seconds=0.0,
         max_rotations_per_hour=settings.dataimpulse_max_rotations_per_hour,
         randomize=True,
+        max_candidate_logins_per_day=settings.dataimpulse_max_candidate_logins_per_day,
     )
     if not candidate.get("ok"):
         blocked_reason = str(candidate.get("reason") or "proxy_rotation_blocked")
@@ -4450,6 +4498,8 @@ def _try_dataimpulse_candidate(
                 "next_eligible_at": next_eligible,
                 "attempts_in_window": candidate.get("rotation_count"),
                 "window_limit": settings.dataimpulse_max_rotations_per_hour,
+                "daily_login_limit": settings.dataimpulse_max_candidate_logins_per_day,
+                "candidate_logins_24h": candidate.get("candidate_logins_24h"),
             },
         )
         return f"blocked:{blocked_reason}"

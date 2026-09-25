@@ -75,3 +75,37 @@ def test_login_after_probe_refresh_restores_probe_eligibility(tmp_path, monkeypa
     hold=quota_hold(path,'a3')
     assert hold['probe_count']==0 and hold['next_check_at']==past
     assert hold['evidence']=='test'
+
+
+import pytest
+from cbrs.safety import StopReason
+
+
+@pytest.mark.parametrize('reason,restored', [
+    (StopReason.CAPTCHA_REJECTED, True),
+    (StopReason.SEARCH_NOT_SUBMITTED, True),
+    (StopReason.TEMPORARY_UNAVAILABLE, True),
+    (StopReason.DAILY_LIMIT, False),
+])
+def test_probe_without_quota_answer_keeps_its_admission(tmp_path, monkeypatch, reason, restored):
+    # D28: 2026-09-23 22:36 both due probes ended in captcha_rejected /
+    # search_not_submitted and still held the accounts for another hour.
+    from types import SimpleNamespace
+    from cbrs import form_search as policy, runtime_observation
+    from cbrs.safety import SafetyStopException
+    path = tmp_path / 'quota.sqlite3'
+    past = (datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()
+    with policy.quota_db(path) as db:
+        db.execute('INSERT INTO portal_quota_holds VALUES(?,?,?,?,?,0)',('a3',past,None,past,'test'))
+    page = SimpleNamespace(evaluate=lambda _:None,reload=lambda **kw:None)
+    browser = SimpleNamespace(settings=SimpleNamespace(account_id='a3'),quota_store_path=path,page=page)
+    monkeypatch.setattr(runtime_observation,'visible_login_gate',lambda _:False)
+    monkeypatch.setattr(policy,'notify_browser_error',lambda *a:None)
+    def fail(*a,**kw):
+        raise SafetyStopException(reason,'probe failed')
+    monkeypatch.setattr(policy,'_search_fna_once',fail)
+    with pytest.raises(SafetyStopException):
+        policy.search_fna_form(browser,1,2,2000,client=None,pace=None)
+    hold = quota_hold(path,'a3')
+    assert (hold['next_check_at'] == past) is restored
+    assert hold['blocked'] is not restored

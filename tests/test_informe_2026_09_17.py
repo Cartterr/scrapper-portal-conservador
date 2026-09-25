@@ -398,6 +398,7 @@ def test_interval_default_is_zero_for_env_only_installs():
 # ------------------------------------------------------------------------ D9 shutdown
 
 def test_sigterm_takes_the_keyboard_interrupt_path():
+    before = signal.getsignal(signal.SIGTERM)
     previous = jobs._install_terminate_handler()
     try:
         handler = signal.getsignal(signal.SIGTERM)
@@ -405,7 +406,27 @@ def test_sigterm_takes_the_keyboard_interrupt_path():
             handler(signal.SIGTERM, None)
     finally:
         jobs._restore_terminate_handler(previous)
-    assert signal.getsignal(signal.SIGTERM) == previous
+    assert signal.getsignal(signal.SIGTERM) == before
+
+
+def test_interrupt_inside_a_greenlet_is_raised_in_its_caller():
+    # D31: Ctrl+C during a Playwright call runs the handler inside the sync
+    # dispatcher greenlet. It must stay alive: the interrupt belongs to the
+    # caller, and later calls (the shutdown close) must still reach it.
+    from greenlet import greenlet
+    trace = []
+
+    def dispatcher():
+        jobs._interrupt(signal.SIGINT, None)
+        trace.append("dispatcher resumed")
+        return "loop still usable"
+
+    fiber = greenlet(dispatcher)
+    with pytest.raises(KeyboardInterrupt):
+        fiber.switch()
+    assert not fiber.dead
+    assert fiber.switch() == "loop still usable"
+    assert trace == ["dispatcher resumed"]
 
 
 def test_shutdown_watchdog_bounds_a_stalled_close_in_embedded_mode_only(tmp_path, monkeypatch):

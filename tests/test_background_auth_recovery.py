@@ -829,3 +829,26 @@ def test_continuous_worker_recovers_loop_after_transient_error(tmp_path, monkeyp
     assert "worker_loop_failed" in events and "worker_loop_recovering" in events
     assert result.status == "stopped"
 
+
+
+def test_daily_candidate_login_cap_counts_only_portal_logins(tmp_path):
+    # Report 2026-09-24, point 6: bound fresh logins per account per day.
+    from datetime import timedelta
+    store = jobs.JobStore(tmp_path / "jobs.sqlite3")
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    oldest = (now - timedelta(hours=20)).isoformat()
+    for index, outcome in enumerate(["candidate_login_rejected", "candidate_connectivity_failed",
+                                     "candidate_login_rejected", "promoted"]):
+        store.record_candidate_attempt("a2", sticky_port=10100 + index, egress_hash=f"h{index}",
+            outcome=outcome, http_status=None, response_code=None, reason=None,
+            started_at=oldest if index == 0 else now.isoformat())
+    reserve = lambda cap: store.begin_dataimpulse_rotation(
+        "a2", initial_port=10002, reason="t", port_min=10000, port_max=20000,
+        cooldown_seconds=0, max_rotations_per_hour=30, max_candidate_logins_per_day=cap)
+    blocked = reserve(3)
+    assert blocked["reason"] == "retry_allowance_exhausted"
+    assert blocked["candidate_logins_24h"] == 3  # the connectivity failure never logged in
+    assert blocked["next_eligible_at"] == (now + timedelta(hours=4)).isoformat()
+    with store.connect() as db:
+        db.execute("UPDATE account_proxy_routes SET cooldown_until = NULL")
+    assert reserve(4)["ok"]

@@ -563,3 +563,14 @@ def test_service_restart_refuses_session_owner_without_explicit_ack(capsys) -> N
 
     assert result == 2
     assert "protegen sesiones autenticadas" in capsys.readouterr().err
+
+
+def test_worker_refuses_headless_before_touching_state(capsys) -> None:
+    # D30: headless searches are rejected and would ditch profiles as
+    # compromised routes; refuse before any store, browser or route is touched.
+    from cbrs.cli import cmd_jobs
+
+    args = build_parser().parse_args(["--headless", "jobs", "worker", "--once"])
+
+    assert cmd_jobs(args) == 2
+    assert "CBRS_HEADLESS=0" in capsys.readouterr().err
