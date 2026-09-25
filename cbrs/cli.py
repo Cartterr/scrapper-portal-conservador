@@ -372,6 +372,21 @@ def _require_preflight() -> dict[str, object]:
     )
 
 
+def cmd_requests(args: argparse.Namespace) -> int:
+    from . import request_log
+
+    entries = list(request_log.read(config.SETTINGS, args.account_id, since=args.since, until=args.until))
+    if args.json:
+        for entry in entries:
+            print(json.dumps(entry, ensure_ascii=False))
+        return 0
+    print(f"{len(entries)} portal request(s) for {args.account_id}"
+          + (f" from {entries[0]['at']} to {entries[-1]['at']}" if entries else ""))
+    for method, path, status, count in request_log.summary(entries):
+        print(f"{count:6d}  {method:6s} {status:>6s}  {path}")
+    return 0
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     from .scraper import CBRSScraper
 
@@ -1193,6 +1208,14 @@ def build_parser() -> argparse.ArgumentParser:
     from .download_cli import add_download_parsers
     add_download_parsers(subparsers)
 
+    requests_parser = subparsers.add_parser(
+        "requests", help="Count one account's recorded portal requests per endpoint"
+    )
+    requests_parser.add_argument("account_id")
+    requests_parser.add_argument("--since", default=None, help="UTC ISO time, e.g. 2026-09-24T14:07")
+    requests_parser.add_argument("--until", default=None, help="UTC ISO time, e.g. 2026-09-24T22:37")
+    requests_parser.add_argument("--json", action="store_true", help="Print every recorded request")
+
     init_parser = subparsers.add_parser("init", help="Open browser for manual login")
     init_parser.add_argument(
         "--timeout",
@@ -1708,6 +1731,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_pool(args)
         if args.command == "jobs":
             return cmd_jobs(args)
+        if args.command == "requests":
+            return cmd_requests(args)
 
         from .scraper import CBRSScraper
 

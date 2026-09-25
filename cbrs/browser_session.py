@@ -191,6 +191,11 @@ class BrowserSession:
                 _release_sync_playwright(self._playwright)
                 self._playwright = None
                 raise
+            try:
+                from . import request_log
+                request_log.attach(self._context, self.settings)
+            except Exception:
+                logger.warning("Portal request log unavailable for this context", exc_info=True)
             return self
 
         if self.settings.browser_backend != "cloak":

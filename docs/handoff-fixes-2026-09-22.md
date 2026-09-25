@@ -103,9 +103,29 @@ la cuenta cae. Lo proponemos como siguiente paso si el mandante lo considera
 1. Nunca headless (ahora bloqueado en el worker y el propietario).
 2. `CBRS_DATAIMPULSE_MAX_CANDIDATE_LOGINS_PER_DAY=3` a `5`.
 3. Que nadie más la use en paralelo mientras corre el servicio.
-4. Si hace falta analizar patrones de peticiones, agregar un registro por
-   petición (método, ruta sin parámetros, estado, hora, cuenta; sin cuerpos ni
-   tokens). No existe hoy en ninguna de las dos instalaciones.
+4. Actualizar a `master`: ahora cada instalación guarda un registro de todas
+   las peticiones al portal por cuenta (ver abajo). Si vuelve a haber una baja,
+   ese registro dirá exactamente qué la precedió.
+
+## Registro de peticiones por cuenta
+
+Hasta ahora el servicio registraba eventos, no peticiones, y por eso nadie pudo
+contar qué pidió `ejecutivo_3` antes de la baja. Desde este cambio, cada
+contexto de Chrome (worker, propietario externo y candidatos de ruta) agrega una
+línea por cada carga de página y llamada a `*.conservador.cl` en
+`.cbrs/runtime/logs/requests/<cuenta>/<fecha UTC>.jsonl`: hora, método, ruta,
+tipo y estado HTTP (o `failed`). Nunca se guardan parámetros de consulta,
+encabezados, cookies ni cuerpos, y los segmentos largos de la ruta (tickets,
+tokens) se enmascaran como `:id`. Son archivos planos, no la base de trabajos,
+para no competir con sus escrituras.
+
+Para contar por endpoint en una ventana (horas UTC):
+
+```bash
+cbrs requests ejecutivo_2 --since 2026-09-24T14:07 --until 2026-09-24T22:37
+```
+
+`--json` imprime cada petición.
 
 ## Pendiente de activación en la producción
 
