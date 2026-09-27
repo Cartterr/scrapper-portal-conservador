@@ -402,12 +402,15 @@ def test_continuous_worker_retains_contexts_after_scheduler_error_until_stop(tmp
 
 def candidate_runtime(tmp_path, monkeypatch, *, accepted=True, persistence_error=False, same_exit=False,
                       gate_results=None, login_results=None, retry_seconds=0,
-                      candidates_per_recovery=None):
+                      candidates_per_recovery=None, historical_other_exit=False):
     overrides = {"dataimpulse_candidate_retry_seconds": retry_seconds}
     if candidates_per_recovery is not None:
         overrides["dataimpulse_candidates_per_recovery"] = candidates_per_recovery
     settings, config, store, pool_store, pool = setup_runtime(
         tmp_path, monkeypatch, **overrides)
+    if historical_other_exit:
+        store.set_account_check("a1", proxy_status="passed", egress_hash="new-exit-hash")
+        store.set_account_check("a1", proxy_status="passed", egress_hash="current-a1-exit")
     old = pool.scraper_factory()
     pool._entries["a2"] = jobs._ManagedAccountScraper(manager=old, scraper=old, settings=settings)
     healthy = pool.scraper_factory()
@@ -470,6 +473,54 @@ def test_successful_candidate_is_adopted_alive_without_relogin_or_closing_old_co
     assert store.account_check("a2")["browser_auth_state"] == "authenticated_form"
     assert baselines == ["new-exit-hash"]
     assert store.dataimpulse_route("a2")["active_port"] != 10002
+
+
+def test_candidate_avoids_exit_recently_used_by_another_account(tmp_path, monkeypatch):
+    ok, pool, store, old, healthy, probes, closed, baselines = candidate_runtime(
+        tmp_path, monkeypatch, historical_other_exit=True, candidates_per_recovery=1)
+    assert not ok
+    assert probes == []
+    assert store.dataimpulse_route("a2")["active_port"] == 10002
+    assert store.recent_candidate_attempts("a2")[0]["reason"] == "exit_recently_used_by_other_account"
+    assert pool._entries["a1"].scraper is healthy
+    assert pool._entries["a2"].scraper is old
+
+
+def test_other_account_exit_history_expires(tmp_path):
+    store = jobs.JobStore(tmp_path / "pool.sqlite3")
+    store.set_account_check("a1", proxy_status="passed", egress_hash="old-hash")
+    assert jobs.JobStore(store.path).recent_other_account_egress(
+        "old-hash", exclude_account="a2") == "a1"
+    assert store.recent_other_account_egress("old-hash", exclude_account="a1") is None
+    with store.connect() as db:
+        db.execute("UPDATE account_egress_history SET observed_at='2000-01-01T00:00:00+00:00'")
+    assert store.recent_other_account_egress("old-hash", exclude_account="a2") is None
+
+
+def test_other_account_history_includes_prior_login_attempts_only(tmp_path):
+    store = jobs.JobStore(tmp_path / "pool.sqlite3")
+    for outcome in (jobs.CANDIDATE_LOGIN_REJECTED, jobs.CANDIDATE_EXIT_REUSED):
+        store.record_candidate_attempt("a1", sticky_port=10005, egress_hash=outcome,
+                                       outcome=outcome, started_at=jobs.utc_now())
+    assert store.recent_other_account_egress(
+        jobs.CANDIDATE_LOGIN_REJECTED, exclude_account="a2") == "a1"
+    assert store.recent_other_account_egress(
+        jobs.CANDIDATE_EXIT_REUSED, exclude_account="a2") is None
+    with store.connect() as db:
+        db.execute("DELETE FROM proxy_candidate_attempts")
+    assert store.recent_other_account_egress(
+        jobs.CANDIDATE_LOGIN_REJECTED, exclude_account="a2") == "a1"
+    store.record_candidate_attempt("a1", sticky_port=10005, egress_hash=jobs.CANDIDATE_LOGIN_REJECTED,
+                                   outcome=jobs.CANDIDATE_LOGIN_REJECTED, started_at=jobs.utc_now())
+    with store.connect() as db:
+        # Upgrade compatibility: the old ledger has no dedicated history rows.
+        db.execute("DELETE FROM account_egress_history")
+    assert store.recent_other_account_egress(
+        jobs.CANDIDATE_LOGIN_REJECTED, exclude_account="a2") == "a1"
+    with store.connect() as db:
+        db.execute("UPDATE proxy_candidate_attempts SET finished_at='2000-01-01T00:00:00+00:00'")
+    assert store.recent_other_account_egress(
+        jobs.CANDIDATE_LOGIN_REJECTED, exclude_account="a2") is None
 
 
 def test_rejected_candidate_closes_only_disposable_probe_and_preserves_routes(tmp_path, monkeypatch):

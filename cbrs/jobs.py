@@ -986,6 +986,15 @@ class JobStore:
                     PRIMARY KEY(account_id, egress_hash)
                 );
 
+                CREATE TABLE IF NOT EXISTS account_egress_history (
+                    account_id TEXT NOT NULL,
+                    egress_hash TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    PRIMARY KEY(account_id, egress_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_account_egress_history_lookup
+                    ON account_egress_history(egress_hash, observed_at);
+
                 CREATE TABLE IF NOT EXISTS proxy_candidate_attempts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     account_id TEXT NOT NULL,
@@ -1013,7 +1022,7 @@ class JobStore:
             db.execute(
                 """
                 INSERT INTO schema_versions(component, version, applied_at)
-                VALUES ('jobs', 9, ?)
+                VALUES ('jobs', 10, ?)
                 ON CONFLICT(component) DO UPDATE SET
                     version = MAX(version, excluded.version),
                     applied_at = CASE
@@ -1962,6 +1971,22 @@ class JobStore:
                     now,
                 ),
             )
+            if proxy_status == "passed" and egress_hash:
+                self._remember_egress(db, account_id, egress_hash, now)
+
+    @staticmethod
+    def _remember_egress(db: sqlite3.Connection, account_id: str, egress_hash: str, at: str) -> None:
+        db.execute(
+            """INSERT INTO account_egress_history(account_id, egress_hash, observed_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(account_id, egress_hash) DO UPDATE SET
+                 observed_at = excluded.observed_at""",
+            (account_id, egress_hash, at),
+        )
+        db.execute(
+            "DELETE FROM account_egress_history WHERE observed_at < ?",
+            ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(),),
+        )
 
     def egress_owner(self, egress_hash: str, *, exclude_account: str) -> str | None:
         with self.connect() as db:
@@ -1972,6 +1997,32 @@ class JobStore:
                 LIMIT 1
                 """,
                 (egress_hash, exclude_account),
+            ).fetchone()
+            return str(row["account_id"]) if row else None
+
+    def recent_other_account_egress(self, egress_hash: str, *, exclude_account: str) -> str | None:
+        """Find a different account seen on this exit in the last seven days.
+
+        Include candidate login attempts, even when login failed. Transport
+        failures and candidates rejected before login do not count.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        with self.connect() as db:
+            row = db.execute(
+                """SELECT account_id FROM account_egress_history
+                   WHERE egress_hash = ? AND account_id != ? AND observed_at >= ?
+                   ORDER BY observed_at DESC LIMIT 1""",
+                (egress_hash, exclude_account, cutoff),
+            ).fetchone()
+            if row:
+                return str(row["account_id"])
+            route_id = f"ip-{hashlib.sha256(str(egress_hash).encode('utf-8')).hexdigest()[:10]}"
+            row = db.execute(
+                f"""SELECT account_id FROM proxy_candidate_attempts
+                    WHERE egress_route_id = ? AND account_id != ? AND finished_at >= ?
+                      AND outcome NOT IN ({','.join('?' * len(NO_LOGIN_CANDIDATE_OUTCOMES))})
+                    ORDER BY finished_at DESC LIMIT 1""",
+                (route_id, exclude_account, cutoff, *sorted(NO_LOGIN_CANDIDATE_OUTCOMES)),
             ).fetchone()
             return str(row["account_id"]) if row else None
 
@@ -2764,6 +2815,8 @@ class JobStore:
             if egress_hash else None
         )
         with self.connect() as db:
+            if egress_hash and outcome not in NO_LOGIN_CANDIDATE_OUTCOMES:
+                self._remember_egress(db, account_id, egress_hash, utc_now())
             db.execute(
                 """
                 INSERT INTO proxy_candidate_attempts(
@@ -4564,6 +4617,10 @@ def _try_dataimpulse_candidate(
         if owner:
             raise _CandidateRejected(
                 CANDIDATE_EXIT_REUSED, "exit_assigned_to_other_account",
+            )
+        if store.recent_other_account_egress(egress_hash, exclude_account=account.account_id):
+            raise _CandidateRejected(
+                CANDIDATE_EXIT_REUSED, "exit_recently_used_by_other_account",
             )
         # Prove the target application's strongest signal before making the
         # route durable.  This standalone context uses the exact profile that

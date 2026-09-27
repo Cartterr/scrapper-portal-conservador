@@ -41,6 +41,27 @@ def test_session_names_profile_port_and_mode():
         "client": "chrome", "profile": "chrome-profile-route-4-port-14068", "port": 14068, "headless": False}
 
 
+def test_requests_use_latest_observed_exit_only_for_their_own_route(tmp_path):
+    settings = SimpleNamespace(log_dir=tmp_path, account_id="a1", profile_dir=tmp_path / "prof",
+                               proxy_url="http://user:secret@gw.dataimpulse.com:14068")
+    callbacks = {}
+    context = SimpleNamespace(on=lambda event, callback: callbacks.update({event: callback}))
+    request_log.attach(context, settings, headless=False)
+    response = SimpleNamespace(request=_request("https://nuevo-portal.conservador.cl/api/v1/home/start"), status=200)
+    at = datetime(2026, 9, 27, 12, tzinfo=timezone.utc)
+    request_log.observe_egress(settings, "a" * 12, source="preflight", observed_at=at)
+    callbacks["response"](response)
+    request_log.observe_egress(settings, "b" * 12, source="proxy_health", observed_at=at)
+    callbacks["response"](response)
+    settings.proxy_url = "http://user:secret@gw.dataimpulse.com:14069"
+    callbacks["response"](response)
+    entries = list(request_log.read(settings, "a1"))
+    assert [e.get("egress_observed_hash") for e in entries] == ["a" * 12, "b" * 12, None]
+    assert entries[0]["egress_observed_at"] == "2026-09-27T12:00:00.000+00:00"
+    assert entries[1]["egress_observation_source"] == "proxy_health"
+    assert "secret" not in json.dumps(entries)
+
+
 def test_proxy_health_portal_call_is_recorded(tmp_path, monkeypatch):
     # It reaches the portal through the account's exit without Chrome.
     from cbrs import proxy_health

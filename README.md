@@ -18,7 +18,12 @@ overview web.
 _Vista ilustrativa con identificadores y estados de ejemplo; la terminal real
 lee el estado local en cada actualización._
 
-Instalación inicial en el checkout activo:
+Para una instalación nueva en Ubuntu, incluida una máquina sin systemd, seguir
+[INSTALL.md](INSTALL.md). La operación en primer plano usa `cbrs jobs worker`;
+Chrome debe tener una pantalla disponible o ejecutarse sobre Xvfb. No es necesario
+adoptar las rutas ni los servicios de la máquina de desarrollo.
+
+La instalación WSL del operador usa los siguientes comandos de administración:
 
 ```bash
 cd /opt/scrapper-portal-conservador

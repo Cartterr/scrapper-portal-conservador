@@ -98,6 +98,10 @@ def test_preflight_creates_sanitized_baseline_and_report_after_approval(tmp_path
     assert result.report_path is not None
     assert "1.2.3.4" not in result.report_path.read_text(encoding="utf-8")
     assert baseline_file(settings).exists()
+    from cbrs.request_log import session_of
+    observed = session_of(settings, headless=False)
+    assert observed["egress_observed_hash"] == result.report["egress_hash"]
+    assert observed["egress_observation_source"] == "preflight"
 
 
 def test_preflight_reuses_matching_egress_baseline(tmp_path: Path) -> None:

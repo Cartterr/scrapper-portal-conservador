@@ -93,6 +93,9 @@ def run_preflight(
             raw_ip = str(egress_info.get("ip") or "").strip()
             egress_hash = _hash_text(raw_ip) if raw_ip else None
             egress_country = str(egress_info.get("country") or "").strip().upper() or None
+            if egress_hash:
+                from .request_log import observe_egress
+                observe_egress(settings, egress_hash, source="preflight")
         except Exception as exc:
             errors.append(f"egress lookup failed: {exc}")
 

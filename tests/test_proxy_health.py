@@ -63,6 +63,10 @@ def test_proxy_health_report_redacts_proxy_credentials(tmp_path: Path, monkeypat
     assert data["proxy_host_hash"]
     assert "user:pass" not in text
     assert "example.test" not in text
+    from cbrs.request_log import session_of
+    observed = session_of(settings, headless=False)
+    assert observed["egress_observation_source"] == "proxy_health"
+    assert "1.2.3.4" not in json.dumps(observed)
 
 
 def test_proxy_health_posts_json_to_cbrs_home_start(tmp_path: Path, monkeypatch) -> None:

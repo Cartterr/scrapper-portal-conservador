@@ -1,5 +1,17 @@
 # Non-negotiable CBRS browser preservation rules
 
+## Standing release-restart authorization (2026-09-27)
+
+The operator explicitly authorized activation of the staged release by restarting
+`cbrs-worker`, `cbrs-browser-owner`, and the owner's Chrome instances, and granted
+standing authorization for those restarts when required by future CBRS releases.
+Do not ask for that permission again. Drain work first; preserve configured proxy
+routes, profile files, credentials, quotas, and accepted search receipts. Verify
+service health and authentication after activation. Prefer worker-only maintenance
+when sufficient; do not restart `cbrs-display` for ordinary releases. This overrides
+older requirements below to request separate restart permission. It does not
+authorize unrelated profile deletion, proxy rotation, or replay of accepted searches.
+
 ## Current platform override: Linux/WSL
 
 The user authorized the Linux migration and the required Chrome/service restarts.

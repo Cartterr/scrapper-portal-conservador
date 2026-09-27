@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,6 +81,10 @@ def write_proxy_health_report(report: dict[str, Any], settings: Settings = SETTI
 def _check_egress(settings: Settings, checks: list[dict[str, Any]], errors: list[str]) -> None:
     try:
         egress = fetch_public_egress(settings)
+        raw_ip = str(egress.get("ip") or "").strip()
+        if raw_ip:
+            from .request_log import observe_egress
+            observe_egress(settings, hashlib.sha256(raw_ip.encode()).hexdigest()[:12], source="proxy_health")
         country = str(egress.get("country") or "").upper()
         _add_check(
             checks,

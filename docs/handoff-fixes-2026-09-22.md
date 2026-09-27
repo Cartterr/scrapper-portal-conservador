@@ -136,12 +136,13 @@ cbrs requests ejecutivo_2 --since 2026-09-24T14:07 --until 2026-09-24T22:37
 
 `--json` imprime cada petición.
 
-## Pendiente de activación en la producción
+## Activación en la producción
 
-Los cambios están en `master` y probados, pero **no están cargados en la
-producción WSL**: el servicio carga código sólo al arrancar y activarlo
-requiere reiniciar el propietario y el worker, lo que necesita autorización
-explícita. Ninguno cambia la base de datos.
+Estos cambios quedaron cargados en la producción WSL el 27-09-2026, tras el
+reinicio autorizado del propietario y el worker. Las tres cuentas volvieron a
+mostrar el formulario autenticado. La release también incluye el historial de
+salidas y su migración aditiva al esquema 10, documentados en
+[la respuesta al informe de DataImpulse](handoff-fixes-2026-09-24.md).
 
 ## Validación reproducible
 
