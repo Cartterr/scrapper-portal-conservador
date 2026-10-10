@@ -7,7 +7,7 @@ import time
 from typing import Any
 from urllib.parse import urlparse
 
-from .browser_session import BrowserSession, RecaptchaSolution
+from .browser_session import BrowserSession, RecaptchaSolution, jwt_expires_at
 from .config import SETTINGS, Settings
 from .safety import (
     SafetyStopException,
@@ -417,12 +417,4 @@ class BrowserOriginClient:
             raise RuntimeError(f"{context} did not return valid JSON.") from exc
 
 
-def _jwt_expires_at(token: str) -> float | None:
-    try:
-        payload = token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
-        exp = data.get("exp")
-        return float(exp) if exp is not None else None
-    except Exception:
-        return None
+_jwt_expires_at = jwt_expires_at

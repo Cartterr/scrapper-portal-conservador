@@ -92,6 +92,7 @@ ROTATION_WINDOW_SECONDS = 3600.0
 # is used up. It describes OUR retry budget, not provider traffic nor proof that
 # every available proxy failed. ``proxy_recovery_exhausted`` is the legacy name.
 RETRY_ALLOWANCE_EXHAUSTED = "retry_allowance_exhausted"
+KEEPALIVE_MIN_SPACING_SECONDS = 60.0
 # Candidate outcomes (durable, sanitized). Transport failures are kept apart
 # from portal login rejections so they can be paced and labelled differently.
 CANDIDATE_PROMOTED = "promoted"
@@ -301,32 +302,39 @@ class _PersistentAccountBrowsers:
                 continue
 
     def _keepalive(self, account_id: str, entry: _ManagedAccountScraper, settings: Settings) -> None:
-        """Opt-in token renewal on an authenticated page; never a login or reload.
+        """Renew the access token shortly before it expires; never a login or reload.
 
-        ``CBRS_SESSION_KEEPALIVE_SECONDS`` is 0 by default. When set, each
-        authenticated browser calls the portal's own refresh endpoint from its
-        live page at that cadence, so an idle session is not logged out by an
-        expired access token when the next search arrives. Outcomes are events
-        (``session_keepalive``), the evidence the operator asked for.
+        The portal's 30-minute access token is refreshed by its SPA only when a
+        request is about to be made, and a failed refresh logs the user out.
+        Renewing it ourselves while it is still valid (lead time
+        ``CBRS_SESSION_KEEPALIVE_SECONDS``, 0 disables) keeps the 7-day refresh
+        cookie rotating, so an idle browser is never logged out when the next
+        search arrives, and a refresh the portal rejects is visible at once in
+        the ``session_keepalive`` event instead of at the next job.
         """
-        interval = float(getattr(settings, "session_keepalive_seconds", 0.0) or 0.0)
-        if interval <= 0 or not entry.authenticated_once or entry.reauth_required:
+        lead = float(getattr(settings, "session_keepalive_seconds", 0.0) or 0.0)
+        if lead <= 0 or not entry.authenticated_once or entry.reauth_required:
             return
         now = time.monotonic()
-        if not entry.last_keepalive_at:
-            entry.last_keepalive_at = now  # the login itself just issued a token
-            return
-        if now - entry.last_keepalive_at < interval:
-            return
-        entry.last_keepalive_at = now
+        if now - entry.last_keepalive_at < KEEPALIVE_MIN_SPACING_SECONDS:
+            return  # a token the portal keeps issuing short never causes a tight loop
         browser = getattr(entry.scraper, "browser", entry.scraper)
+        expires_in = getattr(browser, "access_token_expires_in", None)
         refresh = getattr(browser, "refresh_session_token", None)
-        if not callable(refresh):
+        if not callable(expires_in) or not callable(refresh):
             return
+        try:
+            remaining = expires_in()
+        except Exception:
+            return
+        if remaining is None or remaining > lead:
+            return  # no stored token to renew, or still comfortably valid
+        entry.last_keepalive_at = now
         try:
             outcome = dict(refresh())
         except Exception as exc:
             outcome = {"ok": False, "error_type": type(exc).__name__}
+        outcome["remaining_seconds"] = round(remaining)
         self.store.add_event(
             "session_keepalive", account_id=account_id,
             level="info" if outcome.get("ok") else "warning", data=outcome,

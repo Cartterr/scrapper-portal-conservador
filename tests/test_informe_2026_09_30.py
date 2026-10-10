@@ -326,37 +326,72 @@ def test_proxy_transport_failure_is_still_immediate(monkeypatch, tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_keepalive_is_off_by_default_and_paced_when_enabled(tmp_path):
+def test_keepalive_renews_only_a_token_about_to_expire(tmp_path):
+    """Mirror of the SPA's own rule: refresh when ``exp`` is near, never on a schedule."""
     store = JobStore(tmp_path / "pool.sqlite3")
     pool = _PersistentAccountBrowsers(scraper_factory=None, headless=False, store=store, worker_id="test")
-    calls = []
-    browser = SimpleNamespace(refresh_session_token=lambda: calls.append(1) or {"ok": True, "http_status": 200})
+    calls, remaining = [], [1500.0]
+    browser = SimpleNamespace(
+        access_token_expires_in=lambda: remaining[0],
+        refresh_session_token=lambda: calls.append(1) or {"ok": True, "http_status": 200},
+    )
     entry = _ManagedAccountScraper(manager=None, scraper=SimpleNamespace(browser=browser), authenticated_once=True)
+    settings = load_settings({}, root=tmp_path)
+    assert settings.session_keepalive_seconds == 300  # on by default
 
-    pool._keepalive("a1", entry, load_settings({}, root=tmp_path))
-    assert calls == [] and entry.last_keepalive_at == 0.0
-
-    on = load_settings({"CBRS_SESSION_KEEPALIVE_SECONDS": "600"}, root=tmp_path)
-    pool._keepalive("a1", entry, on)
-    assert calls == [] and entry.last_keepalive_at > 0  # the login just issued a token
-    pool._keepalive("a1", entry, on)
-    assert calls == []  # not due yet
-    entry.last_keepalive_at -= 601
-    pool._keepalive("a1", entry, on)
+    pool._keepalive("a1", entry, settings)
+    assert calls == []  # 25 minutes left: nothing to do
+    remaining[0] = 240.0
+    pool._keepalive("a1", entry, settings)
     assert calls == [1]
-    events = [e for e in store.recent_events(limit=10) if e["event"] == "session_keepalive"]
-    assert events and json.loads(events[0]["data_json"])["ok"] is True
+    event = next(e for e in store.recent_events(limit=10) if e["event"] == "session_keepalive")
+    assert json.loads(event["data_json"]) == {"ok": True, "http_status": 200, "remaining_seconds": 240}
+    # Spacing floor: a portal that keeps answering with short tokens never causes a loop.
+    pool._keepalive("a1", entry, settings)
+    assert calls == [1]
+    entry.last_keepalive_at -= 61
+    pool._keepalive("a1", entry, settings)
+    assert calls == [1, 1]
+    # No stored token (page logged out, or SPA storage missing) is not something to renew.
+    remaining[0] = None
+    entry.last_keepalive_at -= 61
+    pool._keepalive("a1", entry, settings)
+    assert calls == [1, 1]
     # A page needing re-login is never "kept alive": that would be a login.
+    remaining[0] = 10.0
     entry.reauth_required = True
-    entry.last_keepalive_at -= 601
-    pool._keepalive("a1", entry, on)
-    assert calls == [1]
+    entry.last_keepalive_at -= 61
+    pool._keepalive("a1", entry, settings)
+    assert calls == [1, 1]
+    # 0 disables it entirely.
+    entry.reauth_required = False
+    entry.last_keepalive_at -= 61
+    pool._keepalive("a1", entry, load_settings({"CBRS_SESSION_KEEPALIVE_SECONDS": "0"}, root=tmp_path))
+    assert calls == [1, 1]
 
 
-def test_keepalive_setting_rejects_tight_intervals(tmp_path):
+def test_keepalive_setting_bounds(tmp_path):
     with pytest.raises(ValueError):
-        load_settings({"CBRS_SESSION_KEEPALIVE_SECONDS": "60"}, root=tmp_path)
+        load_settings({"CBRS_SESSION_KEEPALIVE_SECONDS": "30"}, root=tmp_path)
+    with pytest.raises(ValueError):
+        load_settings({"CBRS_SESSION_KEEPALIVE_SECONDS": "-1"}, root=tmp_path)
     assert load_settings({"CBRS_SESSION_KEEPALIVE_SECONDS": "0"}, root=tmp_path).session_keepalive_seconds == 0
+    assert load_settings({"CBRS_SESSION_KEEPALIVE_SECONDS": "600"}, root=tmp_path).session_keepalive_seconds == 600
+
+
+def test_access_token_expiry_is_read_from_the_spa_storage(tmp_path):
+    import base64, time
+    session = BrowserSession(load_settings({}, root=tmp_path))
+    exp = int(time.time()) + 1200
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": exp, "type": "access"}).encode()).decode().rstrip("=")
+    token = f"eyJhbGciOiJSUzI1NiJ9.{payload}.sig"
+    stored = [json.dumps(token)]
+    session._context = SimpleNamespace(pages=[SimpleNamespace(evaluate=lambda script: stored[0])])
+    assert 1190 <= session.access_token_expires_in() <= 1200
+    stored[0] = None
+    assert session.access_token_expires_in() is None
+    stored[0] = "not-a-jwt"
+    assert session.access_token_expires_in() is None
 
 
 def test_refresh_session_token_renews_without_navigation(tmp_path):

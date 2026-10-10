@@ -33,32 +33,52 @@ una pasada de recuperación por cuenta y día. Con D34, cuando ese tope deja la
 cola viva. Si el mandante prefiere que los candidatos rechazados en el login no
 cuenten contra el tope, es un cambio de política explícito, no de código.
 
-## Sesiones que se cierran solas: renovación opcional (llamada del 6-10)
+## Sesiones que se cierran solas: cómo vive una sesión y cómo se mantiene (llamada del 6-10)
 
-Lo descrito (la página sigue mostrando el formulario, pero la primera búsqueda
-tras horas de inactividad recarga y expulsa) coincide con un token de acceso
-vencido. El portal usa `auth_cbrs_token` (acceso) y la cookie
-`cbrs_refresh_token`, y su propio interceptor renueva el acceso con
-`POST /api/v1/auth/refresh`. No tenemos observaciones de ese vencimiento en
-nuestra telemetría: el 30-09 las cuentas buscaron durante 40 minutos sin pausa.
+Lo medimos en nuestros perfiles y registros del 25 al 29 de septiembre, sin
+tráfico al portal (detalle en [session-lifetime.md](session-lifetime.md)):
 
-Nuevo `CBRS_SESSION_KEEPALIVE_SECONDS` (por defecto 0, apagado; mínimo 300).
-Activado, cada navegador autenticado llama al refresco desde su propia página
-con esa cadencia y guarda el token nuevo en la cookie y en `localStorage`, igual
-que el portal. No navega, no recarga, no inicia sesión: si la página ya necesita
+- El token de acceso (`auth_cbrs_token`) dura **30 minutos**. El de refresco
+  (`cbrs_refresh_token`, cookie httpOnly) dura 7 días y **se renueva en cada
+  refresco**: nuestras sesiones vivieron 14 y 15 días así, y una sobrevivió
+  27 horas de inactividad total y un cambio de IP de salida.
+- El portal sólo refresca cuando lo necesita: al cargar la página, justo antes
+  de una petición con token vencido, o tras un 401. Si ese refresco falla,
+  borra la sesión local y redirige a `/login/sesion-expirada`. Eso es
+  exactamente «se recarga la página y te saca»: no es el token de acceso
+  vencido (eso se renueva solo), es un refresco rechazado.
+- Dos de nuestras tres sesiones fueron rechazadas por el portal el 28-09 entre
+  las 12:56 y las 15:58 UTC sin ninguna petición nuestra de por medio (sin
+  logout, sin login en otro perfil, sin reinicio de Chrome); la tercera, que
+  no había refrescado a las 12:56, siguió viva al día siguiente. Esa
+  revocación es del lado del portal y no se puede evitar desde aquí, sólo
+  detectar a tiempo.
+- Cargar otras rutas del portal no ayuda: las rutas de la SPA son del
+  navegador, el servidor sólo ve las llamadas a la API y la única que extiende
+  la sesión es el refresco. Más cargas de página sólo suman superficie ante el
+  WAF y reCAPTCHA.
+
+Por eso la renovación quedó **activada por defecto y guiada por el vencimiento**,
+no por un reloj: `CBRS_SESSION_KEEPALIVE_SECONDS` (300 por defecto; 0 la
+apaga) es el margen antes del vencimiento del token de acceso en que cada
+navegador autenticado llama al refresco desde su propia página y guarda el
+token nuevo en la cookie y en `localStorage`, igual que el portal. Es la misma
+petición que haría la SPA, con la misma cookie: una cada ~25 minutos por
+cuenta. No navega, no recarga, no inicia sesión; si la página ya necesita
 login, no hace nada. Cada intento es un evento `session_keepalive` con
-`http_status`, `refresh_cookie_present` y `refresh_cookie_rotated`. Lectura:
+`http_status`, `refresh_cookie_present`, `refresh_cookie_rotated` y
+`remaining_seconds`:
 
-- `ok: true` y `refresh_cookie_rotated: true` durante horas: la sesión se
-  extiende indefinidamente con esta renovación.
-- `ok: true` pero la cookie nunca rota y tras N horas aparece un 401: el token
-  de refresco tiene vida absoluta; la renovación no lo evita y la búsqueda
-  siguiente hará un login, como hoy.
-- 401 inmediato: la sesión ya estaba cerrada; la detección pasiva lo mostrará.
+- `ok: true` con `refresh_cookie_rotated: true` de forma sostenida: la sesión
+  se extiende indefinidamente.
+- `http_status: 401`: el portal rechazó el refresco; la búsqueda siguiente
+  habría caído en `/login/sesion-expirada`. El login ocurre por el camino de
+  siempre al tomar el siguiente trabajo, y la hora del evento queda como
+  evidencia de cuándo el portal mata sus tokens.
 
-Propuesta de prueba en su servidor: `CBRS_SESSION_KEEPALIVE_SECONDS=1200`, un
-lote por la mañana, otro ocho horas después, y comparar los eventos
-`session_keepalive` con los logins (`cbrs requests CUENTA --json`).
+En su servidor basta con dejar el valor por defecto y mirar
+`session_keepalive` junto a los logins (`cbrs requests CUENTA --json`) tras
+un día completo.
 
 ## Telemetría (llamada del 6-10)
 

@@ -40,10 +40,11 @@ HEADLESS_UNSUPPORTED = (
     "`xvfb-run -n 99 -s \"-screen 0 1366x900x24 -nolisten tcp\" cbrs jobs worker`. "
     "Sin `-s`, xvfb-run crea una pantalla de 640x480 a 8 bits."
 )
-# Opt-in session keep-alive: 0 disables it. When set, each authenticated browser
-# renews its access token through the portal's own refresh endpoint from the live
-# page (no reload, no login) at this cadence.
-DEFAULT_SESSION_KEEPALIVE_SECONDS = 0.0
+# Session keep-alive lead time: when the SPA's 30-minute access token has fewer
+# seconds left than this, the authenticated browser renews it through the
+# portal's own refresh endpoint from the live page (no reload, no login), which
+# also rotates the 7-day refresh cookie. 0 disables it. See docs/session-lifetime.md.
+DEFAULT_SESSION_KEEPALIVE_SECONDS = 300.0
 DEFAULT_WINDOW_MODE = "normal"
 DEFAULT_EXPECTED_EGRESS_COUNTRY = "CL"
 DEFAULT_CAPTCHA_SOLVER_MODE = "browser"
@@ -475,8 +476,8 @@ def load_settings(
         env.get("CBRS_SESSION_KEEPALIVE_SECONDS"),
         default=DEFAULT_SESSION_KEEPALIVE_SECONDS,
     )
-    if session_keepalive_seconds and session_keepalive_seconds < 300:
-        raise ValueError("CBRS_SESSION_KEEPALIVE_SECONDS must be 0 (off) or at least 300")
+    if session_keepalive_seconds < 0 or (session_keepalive_seconds and session_keepalive_seconds < 60):
+        raise ValueError("CBRS_SESSION_KEEPALIVE_SECONDS must be 0 (off) or at least 60")
     browser_preview_interval_seconds = _float(
         env.get("CBRS_BROWSER_PREVIEW_INTERVAL_SECONDS"),
         default=DEFAULT_BROWSER_PREVIEW_INTERVAL_SECONDS,

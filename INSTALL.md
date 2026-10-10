@@ -176,6 +176,13 @@ Sin pantalla, el worker corre headful sobre Xvfb con la misma resolución que
 xvfb-run -n 99 -s "-screen 0 1366x900x24 -nolisten tcp" .venv/bin/cbrs jobs worker
 ```
 
+Mientras el worker corre, cada navegador autenticado renueva su token de acceso
+(30 minutos) poco antes de que venza, con la misma petición de refresco que
+hace el portal; eso mantiene la sesión viva entre lotes sin logins nuevos
+(`CBRS_SESSION_KEEPALIVE_SECONDS`, 300 por defecto, 0 la apaga; ver
+`docs/session-lifetime.md`). Un worker detenido no renueva nada: tras más de
+siete días apagado, la primera búsqueda hará un login.
+
 Sin `-s`, `xvfb-run` crea una pantalla de 640x480 a 8 bits. `cbrs jobs worker`
 se niega a arrancar headless porque el portal rechaza el reCAPTCHA de búsqueda
 de Chrome headless (`captcha-rechazado`); `cbrs get --headless` sigue disponible

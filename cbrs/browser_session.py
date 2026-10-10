@@ -33,6 +33,19 @@ LOGIN_COOKIE_NAMES = {
 }
 
 
+def jwt_expires_at(token: str) -> float | None:
+    """The ``exp`` claim of an unverified JWT as a POSIX timestamp, else None."""
+    try:
+        import base64
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+        exp = data.get("exp")
+        return float(exp) if exp is not None else None
+    except Exception:
+        return None
+
+
 class CommerceAuthState(str, Enum):
     """Page-level evidence for access to the protected commerce search."""
 
@@ -1178,14 +1191,36 @@ class BrowserSession:
             body_base64=str(result.get("bodyBase64") or ""),
         )
 
+    def access_token_expires_in(self) -> float | None:
+        """Seconds until the SPA's stored access token expires; None when absent.
+
+        Reads ``localStorage.auth_cbrs_token`` exactly as the portal's own
+        interceptor does (it refreshes when ``exp < now + 30``). No network.
+        """
+        try:
+            raw = self.page.evaluate("() => localStorage.getItem('auth_cbrs_token')")
+        except Exception:
+            return None
+        if not raw:
+            return None
+        try:
+            token = json.loads(raw)
+        except ValueError:
+            token = raw
+        if not isinstance(token, str):
+            return None
+        expires_at = jwt_expires_at(token)
+        return None if expires_at is None else expires_at - time.time()
+
     def refresh_session_token(self) -> dict[str, Any]:
         """Renew the access token from the live page: no navigation, no login.
 
         Mirrors the portal's own interceptor (``/api/v1/auth/refresh`` with the
-        refresh cookie, then the new token in cookie and localStorage). Returns
-        the evidence for the keep-alive event, including whether the portal
-        rotated the refresh cookie, which tells whether idle sessions can be
-        extended indefinitely this way.
+        refresh cookie, then the new token in cookie and localStorage). The
+        portal rotates the 7-day refresh cookie on every refresh, so renewing
+        the access token before it expires keeps a session alive indefinitely
+        (see docs/session-lifetime.md). Returns the evidence for the
+        ``session_keepalive`` event.
         """
         def refresh_cookie() -> str | None:
             for cookie in self.context.cookies([self.settings.base_url]):
