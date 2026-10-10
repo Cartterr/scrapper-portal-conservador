@@ -169,6 +169,17 @@ Con Python 3.11+ y Chrome ya instalados: cree `.venv`, instale
 `pip install -r requirements-dev.txt` y `pip install --no-deps -e .`, complete
 `.env` y ejecute `.venv/bin/cbrs config validate`. En una terminal separada use
 `.venv/bin/cbrs jobs worker`; el cliente puede ejecutarse desde otra terminal.
+Sin pantalla, el worker corre headful sobre Xvfb con la misma resolución que
+`deploy/cbrs-display.service`:
+
+```bash
+xvfb-run -n 99 -s "-screen 0 1366x900x24 -nolisten tcp" .venv/bin/cbrs jobs worker
+```
+
+Sin `-s`, `xvfb-run` crea una pantalla de 640x480 a 8 bits. `cbrs jobs worker`
+se niega a arrancar headless porque el portal rechaza el reCAPTCHA de búsqueda
+de Chrome headless (`captcha-rechazado`); `cbrs get --headless` sigue disponible
+para diagnósticos.
 Este modo conserva la propiedad de Chrome dentro del worker y no tiene las
 garantías de separación del servicio con propietario independiente. No use
 `pkill chrome` para resolver errores ni sobre sesiones productivas. Ctrl+C o
@@ -191,6 +202,28 @@ teniendo prioridad: revise `CBRS_DATAIMPULSE_CANDIDATES_PER_RECOVERY` y
 La recuperación de login con candidatos sigue limitada a los IDs explícitos
 de `CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS` y a evidencia visible de rechazo.
 
+## Reemplazar una cuenta dada de baja
+
+Rutas, retenciones de cuota, rechazos de candidatos, historial de salidas,
+registro de peticiones y el perfil de Chrome (`accounts/<id>` bajo el directorio
+de runtime) van por ID de cuenta. Un ID retirado no se reutiliza: su estado
+seguiría aplicándose al usuario nuevo.
+
+1. Elija un número `N` nunca usado y agregue `CBRS_EJECUTIVO_N_USERNAME` y
+   `CBRS_EJECUTIVO_N_PASSWORD` al `.env`. Con cuentas descubiertas (sin lista
+   `accounts` en `account-pool.json`) el ID es `ejecutivo_N` y el puerto sticky
+   `9999 + N`; con una lista explícita, agregue una entrada nueva con `id`,
+   `label`, `username_env`, `password_env`, `proxy_provider` y ese puerto.
+2. Retire la cuenta antigua: quite su par del `.env` (cuentas descubiertas) o
+   ponga `"enabled": false` en su entrada del JSON. No borre su perfil ni su
+   historial: siguen siendo evidencia.
+3. Si la cuenta nueva debe probar candidatos DataImpulse tras un login
+   rechazado, agregue su ID a `CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS`. Nunca
+   use un comodín.
+4. `cbrs config validate` y reinicie el worker: la configuración de cuentas se
+   lee al arrancar. En `mobile_sticky` la línea base de salida de la cuenta
+   nueva se crea sola tras validar el país. La primera autenticación puede tardar.
+
 ## Cinco errores frecuentes
 
 | Síntoma | Acción |
@@ -198,7 +231,7 @@ de `CBRS_FAILED_LOGIN_REPLACEMENT_ACCOUNTS` y a evidencia visible de rechazo.
 | Servicio no disponible | El mensaje indica el comando exacto según la instalación: `cbrs service start worker` con systemd, `cbrs jobs worker` en otra terminal sin systemd. |
 | Campos faltantes | `cbrs config validate`; completar sólo las claves indicadas en `.env`. |
 | CSV inválido | Corregir encabezado, codificación o la línea indicada; las filas inválidas constan en el reporte. |
-| `pending_quota` | Consultar `resume_at`; el servicio revisará la cuota sin reenviar el lote. La hora es una estimación. |
+| `pending_quota` | Consultar `resume_at`; el servicio revisará la cuota sin reenviar el lote. La hora es una estimación. También aparece cuando la última cuenta sin cuota agotada está pausada con reanudación programada (por ejemplo, el tope diario de logins de candidatos); la columna `error` lo indica. |
 | `pending` por login o proxy | Revisar `cbrs status` y logs; conservar las sesiones autenticadas. El servicio reintenta solo. |
 | `pending_reconciliation` | Búsqueda enviada sin resultado confirmado. El servicio ya consultó «Recientes» en el portal: si la inscripción hubiera faltado habría reintentado solo. Revise «Recientes» de esa cuenta: si la inscripción no figura, `cbrs jobs reconcile JOB_ID --apply`; si figura, la cuota se consumió y el resultado debe recuperarse a mano. |
 

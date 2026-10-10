@@ -233,6 +233,56 @@ def dismiss_dialog(page, evidence, *, timeout_ms=5000):
     return True
 
 
+def attribute_rejection_dialog(browser, exc, *, settle_ms=300, attempts=5):
+    """Own the dialog a rejected search reCAPTCHA leaves open (D32).
+
+    The portal answers ``captcha-rechazado`` with the same "Atención / Se ha
+    detectado un problema" modal even from a clean network (informe 22-09,
+    6.2). It is the trace of a rejection this flow already classified, not new
+    evidence about the route: close it, and remember it in case closing fails,
+    so the passive sampler never reads it later as a compromised exit and
+    deletes an authenticated profile. No reload, no replay, no logout.
+    """
+    page = browser.page
+    evidence = None
+    for _ in range(attempts):
+        page.wait_for_timeout(settle_ms)  # one bounded render window per check
+        try:
+            evidence = portal_dialog_evidence(page)
+        except Exception:
+            evidence = None
+        if evidence:
+            break
+    if not evidence or evidence['reason'] != PORTAL_ERROR_DIALOG:
+        return None
+    browser.attributed_dialog = {**evidence, 'cause': exc.reason.value}
+    dismissed = False
+    try:
+        dismissed = dismiss_dialog(page, evidence)
+    except Exception:
+        pass
+    if dismissed:
+        browser.attributed_dialog = None  # nothing left on the page to attribute
+    path = browser_quota_path(browser)
+    if path:
+        from .jobs import JobStore
+        JobStore(path).add_event('captcha_rejected_dialog_attributed',
+            account_id=getattr(browser.settings, 'account_id', None),
+            data={'dismissed': dismissed, 'panel_id': evidence.get('panel_id'),
+                  'route_evidence': False})
+    return evidence
+
+
+def dialog_attributed(browser, evidence):
+    """True when this visible dialog is the one a classified rejection left open."""
+    owned = getattr(browser, 'attributed_dialog', None)
+    if not owned or not evidence or evidence.get('reason') != owned.get('reason'):
+        return False
+    if owned.get('panel_id') or evidence.get('panel_id'):
+        return owned.get('panel_id') == evidence.get('panel_id')
+    return (owned.get('heading'), owned.get('message')) == (evidence.get('heading'), evidence.get('message'))
+
+
 def dismiss_previous_empty_dialog(page):
     """Dismiss only the recognized old empty modal; never infer this job's result."""
     evidence = portal_dialog_evidence(page)
@@ -350,7 +400,16 @@ def search_fna_form(browser, foja, numero, ano, *, client, pace):
                 JobStore(path).add_event('previous_empty_dialog_dismissed', account_id=account_id,
                     data={'panel_selector': initial['panel_selector'], 'panel_id': initial.get('panel_id'),
                           'new_search_result_inferred': False})
-        if initial and initial['reason'] == PORTAL_ERROR_DIALOG:
+        if initial and initial['reason'] == PORTAL_ERROR_DIALOG and dialog_attributed(browser, initial):
+            # Left over from a classified reCAPTCHA rejection whose close click
+            # failed (D32): try once more to close it; it is not route evidence.
+            try:
+                dismiss_dialog(browser.page, initial)
+                browser.attributed_dialog = None
+                initial = portal_dialog_evidence(browser.page)
+            except Exception:
+                pass
+        if initial and initial['reason'] == PORTAL_ERROR_DIALOG and not dialog_attributed(browser, initial):
             # The portal error dialog is already open on this route. It is never
             # refreshed away: the exit is compromised and another account must take
             # this search while the route is replaced.
@@ -528,6 +587,7 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
                                               status=captured.status, context='commerce form search') from exc
             if exc.reason != StopReason.CAPTCHA_REJECTED:
                 raise
+            attribute_rejection_dialog(browser, exc)
             # Reuse the observed rejection with the existing bounded solver chain.
             # Do NOT submit a second browser-token request first.
             result = client.post_json(
@@ -560,7 +620,7 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
             # the field read-back fails. Nothing was submitted, so classify by
             # the modal that blocked the form instead of handing the same
             # route another query later (D17).
-            if evidence and evidence['reason'] == PORTAL_ERROR_DIALOG:
+            if evidence and evidence['reason'] == PORTAL_ERROR_DIALOG and not dialog_attributed(browser, evidence):
                 stop = portal_error_dialog_stop(evidence, after_submission=False,
                     message='Portal error dialog blocked the search form; route compromised, nothing submitted')
                 notify_browser_error(browser, stop)

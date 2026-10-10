@@ -28,14 +28,22 @@ DEFAULT_BROWSER_BACKEND = "chrome"
 # The portal rejects the search reCAPTCHA of headless Chrome (D29, 2026-09-24);
 # run headed, on Xvfb when no screen is available.
 DEFAULT_HEADLESS = False
-# D30: the rejection also shows the portal error dialog, which the service reads
-# as a compromised exit and answers by deleting profiles and rotating routes.
+# D30: the worker refuses to start headless because every headless search would
+# be rejected; `cbrs get` and diagnostics may still pass --headless explicitly.
+# Since D32 the dialog left by a rejected search reCAPTCHA is attributed to that
+# rejection and is no longer read as a compromised exit.
 HEADLESS_UNSUPPORTED = (
     "Chrome headless no es compatible con el portal: rechaza el reCAPTCHA de "
-    "búsqueda (captcha-rechazado) y el diálogo de error resultante se tomaría como "
-    "ruta comprometida. Use CBRS_HEADLESS=0; en Linux sin pantalla, sobre Xvfb "
-    "(DISPLAY=:99, deploy/cbrs-display.service)."
+    "búsqueda (captcha-rechazado, pruebas del 2026-09-24), así que `cbrs jobs worker` "
+    "sólo arranca headful (CBRS_HEADLESS=0). En Linux sin pantalla use Xvfb: "
+    "deploy/cbrs-display.service (DISPLAY=:99) o "
+    "`xvfb-run -n 99 -s \"-screen 0 1366x900x24 -nolisten tcp\" cbrs jobs worker`. "
+    "Sin `-s`, xvfb-run crea una pantalla de 640x480 a 8 bits."
 )
+# Opt-in session keep-alive: 0 disables it. When set, each authenticated browser
+# renews its access token through the portal's own refresh endpoint from the live
+# page (no reload, no login) at this cadence.
+DEFAULT_SESSION_KEEPALIVE_SECONDS = 0.0
 DEFAULT_WINDOW_MODE = "normal"
 DEFAULT_EXPECTED_EGRESS_COUNTRY = "CL"
 DEFAULT_CAPTCHA_SOLVER_MODE = "browser"
@@ -147,6 +155,7 @@ class Settings:
     dataimpulse_canary_spacing_seconds: float
     browser_healthcheck_seconds: float
     browser_reauth_backoff_seconds: float
+    session_keepalive_seconds: float
     browser_preview_interval_seconds: float
     browser_preview_max_age_seconds: float
     search_submission_timeout_seconds: float
@@ -462,6 +471,12 @@ def load_settings(
     )
     if browser_reauth_backoff_seconds < 10:
         raise ValueError("CBRS_BROWSER_REAUTH_BACKOFF_SECONDS must be at least 10")
+    session_keepalive_seconds = _float(
+        env.get("CBRS_SESSION_KEEPALIVE_SECONDS"),
+        default=DEFAULT_SESSION_KEEPALIVE_SECONDS,
+    )
+    if session_keepalive_seconds and session_keepalive_seconds < 300:
+        raise ValueError("CBRS_SESSION_KEEPALIVE_SECONDS must be 0 (off) or at least 300")
     browser_preview_interval_seconds = _float(
         env.get("CBRS_BROWSER_PREVIEW_INTERVAL_SECONDS"),
         default=DEFAULT_BROWSER_PREVIEW_INTERVAL_SECONDS,
@@ -556,6 +571,7 @@ def load_settings(
         dataimpulse_canary_spacing_seconds=dataimpulse_canary_spacing,
         browser_healthcheck_seconds=browser_healthcheck_seconds,
         browser_reauth_backoff_seconds=browser_reauth_backoff_seconds,
+        session_keepalive_seconds=session_keepalive_seconds,
         browser_preview_interval_seconds=browser_preview_interval_seconds,
         browser_preview_max_age_seconds=browser_preview_max_age_seconds,
         search_submission_timeout_seconds=search_submission_timeout_seconds,

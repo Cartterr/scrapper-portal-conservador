@@ -177,6 +177,7 @@ class _ManagedAccountScraper:
     reauth_required: bool = False
     authenticated_once: bool = False
     portal_error_dialog: bool = False
+    last_keepalive_at: float = 0.0
 
 
 def is_portal_error_dialog(exc: BaseException) -> bool:
@@ -299,6 +300,38 @@ class _PersistentAccountBrowsers:
                 # login, search, recovery, or exclusive browser-owner lease.
                 continue
 
+    def _keepalive(self, account_id: str, entry: _ManagedAccountScraper, settings: Settings) -> None:
+        """Opt-in token renewal on an authenticated page; never a login or reload.
+
+        ``CBRS_SESSION_KEEPALIVE_SECONDS`` is 0 by default. When set, each
+        authenticated browser calls the portal's own refresh endpoint from its
+        live page at that cadence, so an idle session is not logged out by an
+        expired access token when the next search arrives. Outcomes are events
+        (``session_keepalive``), the evidence the operator asked for.
+        """
+        interval = float(getattr(settings, "session_keepalive_seconds", 0.0) or 0.0)
+        if interval <= 0 or not entry.authenticated_once or entry.reauth_required:
+            return
+        now = time.monotonic()
+        if not entry.last_keepalive_at:
+            entry.last_keepalive_at = now  # the login itself just issued a token
+            return
+        if now - entry.last_keepalive_at < interval:
+            return
+        entry.last_keepalive_at = now
+        browser = getattr(entry.scraper, "browser", entry.scraper)
+        refresh = getattr(browser, "refresh_session_token", None)
+        if not callable(refresh):
+            return
+        try:
+            outcome = dict(refresh())
+        except Exception as exc:
+            outcome = {"ok": False, "error_type": type(exc).__name__}
+        self.store.add_event(
+            "session_keepalive", account_id=account_id,
+            level="info" if outcome.get("ok") else "warning", data=outcome,
+        )
+
     def refresh_page_auth_states(self, *, account_ids: set[str] | None = None) -> None:
         from .runtime_updates import runtime_module
         runtime_module("runtime_observation").sample_auth(self, account_ids=account_ids)
@@ -338,6 +371,8 @@ class _PersistentAccountBrowsers:
                     continue  # never re-login or relaunch through a compromised exit
             except Exception:
                 continue
+            if entry is not None:
+                self._keepalive(account_id, entry, settings)
             # An already-known failed login need not wait for the next passive
             # health scan after its cooldown expires. This is scheduling only:
             # account/global/route gates and the retry floor still apply.
@@ -1130,6 +1165,15 @@ class JobStore:
                 existing = db.execute(
                     "SELECT * FROM jobs WHERE idempotency_key = ?", (key,)
                 ).fetchone()
+                if existing and existing["status"] == "cancelled":
+                    # A cancelled job answers nothing (D33): release its key so
+                    # the same inscription can be requested again. Its row,
+                    # attempts and evidence stay for the record.
+                    db.execute(
+                        "UPDATE jobs SET idempotency_key = NULL, updated_at = ? WHERE job_id = ?",
+                        (now, existing["job_id"]),
+                    )
+                    existing = None
                 if existing:
                     if existing["kind"] != kind or existing["input_json"] != stable_json(normalized):
                         raise IdempotencyConflictError(

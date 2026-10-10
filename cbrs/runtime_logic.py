@@ -84,24 +84,43 @@ def finish_for_review(store, job_id, reason):
     return bool(changed)
 
 def _all_accounts_quota_held(store, pool_store, run_id, config, quota_policy):
-    """Earliest hold release when every usable account is portal-held, else None.
+    """Earliest release when every usable account is held, else None."""
+    held = _accounts_release(store, pool_store, run_id, config, quota_policy)
+    return held[0] if held else None
 
-    Accounts disabled by rejected credentials never come back on their own, so
-    they do not count; one account with capacity (or a probe already due) means
-    the job must keep flowing instead of waiting on the quota clock.
+
+def _accounts_release(store, pool_store, run_id, config, quota_policy):
+    """``(resume_at, reason)`` when every usable account is held, else None.
+
+    Held means a portal quota hold or a pause with a known resume time, such
+    as the daily candidate-login cap (D34). Accounts disabled by rejected
+    credentials never come back on their own, so they do not count; one
+    account with capacity (or a probe already due) means the job must keep
+    flowing instead of waiting on a clock. The reason is
+    ``portal_quota_exhausted`` only when quota holds alone explain the wait.
     """
+    now = core.utc_now()
     states = {str(row['account_id']): dict(row) for row in pool_store.accounts(run_id)}
-    releases = []
+    releases, quota_only = [], True
     for account in config.accounts:
         if not account.enabled:
             continue
-        if states.get(account.account_id, {}).get('paused_reason') == 'credentials_invalid':
+        state = states.get(account.account_id, {})
+        if state.get('paused_reason') == 'credentials_invalid':
             continue
         hold = quota_policy.quota_hold(store.path, account.account_id)
-        if not (hold and hold.get('blocked')):
-            return None
-        releases.append(str(hold['next_check_at']))
-    return min(releases) if releases else None
+        if hold and hold.get('blocked'):
+            releases.append(str(hold['next_check_at']))
+            continue
+        resume_at = str(state.get('resume_at') or '')
+        if state.get('status') == 'paused' and resume_at > now:
+            releases.append(resume_at)
+            quota_only = False
+            continue
+        return None
+    if not releases:
+        return None
+    return min(releases), ('portal_quota_exhausted' if quota_only else 'accounts_unavailable')
 
 
 def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobStore, pool_store: AccountPoolStore, run_id: str, browser_pool: _PersistentAccountBrowsers, preflight_runner: Callable[..., Any], proxy_health_runner: Callable[..., Any], endurance_plan: Any | None=None) -> str:
@@ -195,14 +214,16 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                 # Do not monopolize the one endurance slot while its original
                 # account cannot retrieve documents. Keep its accepted receipt.
                 return store.get_job(job.job_id)['status']
-            resume = None if checkpoint['saved'] else _all_accounts_quota_held(store, pool_store, run_id, config, quota_policy)
-            if resume:
-                # Every usable account is held by the portal's daily limit: wait
-                # for the earliest release instead of re-claiming every minute,
-                # and say so in the job itself so reports show pending_quota (D16/D17).
-                store.set_waiting(job.job_id, 'waiting_capacity', reason='portal_quota_exhausted', next_run_at=resume)
+            held = None if checkpoint['saved'] else _accounts_release(store, pool_store, run_id, config, quota_policy)
+            if held:
+                # Every usable account is held by the portal's daily limit or by
+                # a pause with a known end (login cap, D34): wait for the earliest
+                # release instead of re-claiming every few seconds, and say so in
+                # the job itself so reports show pending_quota with resume_at (D16/D17/D27).
+                resume, reason = held
+                store.set_waiting(job.job_id, 'waiting_capacity', reason=reason, next_run_at=resume)
                 pool_store.update_run(run_id, status='waiting_capacity', next_cycle_at=resume,
-                                      blocked_reason='portal_quota_exhausted')
+                                      blocked_reason=reason)
                 return 'waiting_capacity'
             if target_account_id:
                 target_state = next((str(row['status']) for row in pool_store.accounts(run_id) if str(row['account_id']) == target_account_id), 'paused')

@@ -1178,6 +1178,44 @@ class BrowserSession:
             body_base64=str(result.get("bodyBase64") or ""),
         )
 
+    def refresh_session_token(self) -> dict[str, Any]:
+        """Renew the access token from the live page: no navigation, no login.
+
+        Mirrors the portal's own interceptor (``/api/v1/auth/refresh`` with the
+        refresh cookie, then the new token in cookie and localStorage). Returns
+        the evidence for the keep-alive event, including whether the portal
+        rotated the refresh cookie, which tells whether idle sessions can be
+        extended indefinitely this way.
+        """
+        def refresh_cookie() -> str | None:
+            for cookie in self.context.cookies([self.settings.base_url]):
+                if cookie["name"] == "cbrs_refresh_token":
+                    return str(cookie["value"])
+            return None
+
+        before = refresh_cookie()
+        response = self.fetch_json(
+            "/api/v1/auth/refresh",
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            body={},
+        )
+        token = None
+        if response.status == 200:
+            try:
+                data = json.loads(response.body_text or "")
+            except json.JSONDecodeError:
+                data = {}
+            candidate = data.get("token") if isinstance(data, dict) else None
+            if isinstance(candidate, str) and candidate:
+                token = candidate
+                self.set_auth_cookie(token)
+        return {
+            "ok": token is not None,
+            "http_status": int(response.status),
+            "refresh_cookie_present": before is not None,
+            "refresh_cookie_rotated": before != refresh_cookie(),
+        }
+
     def set_auth_cookie(self, token: str) -> None:
         domain = urlparse(self.settings.base_url).hostname
         if not domain:

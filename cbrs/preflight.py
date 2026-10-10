@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -22,6 +24,15 @@ from .proxy import build_authenticated_proxy_opener
 from .safety import redact
 
 EGRESS_INFO_URL = "https://ipinfo.io/json"
+# Same two fields (``ip``, ISO-2 ``country``) from an independent service; only
+# consulted after the primary answered with an HTTP error twice.
+EGRESS_INFO_FALLBACK_URL = "https://ipapi.co/json/"
+EGRESS_INFO_URLS = (EGRESS_INFO_URL, EGRESS_INFO_URL, EGRESS_INFO_FALLBACK_URL)
+EGRESS_SERVICE_RETRY_SECONDS = 2.0
+
+
+class EgressServiceUnavailable(RuntimeError):
+    """Every IP lookup service answered with an HTTP error; the proxy itself did respond."""
 
 
 @dataclass(frozen=True)
@@ -177,16 +188,33 @@ def ensure_preflight_ok(settings: Settings = SETTINGS) -> PreflightResult:
     return result
 
 
-def fetch_public_egress(settings: Settings = SETTINGS) -> dict[str, Any]:
-    request = Request(EGRESS_INFO_URL, headers={"user-agent": "cbrs-preflight/1.0"})
+def fetch_public_egress(settings: Settings = SETTINGS, *, sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
+    """Resolve the public exit (``ip``, ``country``) through the configured proxy.
+
+    The lookup travels through an HTTPS tunnel, so an HTTP status can only come
+    from the lookup service itself: the proxy already carried the request. Such
+    an answer (ipinfo 429/503, D35) is retried once and then asked of a second
+    service before it is reported as ``EgressServiceUnavailable``; it is never a
+    proxy failure. Transport errors (tunnel, DNS, timeout) still propagate at once.
+    """
     opener = _proxy_opener(settings.proxy_url)
     open_fn = opener.open if opener else urlopen
-    with open_fn(request, timeout=20) as response:
-        payload = response.read().decode("utf-8", errors="replace")
-    data = json.loads(payload)
-    if not isinstance(data, dict):
-        raise RuntimeError("egress service returned unexpected payload")
-    return data
+    service_errors: list[str] = []
+    for attempt, url in enumerate(EGRESS_INFO_URLS):
+        if attempt:
+            sleep(EGRESS_SERVICE_RETRY_SECONDS)
+        request = Request(url, headers={"user-agent": "cbrs-preflight/1.0"})
+        try:
+            with open_fn(request, timeout=20) as response:
+                payload = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            service_errors.append(f"{urlparse(url).hostname} HTTP {exc.code}")
+            continue
+        data = json.loads(payload)
+        if not isinstance(data, dict):
+            raise RuntimeError("egress service returned unexpected payload")
+        return data
+    raise EgressServiceUnavailable("egress lookup service unavailable: " + "; ".join(service_errors))
 
 
 def write_preflight_report(

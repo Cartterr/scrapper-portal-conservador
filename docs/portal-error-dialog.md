@@ -22,6 +22,16 @@ That exact visible signature is treated as evidence about the ROUTE, not the
 account: `verdict: proxy_compromised`. It is not evidence of invalid
 credentials, of a portal-wide outage, or of an expired session.
 
+**Not evidence (D32, 2026-09-30):** the same modal is also the portal's answer
+to a rejected search reCAPTCHA (`captcha-rechazado`, HTTP 400), even from a
+clean network. The search flow that observed that rejection owns the dialog:
+`attribute_rejection_dialog()` closes it and, if the close click fails,
+remembers it on the browser (`attributed_dialog`) so neither the passive
+sampler nor the pre-submission check reads it later as a compromised exit. The
+account still takes its `captcha_rejected` pause; its profile survives. A
+different dialog (new panel id) or one that appears without a classified
+rejection keeps the verdict above.
+
 ## Reaction
 
 1. **Detect, continuously.** `portal_dialog_evidence()` recognizes the dialog

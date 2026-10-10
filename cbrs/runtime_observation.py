@@ -55,9 +55,11 @@ def sample_auth(self, *, account_ids=None):
         from .runtime_updates import runtime_module
         quota_policy = runtime_module('form_search')
         try:
-            dialog = quota_policy.portal_dialog_reason(browser.page)
+            evidence = quota_policy.portal_dialog_evidence(browser.page)
+            page_read = True
         except Exception:
-            dialog = None  # Disconnected pages cannot supply evidence.
+            evidence, page_read = None, False  # Disconnected pages cannot supply evidence.
+        dialog = evidence['reason'] if evidence else None
         quota_exhausted = dialog == 'daily_limit'
         if quota_exhausted:
             quota_policy.record_quota_hold(self.store.path, account_id)
@@ -65,7 +67,13 @@ def sample_auth(self, *, account_ids=None):
         # The exact portal error dialog identifies a compromised exit: flag it
         # for the owning process, which ditches the browser and replaces the
         # route. Observation only; nothing is clicked, reloaded or logged out.
-        portal_error = dialog == getattr(quota_policy, 'PORTAL_ERROR_DIALOG', 'temporary_unavailable')
+        # The one exception is the dialog a classified reCAPTCHA rejection left
+        # open (D32): the search flow already owns that trace, so it is never
+        # passive route evidence. Once it is gone the attribution is spent.
+        attributed = bool(evidence) and bool(getattr(quota_policy, 'dialog_attributed', lambda *_: False)(browser, evidence))
+        if page_read and not evidence and getattr(browser, 'attributed_dialog', None):
+            browser.attributed_dialog = None
+        portal_error = dialog == getattr(quota_policy, 'PORTAL_ERROR_DIALOG', 'temporary_unavailable') and not attributed
         if portal_error:
             entry.portal_error_dialog = True
         detector = getattr(browser, "detect_commerce_auth_state", None)

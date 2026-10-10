@@ -322,12 +322,21 @@ class Client:
         else:
             accounts = self.status()["accounts"]
             usable = [a for a in accounts if a.get("status") != "disabled"]
-            held = [a for a in usable if a.get("portal_quota") or a.get("status") == "held"]
-            if job.get("error_code") == "portal_quota_exhausted" or (usable and len(held) == len(usable)):
+            quota = [a for a in usable if a.get("portal_quota") or a.get("status") == "held"]
+            # A pause with a known end (the daily login cap, D34) holds an
+            # account as surely as the portal quota: the reader needs resume_at.
+            paused = [a for a in usable if a not in quota and a.get("status") == "paused" and a.get("resume_at")]
+            held = quota + paused
+            if job.get("error_code") in {"portal_quota_exhausted", "accounts_unavailable"} or (usable and len(held) == len(usable)):
                 result.status = "pending_quota"
                 dates = [a["resume_at"] for a in held if a.get("resume_at")]
                 result.resume_at = min(dates) if dates else None
-                result.error = "Todas las cuentas tienen cuota del portal agotada."
+                if paused:
+                    reasons = ", ".join(sorted({str(a.get("error") or "pausa") for a in paused}))
+                    result.error = (f"Sin cuentas disponibles: cuota del portal agotada ({len(quota)}), "
+                                    f"pausadas con reanudación programada ({len(paused)}: {reasons}).")
+                else:
+                    result.error = "Todas las cuentas tienen cuota del portal agotada."
         return result
 
     def job(self, job_id: str) -> Result:
