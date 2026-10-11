@@ -33,6 +33,16 @@ def add_download_parsers(subparsers) -> None:
     batch.add_argument("--timeout", type=float, default=None)
     batch.add_argument("--no-wait", action="store_true")
     batch.add_argument("--json", action="store_true")
+    find = subparsers.add_parser("find", help="Buscar inscripciones por razón social o nombre de socio")
+    find.add_argument("nombre", help="Texto a buscar (hasta 50 caracteres)")
+    find.add_argument("--ano", type=int, help="Conservar sólo coincidencias de ese año")
+    find.add_argument("--exact", action="store_true", help="Conservar sólo la razón social idéntica al texto")
+    find.add_argument("--download", action="store_true",
+                      help="Descargar el PDF si queda exactamente una coincidencia tras los filtros")
+    find.add_argument("--output")
+    find.add_argument("--force", action="store_true")
+    find.add_argument("--timeout", type=float, default=300)
+    find.add_argument("--json", action="store_true")
     status = subparsers.add_parser("status", help="Estado del servicio, cuentas y cola")
     status.add_argument("--json", action="store_true")
 
@@ -64,6 +74,24 @@ def run(args) -> int:
             if result.status != "done":
                 print(" ".join((result.error or f"Trabajo pendiente: {result.job_id}").splitlines()), file=sys.stderr)
             return 0 if result.status == "done" else 1
+        if args.command == "find":
+            result = client.find(args.nombre, ano=args.ano, exact=args.exact, download=args.download,
+                                 output=args.output, force=args.force)
+            if args.json:
+                print(json.dumps(result.to_dict(), ensure_ascii=False))
+            elif result.status == "done":
+                print(result.pdf_path)
+            else:
+                for index, match in enumerate(result.matches or [], 1):
+                    mark = "*" if match["selected"] else " "
+                    print(f"{mark}{index:3d}. {match['nombre'] or '-'} | fojas {match['foja']} | numero {match['numero']} | "
+                          f"ano {match['ano']} | {match['acto'] or '-'}")
+                print(f"status={result.status} job_id={result.job_id} coincidencias={len(result.matches or [])}")
+                if result.status == "needs_selection":
+                    print("Para descargar una: cbrs get --fojas F --numero N --ano A")
+            if result.status not in {"done", "needs_selection", "not_found"}:
+                print(" ".join((result.error or f"Trabajo pendiente: {result.job_id}").splitlines()), file=sys.stderr)
+            return 0 if result.status in {"done", "needs_selection", "not_found"} else 1
         if args.report.resolve() == args.input.resolve():
             raise InvalidInscription("El reporte debe tener una ruta diferente al CSV de entrada.")
         results = client.get_batch(args.input, output_dir=args.output, report=args.report,

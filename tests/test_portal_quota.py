@@ -23,7 +23,7 @@ def test_due_probe_refreshes_stale_modal_and_clears_only_on_acceptance(tmp_path,
             self.reloaded += 1
     page = Page()
     browser = SimpleNamespace(settings=SimpleNamespace(account_id='a3'), quota_store_path=path, page=page)
-    monkeypatch.setattr(policy, '_search_fna_once', lambda *a, **kw: [])
+    monkeypatch.setattr(policy, '_submit_search_once', lambda *a, **kw: [])
     monkeypatch.setattr(policy, 'notify_browser_error', lambda *a: None)
     assert policy.search_fna_form(browser,1,2,2000,client=None,pace=None) == []
     assert page.reloaded == 1
@@ -69,7 +69,7 @@ def test_login_after_probe_refresh_restores_probe_eligibility(tmp_path, monkeypa
     monkeypatch.setattr(policy,'notify_browser_error',lambda *a:None)
     def expired(*a,**kw):
         raise SafetyStopException(StopReason.AUTH_REQUIRED,'Login gate')
-    monkeypatch.setattr(policy,'_search_fna_once',expired)
+    monkeypatch.setattr(policy,'_submit_search_once',expired)
     with pytest.raises(SafetyStopException):
         policy.search_fna_form(browser,1,2,2000,client=None,pace=None)
     hold=quota_hold(path,'a3')
@@ -103,7 +103,7 @@ def test_probe_without_quota_answer_keeps_its_admission(tmp_path, monkeypatch, r
     monkeypatch.setattr(policy,'notify_browser_error',lambda *a:None)
     def fail(*a,**kw):
         raise SafetyStopException(reason,'probe failed')
-    monkeypatch.setattr(policy,'_search_fna_once',fail)
+    monkeypatch.setattr(policy,'_submit_search_once',fail)
     with pytest.raises(SafetyStopException):
         policy.search_fna_form(browser,1,2,2000,client=None,pace=None)
     hold = quota_hold(path,'a3')

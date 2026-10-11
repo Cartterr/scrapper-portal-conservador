@@ -1519,8 +1519,9 @@ class JobStore:
 
     def add_results(
         self, job_id: str, results: list[dict[str, Any]], *, attempt_id: str | None = None,
-        materialize_items: bool = True,
+        materialize_items: bool = True, download_sequences: set[int] | None = None,
     ) -> list[dict[str, Any]]:
+        """Record the search receipt and its rows; rows outside ``download_sequences`` are kept as ``skipped``."""
         now = utc_now()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -1541,12 +1542,14 @@ class JobStore:
                 for sequence, result in enumerate(results if materialize_items else [], 1):
                     ticket = result.get("ticket")
                     public_result = {key: value for key, value in result.items() if key != "ticket"}
+                    status = ("pending" if download_sequences is None or sequence in download_sequences
+                              else "skipped")
                     db.execute(
                         """
                         INSERT INTO job_items(
                             item_id, job_id, sequence, ticket_ref, result_json,
                             status, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             f"{job_id}-item-{sequence:04d}",
@@ -1554,6 +1557,7 @@ class JobStore:
                             sequence,
                             str(ticket) if ticket else None,
                             stable_json(public_result),
+                            status,
                             now,
                             now,
                         ),
@@ -2286,16 +2290,19 @@ class JobStore:
             total = sum(counts.values())
             completed = counts.get("completed", 0)
             failed = counts.get("failed", 0)
+            # Rows a name search kept for the caller to choose from are done
+            # by not being downloaded; they never make a job partial or failed.
+            skipped = counts.get("skipped", 0)
             if bool(job["cancel_requested"]):
                 status = "cancelled"
             else:
                 if total == 0:
                     status = "completed"
-                elif completed == total:
+                elif completed + skipped == total:
                     status = "completed"
-                elif completed > 0 and completed + failed == total:
+                elif completed > 0 and completed + failed + skipped == total:
                     status = "partial"
-                elif failed == total:
+                elif failed > 0 and failed + skipped == total:
                     status = "failed"
                 else:
                     return "running"
@@ -3220,6 +3227,8 @@ class JobStore:
             ).fetchone()
             account_id = attempt["account_id"] if attempt else None
         raw_input = json.loads(str(row["input_json"]))
+        items = self._items_db(db, str(row["job_id"]), public=True)
+        skipped = sum(1 for item in items if item.get("status") == "skipped")
         payload = {
             "job_id": row["job_id"],
             "kind": row["kind"],
@@ -3235,7 +3244,8 @@ class JobStore:
                 "not_required" if row["result_count"] == 0 or (
                     row["source"] == "captcha_validation" and raw_input.get("validation_only")
                 ) else
-                "completed" if row["completed_items"] == row["result_count"] else
+                "selection_required" if skipped == row["result_count"] else
+                "completed" if (row["completed_items"] or 0) + skipped == row["result_count"] else
                 "failed" if row["failed_items"] else "pending"
             ),
             "failed_items": row["failed_items"],
@@ -3250,7 +3260,7 @@ class JobStore:
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
             "attempts": self._attempts_db(db, str(row["job_id"])),
-            "items": self._items_db(db, str(row["job_id"]), public=True),
+            "items": items,
         }
         if include_input:
             payload["input"] = raw_input
@@ -3361,8 +3371,10 @@ def normalize_job_input(kind: str, input_data: Mapping[str, Any]) -> dict[str, A
             raise ValueError("text jobs require a non-empty text value")
         if len(query) > 500:
             raise ValueError("text value must be 500 characters or fewer")
+        select = _normalize_select(input_data.get("select"))
         return {
             "text": query,
+            **({"select": select} if select else {}),
             **({"sample_pages": sample_pages} if sample_pages else {}),
             **internal,
         }
@@ -3383,6 +3395,55 @@ def normalize_job_input(kind: str, input_data: Mapping[str, Any]) -> dict[str, A
             **internal,
         }
     raise ValueError("job kind must be 'text' or 'fna'")
+
+
+def _normalize_select(value: Any) -> dict[str, Any] | None:
+    """Selection policy of a name search: which matches to download.
+
+    Absent means the legacy behaviour (every row). Present, it filters the
+    rows by exact ``ano`` and/or exact normalized ``nombre`` and downloads only
+    when exactly one row remains and ``download`` is true; otherwise the rows
+    are kept for the caller to choose from.
+    """
+    if value in (None, "", {}):
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("select must be an object")
+    ano = value.get("ano")
+    if ano in (None, ""):
+        ano = None
+    else:
+        try:
+            ano = int(ano)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("select.ano must be an integer year") from exc
+        if ano <= 0:
+            raise ValueError("select.ano must be positive")
+    nombre = " ".join(str(value.get("nombre") or "").split()) or None
+    return {"download": bool(value.get("download", True)), "ano": ano, "nombre": nombre}
+
+
+def select_matches(job_input: Mapping[str, Any], results: list[Mapping[str, Any]]) -> set[int] | None:
+    """1-based sequences a text job downloads; None means every row (no policy)."""
+    select = job_input.get("select") if isinstance(job_input, Mapping) else None
+    if not select:
+        return None
+    from .form_search import normalize_name
+    wanted = normalize_name(select["nombre"]) if select.get("nombre") else None
+    candidates = []
+    for sequence, row in enumerate(results, 1):
+        if select.get("ano") is not None:
+            try:
+                if int(row.get("ano")) != int(select["ano"]):
+                    continue
+            except (TypeError, ValueError):
+                continue
+        if wanted is not None and normalize_name(row.get("nombreSociedad")) != wanted:
+            continue
+        candidates.append(sequence)
+    if not select.get("download", True) or len(candidates) != 1:
+        return set()
+    return set(candidates)
 
 
 def _normalize_sample_pages(value: Any) -> int | None:

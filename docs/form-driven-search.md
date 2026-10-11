@@ -10,8 +10,15 @@ solo registra historial y jamás es prueba suficiente de una búsqueda exitosa.
 El sitio genera su propio token y cuerpo inicial, sin `fetch` sintético para la
 primera búsqueda. Se preservan los resultados/tickets devueltos para el pipeline
 existente de páginas y PDF. Una lista vacía también es una respuesta válida.
-Las búsquedas por texto conservan su implementación anterior; este cambio cubre
-FNA, utilizado por los seis fixtures de endurance.
+La búsqueda por razón social o nombre de socio usa el mismo mecanismo desde
+el 2026-10-10 (`search_text_form`): el servicio elige el formulario con el
+propio conmutador «Tipo de búsqueda» del portal, rellena `#indice-texto`, pulsa
+`Buscar` una vez y acepta sólo el POST con `origen: texto` y ese texto. Al
+terminar vuelve a mostrar el formulario FNA, que es la evidencia de página
+autenticada del muestreo de salud; ambos formularios cuentan como página
+autenticada en los detectores. El API directo queda como `search_by_text_api`,
+sólo diagnóstico. Las filas devueltas conservan su `ticket`; qué filas se
+descargan lo decide la política `select` del trabajo (ver `cbrs find`).
 
 No se navega ni refresca automáticamente una sesión existente. La ruta y el
 formulario deben estar abiertos; si no, el job falla de forma acotada. El token

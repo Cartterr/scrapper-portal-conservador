@@ -1689,7 +1689,7 @@ def main(argv: list[str] | None = None) -> int:
     validate_fna_args(args, parser)
 
     try:
-        if args.command in {"get", "get-batch", "status"}:
+        if args.command in {"get", "get-batch", "find", "status"}:
             from .download_cli import run
             return run(args)
         if args.command == "overview":

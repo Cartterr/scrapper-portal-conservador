@@ -51,6 +51,13 @@ class CBRSScraper:
         return self.browser.ensure_authenticated(username, password, force=force)
 
     def search_by_text(self, texto: str) -> list[dict[str, Any]]:
+        """Name search through the portal's own form, like FNA (the API path is rejected)."""
+        from .runtime_updates import runtime_module
+        return runtime_module("form_search").search_text_form(self.browser, texto,
+                               client=self.client, pace=self.client._pace)
+
+    def search_by_text_api(self, texto: str) -> list[dict[str, Any]]:
+        """Explicit legacy diagnostic path, never an automatic form fallback."""
         logger.info("Searching commerce index by text")
         body = {
             "foja": None,

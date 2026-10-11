@@ -12,7 +12,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 class ServiceUnavailable(RuntimeError):
@@ -29,6 +29,14 @@ class QuotaExhausted(RuntimeError):
 
 class DownloadFailed(RuntimeError):
     """Raised for local output errors or by Result.raise_for_status."""
+
+
+class SelectionRequired(RuntimeError):
+    """Raised by Result.raise_for_status when a name search needs a choice; carries ``matches``."""
+
+    def __init__(self, message: str, matches: list[dict[str, Any]]):
+        super().__init__(message)
+        self.matches = matches
 
 
 SYSTEMD_UNIT = Path("/etc/systemd/system/cbrs-worker.service")
@@ -57,6 +65,8 @@ class Result:
     finished_at: str | None = None
     job_id: str | None = None
     resume_at: str | None = None
+    query: str | None = None
+    matches: list[dict[str, Any]] | None = None
     source: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -70,6 +80,8 @@ class Result:
         """Optionally turn unsuccessful outcomes into typed exceptions."""
         if self.status == "pending_quota":
             raise QuotaExhausted(self.error or "Cuota agotada; el trabajo sigue pendiente.")
+        if self.status == "needs_selection":
+            raise SelectionRequired(self.error or "Varias coincidencias; elija una.", self.matches or [])
         if self.status != "done":
             raise DownloadFailed(self.error or self.status)
         return self
@@ -82,6 +94,30 @@ def _positive(value: Any) -> int:
     if number <= 0:
         raise InvalidInscription("fojas, numero y ano deben ser enteros positivos")
     return number
+
+
+NAME_QUERY_MAX = 50  # the portal's own input is maxlength 50
+
+
+def _name_query(value: Any) -> str:
+    query = " ".join(str(value or "").split())
+    if not query or len(query) > NAME_QUERY_MAX:
+        raise InvalidInscription(f"nombre debe tener entre 1 y {NAME_QUERY_MAX} caracteres")
+    return query
+
+
+def _matches(job: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Public rows of a name search, each marked as chosen for download or not."""
+    rows = []
+    for item in job.get("items") or []:
+        result = item.get("result") if isinstance(item.get("result"), Mapping) else {}
+        rows.append({
+            "foja": result.get("foja"), "numero": result.get("num", result.get("numero")),
+            "ano": result.get("ano"), "nombre": result.get("nombreSociedad"), "acto": result.get("acto"),
+            "tipo": result.get("tipo"), "personas": result.get("personas"), "folio": result.get("folio"),
+            "id": result.get("id"), "selected": item.get("status") != "skipped",
+        })
+    return rows
 
 
 def _timeout(value: float) -> float:
@@ -215,11 +251,31 @@ class _LocalBackend:
         job, _ = self.store.create_job(kind="fna", input_data=request, idempotency_key=key)
         return job
 
+    def submit_text(self, query: str, select: dict[str, Any], force: bool) -> dict[str, Any]:
+        """One name search per distinct (query, selection policy); cancelled jobs never answer."""
+        from .jobs import normalize_job_input, stable_json
+        request = {"text": query, "select": select}
+        normalized = stable_json(normalize_job_input("text", request))
+        if not force:
+            with self.store.connect() as db:
+                row = db.execute(
+                    "SELECT job_id FROM jobs WHERE kind='text' AND input_json=? AND source='production' "
+                    "AND status != 'cancelled' ORDER BY CASE WHEN status='completed' THEN 0 ELSE 1 END, created_at LIMIT 1",
+                    (normalized,),
+                ).fetchone()
+            if row:
+                return self.store.get_job(row["job_id"])
+        key = None if force else "find:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:40]
+        job, _ = self.store.create_job(kind="text", input_data=request, idempotency_key=key)
+        return job
+
     def _recover_documents(self, job: dict[str, Any]) -> None:
         """Requeue document work with its original search receipt and quota intact."""
         from .jobs import utc_now, validate_pdf
         broken = []
         for item in self.store.items(job["job_id"], public=False):
+            if item["status"] == "skipped":
+                continue  # a match the caller did not choose is not a missing document
             try:
                 if item["status"] != "completed":
                     raise ValueError("incomplete")
@@ -299,8 +355,22 @@ class Client:
                         job_id=job["job_id"], account=job.get("account_id"),
                         attempts=len(job.get("attempts", [])), started_at=job.get("started_at"),
                         finished_at=job.get("finished_at"), error=job.get("error_message") or job.get("error_code"))
+        if job.get("kind") == "text":
+            result.query = raw.get("text")
+            result.matches = _matches(job)
+            chosen = next((match for match in result.matches if match["selected"]), None)
+            if chosen:
+                result.fojas, result.numero, result.ano = chosen["foja"], chosen["numero"], chosen["ano"]
         if job["status"] == "completed" and job.get("result_count") == 0:
-            result.status, result.error = "not_found", "Inscripción inexistente (resultado vacío confirmado)."
+            result.status = "not_found"
+            result.error = ("Sin coincidencias para el nombre buscado." if job.get("kind") == "text"
+                            else "Inscripción inexistente (resultado vacío confirmado).")
+        elif (job["status"] == "completed" and result.matches
+                and not any(match["selected"] for match in result.matches)):
+            # The search answered; downloading waits for a choice (D: name search).
+            result.status = "needs_selection"
+            result.error = (f"{len(result.matches)} coincidencias; elija una y pida su inscripción "
+                            "con get (fojas, numero, ano).")
         elif job["status"] == "completed":
             result.pdf_path = self._db.pdf(job)
             if result.pdf_path:
@@ -383,6 +453,32 @@ class Client:
         except OSError as exc:
             raise DownloadFailed("No se pudo guardar el PDF en el destino solicitado.") from exc
         return result
+
+    def find(self, nombre: str, *, ano: int | None = None, exact: bool = False, download: bool = False,
+             output: str | Path | None = None, timeout: float | None = None, force: bool = False) -> Result:
+        """Search the commerce index by company or partner name; one portal search.
+
+        Without ``download`` the result is ``needs_selection`` with every match
+        and nothing is fetched. With ``download`` the PDF is fetched only when
+        exactly one match survives the ``ano`` and ``exact`` (normalized name
+        equality) filters; otherwise the matches come back for the caller to
+        choose from and request with ``get``. ``not_found`` means no match.
+        """
+        query = _name_query(nombre)
+        select = {"download": bool(download), "ano": _positive(ano) if ano is not None else None,
+                  "nombre": query if exact else None}
+        seconds = self.timeout if timeout is None else _timeout(timeout)
+        self._db.check()
+        job = self._db.submit_text(query, select, force)
+        deadline = time.monotonic() + seconds
+        while True:
+            result = self._result(job)
+            result.query = query
+            if result.status != "pending" or time.monotonic() >= deadline:
+                return self._output(result, output)
+            time.sleep(min(1.0, max(0, deadline - time.monotonic())))
+            self._db.check()
+            job = self._db.job(result.job_id)
 
     def get(self, *, fojas: int, numero: int, ano: int, output: str | Path | None = None,
             timeout: float | None = None, force: bool = False) -> Result:

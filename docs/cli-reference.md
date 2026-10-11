@@ -134,6 +134,21 @@ La cola es el camino recomendado para consultas. `cancel` solicita cancelación
 en un punto seguro. `recover` limpia solo leases vencidos y reencola trabajos
 abandonados; nunca cierra Chrome.
 
+Búsqueda por razón social o nombre de socio, con elección entre coincidencias:
+
+```bash
+cbrs find "RAZÓN SOCIAL"                         # lista las coincidencias, no descarga
+cbrs find "RAZÓN SOCIAL" --json                  # mismas coincidencias en JSON (matches)
+cbrs find "RAZÓN SOCIAL" --ano 2021 --exact --download   # descarga sólo si queda una
+cbrs get --fojas F --numero N --ano A            # descarga la coincidencia elegida
+```
+
+Cada `find` consume una consulta del portal, igual que `get`. Con `--download`
+el PDF se descarga en la misma consulta sólo si los filtros dejan exactamente
+una fila; con cero o varias, el resultado es `needs_selection` con todas las
+filas. `cbrs jobs enqueue --text` conserva el comportamiento histórico de
+descargar todas las filas.
+
 Comandos avanzados de la cola:
 
 ```bash

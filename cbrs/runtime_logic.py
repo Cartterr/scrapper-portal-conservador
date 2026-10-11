@@ -186,7 +186,7 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                 def download_image(self, ref, path):
                     raise RuntimeError('Document page not cached yet')
             for item in store.items(job.job_id, public=False):
-                if item['status'] == 'completed':
+                if item['status'] in ('completed', 'skipped'):
                     continue
                 sample = (int(job.input.get('sample_pages') or 0) or None) if job.source == 'endurance' else None
                 try:
@@ -202,7 +202,7 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                     # Missing cache is not proof of a portal failure.
                     continue
             cached_items = store.items(job.job_id,public=False)
-            if cached_items and all(i['status']=='completed' for i in cached_items):
+            if cached_items and all(i['status'] in ('completed', 'skipped') for i in cached_items):
                 return store.finalize_job(job.job_id)
             if not checkpoint['account_id']:
                 store.set_waiting(job.job_id, 'waiting_capacity', reason='search_owner_unknown')
@@ -288,7 +288,8 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                             raise
                     store.clear_external_outage_backoff()
                     quota_policy.clear_quota_hold(store.path, account.account_id)
-                    items = store.add_results(job.job_id, results, attempt_id=attempt_id, materialize_items=not (job.source == 'captcha_validation' and job.input.get('validation_only')))
+                    items = store.add_results(job.job_id, results, attempt_id=attempt_id, materialize_items=not (job.source == 'captcha_validation' and job.input.get('validation_only')),
+                                              download_sequences=core.select_matches(job.input, results) if job.kind == 'text' else None)
                     attempt_id = None
                     if job.source == 'captcha_validation' and job.input.get('validation_only'):
                         from .captcha_budget import CaptchaBudgetStore
@@ -298,7 +299,7 @@ def process_job(job: Job, *, settings: Settings, config: PoolConfig, store: JobS
                 else:
                     attempt_id = store.begin_attempt(job_id=job.job_id, account_id=account.account_id, quota_date=quota_date, quota=config.quota_for(account), run_id=run_id, consume_quota=False)
                 for item in items:
-                    if item['status'] == 'completed':
+                    if item['status'] in ('completed', 'skipped'):
                         continue
                     if store.cancel_requested(job.job_id):
                         if attempt_id:

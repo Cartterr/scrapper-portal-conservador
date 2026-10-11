@@ -146,6 +146,39 @@ modularización queda para después del acceso SSH, como se acordó.
 
 La autoregistración de cuentas no forma parte de esta entrega.
 
+## Búsqueda por nombre y elección entre coincidencias
+
+Quedó implementada de punta a punta con la misma disciplina que la búsqueda
+FNA. La búsqueda por «razón social o nombre de socio» va por el formulario del
+portal (el conmutador «Tipo de búsqueda», el campo de 50 caracteres y un solo
+clic en «Buscar»), acepta sólo el POST con `origen: texto`, y al terminar deja
+visible otra vez el formulario FNA. Cada búsqueda por nombre consume una
+consulta del portal, igual que una FNA; las filas devueltas (razón social,
+foja, número, año, acto) se guardan todas con su ticket, y cuáles se descargan
+lo decide una política explícita: sin ella, ninguna.
+
+- `Client.find(nombre)` / `cbrs find "NOMBRE"`: una búsqueda, ningún PDF; el
+  resultado es `needs_selection` con la lista `matches` (`foja`, `numero`,
+  `ano`, `nombre`, `acto`, `tipo`, `personas`, `folio`, `id`, `selected`). Quien
+  llama elige y pide la inscripción con `get` (segunda consulta).
+- `Client.find(nombre, ano=2021, exact=True, download=True)` /
+  `cbrs find "NOMBRE" --ano 2021 --exact --download`: filtra por año y por
+  razón social idéntica (sin acentos ni mayúsculas) y descarga **sólo si queda
+  exactamente una** coincidencia, en la misma consulta; si quedan cero o varias,
+  devuelve `needs_selection` con todas, sin gastar más.
+- `not_found` cuando el portal no devuelve filas. Las demás salidas
+  (`pending`, `pending_quota`, `failed`) son las de `get`.
+- `raise_for_status()` lanza `SelectionRequired` con `.matches`. El trabajo
+  guarda las filas no elegidas como `skipped`: no son fallos, no se reintentan y
+  no cuentan como documentos pendientes.
+- La misma búsqueda (texto y política) reutiliza su trabajo; `--force` repite.
+  La cola `cbrs jobs enqueue --text` conserva su comportamiento histórico
+  (descargar todas las filas).
+
+Decidir «cuál es la correcta cuando hay dos sociedades con el mismo nombre»
+sigue siendo lógica del mandante: el servicio le entrega las coincidencias
+completas y descarga sólo cuando la regla que él fije deja una sola.
+
 ## Validación y activación
 
 `tests/test_informe_2026_09_30.py`: 14 pruebas nuevas (Chrome real sobre HTML

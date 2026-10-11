@@ -33,7 +33,9 @@ def _visible_login_gate(page):
                 &&text(a)==='Iniciar sesión'&&!!card.querySelector('a[href="/crear-cuenta"]');
         });
         const form=[...document.querySelectorAll('section[aria-label="Búsqueda por foja, número y año"]')]
-            .some(s=>visible(s)&&['#input-fojas','#input-numero','#input-ano'].every(q=>visible(s.querySelector(q))));
+            .some(s=>visible(s)&&['#input-fojas','#input-numero','#input-ano'].every(q=>visible(s.querySelector(q))))
+            ||[...document.querySelectorAll('section[aria-label="Búsqueda por razón social o nombre de socio"]')]
+            .some(s=>visible(s)&&visible(s.querySelector('#indice-texto')));
         const loginRoute=location.pathname==='/login'||location.pathname.startsWith('/login/');
         const loginForm=loginRoute && [...document.querySelectorAll('form')].some(f=>
             visible(f) && visible(f.querySelector('input[type="email"]')) &&

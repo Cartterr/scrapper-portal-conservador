@@ -75,6 +75,14 @@ real y recuperación completa en el portal.
    cbrs get --fojas 30282 --numero 12784 --ano 2024 --output "$HOME/mis-pdfs/"
    ```
 
+   Para buscar por razón social o nombre de socio y elegir entre varias
+   coincidencias (cada búsqueda consume una consulta del portal):
+
+   ```bash
+   cbrs find "RAZÓN SOCIAL"                               # lista coincidencias, no descarga
+   cbrs find "RAZÓN SOCIAL" --ano 2021 --exact --download # descarga sólo si queda una
+   ```
+
    Por defecto la copia de entrega queda en `outputs/pdf/` del repositorio.
    El original permanece en `.cbrs/runtime/outputs/jobs/` para recuperación.
    `CBRS_OUTPUT_DIR` en `.env` o el entorno cambia el directorio de entrega de
@@ -239,6 +247,7 @@ seguiría aplicándose al usuario nuevo.
 | Campos faltantes | `cbrs config validate`; completar sólo las claves indicadas en `.env`. |
 | CSV inválido | Corregir encabezado, codificación o la línea indicada; las filas inválidas constan en el reporte. |
 | `pending_quota` | Consultar `resume_at`; el servicio revisará la cuota sin reenviar el lote. La hora es una estimación. También aparece cuando la última cuenta sin cuota agotada está pausada con reanudación programada (por ejemplo, el tope diario de logins de candidatos); la columna `error` lo indica. |
+| `needs_selection` | Sólo en `cbrs find`: la búsqueda por nombre devolvió varias coincidencias (o ninguna pasó los filtros). Elija una en `matches` y pídala con `cbrs get --fojas F --numero N --ano A`. |
 | `pending` por login o proxy | Revisar `cbrs status` y logs; conservar las sesiones autenticadas. El servicio reintenta solo. |
 | `pending_reconciliation` | Búsqueda enviada sin resultado confirmado. El servicio ya consultó «Recientes» en el portal: si la inscripción hubiera faltado habría reintentado solo. Revise «Recientes» de esa cuenta: si la inscripción no figura, `cbrs jobs reconcile JOB_ID --apply`; si figura, la cuota se consumió y el resultado debe recuperarse a mano. |
 

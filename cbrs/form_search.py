@@ -1,6 +1,7 @@
 """Use the portal's own FNA form handler, without replaying its browser request."""
 from urllib.parse import urlsplit
 from types import SimpleNamespace
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import sqlite3
@@ -343,6 +344,65 @@ def portal_history_lists(page, foja, numero, ano):
     return (int(foja), int(numero), int(ano)) in entries
 
 
+def normalize_name(value):
+    """The portal's own comparison form: no accents, single spaces, lower case."""
+    text = unicodedata.normalize('NFD', str(value or ''))
+    text = ''.join(ch for ch in text if unicodedata.category(ch) != 'Mn')
+    return ' '.join(text.split()).lower()
+
+
+def portal_history_lists_text(page, texto):
+    """True/False when the Recientes chips carry text signatures, None otherwise.
+
+    The commerce index stamps each chip with ``modo|foja|numero|ano|texto``
+    (``texto||||<query>`` for a name search). Only that structured form is
+    read; the fallback text scan is FNA-specific, so without chips the answer
+    is unknown and the caller keeps the outcome for reconciliation.
+    """
+    try:
+        firmas = page.evaluate('''() => [...document.querySelectorAll('[data-firma^="texto|"]')]
+            .map(e => e.getAttribute('data-firma') || '')''')
+    except Exception:
+        return None
+    if not isinstance(firmas, list) or not firmas:
+        return None
+    wanted = normalize_name(texto)
+    return any(normalize_name(firma.split('|', 4)[4] if firma.count('|') >= 4 else '') == wanted
+               for firma in firmas)
+
+
+def _history_lists_values(page, values):
+    if 'texto' in values:
+        return portal_history_lists_text(page, values['texto'])
+    return portal_history_lists(page, values['foja'], values['numero'], values['ano'])
+
+
+# The two protected search forms of the commerce index. The page shows one at a
+# time, chosen with the "Tipo de búsqueda" toggle; the service always leaves the
+# FNA form visible afterwards because that form is its authenticated-page evidence.
+SEARCH_FORMS = {
+    'fna': {'label': 'Búsqueda por foja, número y año', 'toggle': 'Foja, número y año',
+            'fields': (('#input-fojas', 'foja'), ('#input-numero', 'numero'), ('#input-ano', 'ano'))},
+    'texto': {'label': 'Búsqueda por razón social o nombre de socio', 'toggle': 'Razón social o nombre de socio',
+              'fields': (('#indice-texto', 'texto'),)},
+}
+SEARCH_MODE_GROUP = '[role="group"][aria-label="Tipo de búsqueda"]'
+
+
+def search_form_section(page, kind):
+    return page.locator(f'section[aria-label="{SEARCH_FORMS[kind]["label"]}"]')
+
+
+def select_search_mode(page, kind, *, timeout_ms=10000):
+    """Show the requested form with the portal's own toggle; no request is sent."""
+    section = search_form_section(page, kind)
+    if section.count() and section.first.is_visible():
+        return False
+    page.locator(SEARCH_MODE_GROUP).get_by_role('button', name=SEARCH_FORMS[kind]['toggle'], exact=True).click(timeout=timeout_ms)
+    section.first.wait_for(state='visible', timeout=timeout_ms)
+    return True
+
+
 def _history_verdict(page, values, *, evidence):
     """Decide whether an unobserved outcome was registered by the portal.
 
@@ -353,7 +413,7 @@ def _history_verdict(page, values, *, evidence):
     tuple, or an unreadable history without that modal, keeps the outcome
     unknown so reconciliation stays explicit and quota is never charged twice.
     """
-    listed = portal_history_lists(page, values['foja'], values['numero'], values['ano'])
+    listed = _history_lists_values(page, values)
     failed_dialog = bool(evidence and evidence['reason'] == SEARCH_FAILED_DIALOG)
     if failed_dialog:
         try:
@@ -373,6 +433,20 @@ def _history_verdict(page, values, *, evidence):
 
 
 def search_fna_form(browser, foja, numero, ano, *, client, pace):
+    return _form_search(browser, {'foja': foja, 'numero': numero, 'ano': ano}, client=client, pace=pace)
+
+
+def search_text_form(browser, texto, *, client, pace):
+    """Name search ("razón social o nombre de socio") through the portal's own form.
+
+    Same single-click contract, quota admission, dialog policy and history
+    verdict as the FNA form; only the input, the toggle and the request body
+    differ. The result rows (with their tickets) feed the same document pipeline.
+    """
+    return _form_search(browser, {'texto': ' '.join(str(texto).split())}, client=client, pace=pace)
+
+
+def _form_search(browser, values, *, client, pace):
     from .runtime_updates import runtime_module
     if runtime_module('runtime_observation').visible_login_gate(browser.page):
         raise SafetyStopException(StopReason.AUTH_REQUIRED,
@@ -423,7 +497,7 @@ def search_fna_form(browser, foja, numero, ano, *, client, pace):
             browser.page.reload(wait_until='domcontentloaded', timeout=60000)
         if portal_dialog_reason(browser.page) == 'daily_limit':
             raise SafetyStopException(StopReason.DAILY_LIMIT, 'Portal daily quota exhausted', context='commerce form search')
-        result = _search_fna_once(browser, foja, numero, ano, client=client, pace=pace)
+        result = _submit_search_once(browser, values, client=client, pace=pace)
         if path:
             clear_quota_hold(path, account_id)
         return result
@@ -441,7 +515,7 @@ def search_fna_form(browser, foja, numero, ano, *, client, pace):
                 'portal_history_listed': exc.portal_history,
                 'failure_dialog': bool(getattr(exc, 'portal_dialog', None)),
                 'request_dispatched': bool(getattr(exc, 'request_dispatched', False)),
-                'foja': foja, 'numero': numero, 'ano': ano})
+                **_event_values(values)})
         if exc.reason == StopReason.SEARCH_NOT_SUBMITTED and path and getattr(exc, 'blocking_dialog', None):
             from .jobs import JobStore
             JobStore(path).add_event('search_form_blocked_by_dialog', account_id=account_id,
@@ -463,22 +537,31 @@ def search_fna_form(browser, foja, numero, ano, *, client, pace):
             from .jobs import JobStore
             JobStore(path).add_event('search_outcome_unknown_history', account_id=account_id,
                 level='warning', data={'portal_history_listed': exc.portal_history,
-                                       'foja': foja, 'numero': numero, 'ano': ano})
+                                       **_event_values(values)})
         raise
 
 
-def _search_fna_once(browser, foja, numero, ano, *, client, pace):
+def _event_values(values):
+    """Event fields for a search: FNA coordinates, or only the length of a name query."""
+    if 'texto' in values:
+        return {'kind': 'texto', 'texto_length': len(str(values['texto']))}
+    return {'foja': values['foja'], 'numero': values['numero'], 'ano': values['ano']}
+
+
+def _submit_search_once(browser, values, *, client, pace):
     page = browser.page
     from .runtime_updates import runtime_module
     if runtime_module('runtime_observation').visible_login_gate(page):
         raise SafetyStopException(StopReason.AUTH_REQUIRED,
             'Visible login gate before search submission', context='commerce form search')
+    kind = 'texto' if 'texto' in values else 'fna'
+    spec = SEARCH_FORMS[kind]
     origin = urlsplit(browser.settings.commerce_url)
     current = urlsplit(page.url)
     if (current.scheme, current.netloc, current.path) != (origin.scheme, origin.netloc, origin.path):
         raise SafetyStopException(StopReason.SEARCH_NOT_SUBMITTED,
             "Protected search route is not open; no request submitted", context='commerce form search')
-    values = {"foja": str(foja), "numero": str(numero), "ano": str(ano)}
+    values = {key: str(value) for key, value in values.items()}
 
     def matches(response):
         url = urlsplit(response.url)
@@ -488,6 +571,8 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
             return False
         try:
             body = response.request.post_data_json
+            if kind == 'texto' and body.get('origen') != 'texto':
+                return False
             return all(str(body.get(key)) == value for key, value in values.items())
         except Exception:
             return False
@@ -506,12 +591,14 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
     page.on('request', request_sent)
     page.on('response', response_received)
     try:
-        form = page.locator('section[aria-label="Búsqueda por foja, número y año"]')
+        # The toggle only switches which form is rendered; nothing is sent.
+        select_search_mode(page, kind)
+        form = search_form_section(page, kind)
         form.wait_for(state='visible', timeout=10000)
-        for selector, value in (("#input-fojas", foja), ("#input-numero", numero), ("#input-ano", ano)):
+        for selector, key in spec['fields']:
             field = form.locator(selector)
-            field.fill(str(value), timeout=10000)
-            if field.input_value() != str(value):
+            field.fill(values[key], timeout=10000)
+            if field.input_value() != values[key]:
                 raise RuntimeError("Search field read-back mismatch")
         pace("commerce form search")
         # Listeners are armed before the single click. A click is not evidence
@@ -655,3 +742,10 @@ def _search_fna_once(browser, foja, numero, ano, *, client, pace):
     finally:
         page.remove_listener('request', request_sent)
         page.remove_listener('response', response_received)
+        if kind != 'fna':
+            # Leave the page as the service expects it: the FNA form is the
+            # authenticated-page evidence for the health sampler and the next job.
+            try:
+                select_search_mode(page, 'fna', timeout_ms=5000)
+            except Exception:
+                pass

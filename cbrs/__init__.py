@@ -1,4 +1,13 @@
 """CBRS public API; importing does not load configuration or launch browsers."""
-from .api import Client, DownloadFailed, InvalidInscription, QuotaExhausted, Result, ServiceUnavailable
+from .api import (
+    Client,
+    DownloadFailed,
+    InvalidInscription,
+    QuotaExhausted,
+    Result,
+    SelectionRequired,
+    ServiceUnavailable,
+)
 
-__all__ = ["Client", "Result", "ServiceUnavailable", "InvalidInscription", "QuotaExhausted", "DownloadFailed"]
+__all__ = ["Client", "Result", "ServiceUnavailable", "InvalidInscription", "QuotaExhausted",
+           "DownloadFailed", "SelectionRequired"]

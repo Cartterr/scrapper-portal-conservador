@@ -327,17 +327,19 @@ class BrowserSession:
                                 Boolean(registerLink);
                         });
 
+                        // Either protected form of the commerce index proves the
+                        // session: FNA, or the name search shown by the same toggle.
+                        const forms = {
+                            "Búsqueda por foja, número y año": ["#input-fojas", "#input-numero", "#input-ano"],
+                            "Búsqueda por razón social o nombre de socio": ["#indice-texto"]
+                        };
                         const protectedForm = Array.from(
                             document.querySelectorAll("section.m3-card-outlined")
                         ).some((section) => {
                             if (!visible(section)) return false;
-                            if (normalize(section.getAttribute("aria-label")) !==
-                                "Búsqueda por foja, número y año") return false;
-                            const inputs = [
-                                section.querySelector("#input-fojas"),
-                                section.querySelector("#input-numero"),
-                                section.querySelector("#input-ano")
-                            ];
+                            const selectors = forms[normalize(section.getAttribute("aria-label"))];
+                            if (!selectors) return false;
+                            const inputs = selectors.map((selector) => section.querySelector(selector));
                             if (!inputs.every((input) => visible(input))) return false;
                             const buttons = Array.from(section.querySelectorAll("button"))
                                 .filter((button) => visible(button))
