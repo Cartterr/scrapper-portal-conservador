@@ -144,7 +144,10 @@ HTTP sobre su servidor sería una capa delgada que llame a esas dos funciones:
 escribe en su propia tabla y un puente periódico llama a `get-batch`. La
 modularización queda para después del acceso SSH, como se acordó.
 
-La autoregistración de cuentas no forma parte de esta entrega.
+El registro automático de cuentas se incorporó al repositorio el 10-10 por
+separado (commit `7e26159`: `cbrs/registration`, `cbrs/rut_scraper`); su estado
+está en `E2E_STATUS.md` y `PROGRESS_SUMMARY.md` y no forma parte de lo validado
+en este informe.
 
 ## Búsqueda por nombre y elección entre coincidencias
 
@@ -178,6 +181,37 @@ lo decide una política explícita: sin ella, ninguna.
 Decidir «cuál es la correcta cuando hay dos sociedades con el mismo nombre»
 sigue siendo lógica del mandante: el servicio le entrega las coincidencias
 completas y descarga sólo cuando la regla que él fije deja una sola.
+
+## Pendiente del mandante: la regla para elegir entre coincidencias
+
+Queda un punto que el servicio no puede resolver solo y que el mandante debe
+definir: **cuál es la inscripción correcta cuando una búsqueda por nombre
+devuelve varias filas**, por ejemplo dos sociedades con la misma razón social o
+varias inscripciones de la misma sociedad (constitución, modificaciones).
+
+Hoy el comportamiento es deliberadamente conservador: `find` entrega todas las
+coincidencias (`needs_selection`) y sólo descarga, con `--download`, cuando los
+filtros disponibles dejan exactamente una. Los filtros existentes son el año
+exacto (`ano`) y la razón social idéntica (`exact`, sin acentos ni mayúsculas).
+No se descarga «la primera», «la más reciente» ni «la constitución» porque
+cualquiera de esas reglas sería una decisión de negocio tomada por el servicio.
+
+Lo que necesitamos del mandante, en el orden que prefiera:
+
+1. La regla de desempate que su aplicación quiere aplicar, con ejemplos reales
+   de su propio listado: por ejemplo «si hay varias con el mismo nombre, la de
+   `acto = CONSTITUCION` más antigua», o «la de mayor año», o «siempre pedir
+   intervención humana». Cada fila ofrece `nombre`, `foja`, `numero`, `ano`,
+   `acto`, `tipo`, `personas`, `folio` e `id` para formularla.
+2. Si esa regla debe vivir en el servicio (se agrega como un filtro más de la
+   política `select`, con su prueba de regresión) o en su aplicación (que ya
+   recibe `matches` y pide la elegida con `get`).
+3. Qué hacer cuando ni la regla deja una sola fila: dejar `needs_selection`
+   para revisión manual, como ahora, o descargar varias.
+
+Mientras no exista esa definición, toda búsqueda por nombre con más de una
+coincidencia termina en `needs_selection` y no consume más consultas del
+portal que la búsqueda misma.
 
 ## Validación y activación
 
