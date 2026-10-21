@@ -1,9 +1,15 @@
 """Activation-inbox support: address generation and IMAP retrieval.
 
-The registration pipeline uses a catch-all domain (Cloudflare Email Routing)
-that forwards every address to one real Gmail mailbox.  Each registration gets
-a unique address; this module waits for the portal's activation email to that
-address and extracts the ``/activacion-de-cuenta?email=...&token=...`` link.
+The registration pipeline uses a catch-all domain (e.g. Cloudflare Email
+Routing, or any registrar/provider catch-all) that forwards every address on
+that domain to one real mailbox.  Each registration gets a unique address; this
+module waits for the portal's activation email to that address and extracts the
+``/activacion-de-cuenta?email=...&token=...`` link.
+
+The forwarding mailbox is *any* provider reachable over IMAP -- Gmail, Outlook /
+Microsoft 365, Proton Bridge, a self-hosted server, ... -- so no specific email
+brand is required.  :class:`ActivationInbox` is the public contract;
+:class:`ImapActivationInbox` is the bundled implementation.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.message import Message
+from typing import Callable, Protocol, runtime_checkable
 from urllib.parse import parse_qs, unquote, urlparse
 
 ACTIVATION_PATH = "/activacion-de-cuenta"
@@ -36,6 +43,28 @@ class ActivationLink:
     email: str
     token: str
     raw_url: str
+
+
+@runtime_checkable
+class ActivationInbox(Protocol):
+    """Contract for reading the portal's activation email.
+
+    Any mailbox that can receive mail for the generated address satisfies it:
+    the only requirement is that :meth:`wait_for_activation` returns the
+    activation link (or raises :class:`ActivationEmailTimeout`) within the
+    timeout.  :class:`ImapActivationInbox` is the bundled implementation; a new
+    provider is any class with the same method.
+    """
+
+    def wait_for_activation(
+        self,
+        address: str,
+        *,
+        not_before: datetime,
+        timeout_seconds: float,
+        poll_seconds: float,
+        sleep: Callable[[float], None] = ...,
+    ) -> ActivationLink: ...
 
 
 def build_activation_address(domain: str, rut: str, rng: random.Random | None = None) -> str:
@@ -109,6 +138,24 @@ def _recipients(msg: Message) -> set[str]:
     return values
 
 
+def _folder_names(lines) -> list[str]:
+    """Parse IMAP LIST responses into folder names (handles quoted names)."""
+
+    names: list[str] = []
+    for line in lines or []:
+        decoded = (
+            line.decode("utf-8", errors="replace")
+            if isinstance(line, bytes)
+            else str(line)
+        )
+        match = re.search(r'"([^"]+)"$|(\S+)$', decoded)
+        if match:
+            name = (match.group(1) or match.group(2) or "").strip()
+            if name:
+                names.append(name)
+    return names
+
+
 def _message_date(msg: Message) -> datetime | None:
     raw = msg.get("Date")
     if not raw:
@@ -123,7 +170,13 @@ def _message_date(msg: Message) -> datetime | None:
 
 
 class ImapActivationInbox:
-    """Reads activation emails from the forwarding mailbox over IMAP."""
+    """Reads activation emails from any IMAP mailbox over SSL or STARTTLS.
+
+    Provider-agnostic: pass the IMAP host/port and credentials of whatever
+    mailbox receives the catch-all forwards.  Defaults match the common
+    mailbox; override ``mailbox_candidates`` (or ``use_ssl``/``starttls``) for
+    a provider with a different folder layout or transport.
+    """
 
     def __init__(
         self,
@@ -133,6 +186,9 @@ class ImapActivationInbox:
         password: str,
         *,
         mailbox_candidates: tuple[str, ...] = ("[Gmail]/All Mail", "INBOX"),
+        use_ssl: bool = True,
+        starttls: bool = False,
+        timeout_seconds: float | None = None,
     ) -> None:
         if not user or not password:
             raise ValueError("IMAP user and app password are required")
@@ -141,6 +197,20 @@ class ImapActivationInbox:
         self.user = user
         self.password = password
         self.mailbox_candidates = mailbox_candidates
+        self.use_ssl = use_ssl
+        self.starttls = starttls
+        self._timeout = timeout_seconds
+
+    def _connect(self) -> imaplib.IMAP4:
+        kwargs: dict[str, object] = {}
+        if self._timeout is not None:
+            kwargs["timeout"] = self._timeout
+        if self.use_ssl:
+            return imaplib.IMAP4_SSL(self.host, self.port, **kwargs)
+        connection = imaplib.IMAP4(self.host, self.port, **kwargs)
+        if self.starttls:
+            connection.starttls()
+        return connection
 
     def wait_for_activation(
         self,
@@ -171,7 +241,7 @@ class ImapActivationInbox:
         )
 
     def _search_once(self, target: str, not_before: datetime) -> ActivationLink | None:
-        connection = imaplib.IMAP4_SSL(self.host, self.port)
+        connection = self._connect()
         try:
             connection.login(self.user, self.password)
             mailbox = self._select_mailbox(connection)
@@ -188,14 +258,23 @@ class ImapActivationInbox:
             except Exception:
                 pass
 
-    def _select_mailbox(self, connection: imaplib.IMAP4_SSL) -> str:
+    def list_folders(self) -> list[str]:
+        """Return the mailbox folder names (read-only; no message is read)."""
+
+        connection = self._connect()
+        try:
+            connection.login(self.user, self.password)
+            status, lines = connection.list()
+            return _folder_names(lines) if status == "OK" else []
+        finally:
+            try:
+                connection.logout()
+            except Exception:
+                pass
+
+    def _select_mailbox(self, connection: imaplib.IMAP4) -> str:
         listed = connection.list()
-        available = set()
-        for line in listed[1] or []:
-            decoded = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else str(line)
-            match = re.search(r'"([^"]+)"$|(\S+)$', decoded)
-            if match:
-                available.add((match.group(1) or match.group(2) or "").strip())
+        available = set(_folder_names(listed[1]))
         for candidate in self.mailbox_candidates:
             if candidate in available or candidate == "INBOX":
                 status, _ = connection.select(candidate, readonly=True)
@@ -207,7 +286,7 @@ class ImapActivationInbox:
         return "INBOX"
 
     def _search_ids(
-        self, connection: imaplib.IMAP4_SSL, mailbox: str, target: str, since: str
+        self, connection: imaplib.IMAP4, mailbox: str, target: str, since: str
     ) -> list[bytes]:
         ids: list[bytes] = []
         for criteria in (
@@ -230,7 +309,7 @@ class ImapActivationInbox:
 
     def _inspect_message(
         self,
-        connection: imaplib.IMAP4_SSL,
+        connection: imaplib.IMAP4,
         mailbox: str,
         message_id: bytes,
         target: str,

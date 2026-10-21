@@ -7,7 +7,7 @@ the live worker, its browsers, or its proxy routes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..config import DEFAULT_RECAPTCHA_SITEKEY, _merged_env
@@ -81,7 +81,7 @@ class RegistrationSettings:
     dataimpulse_port_max: int
 
     # CapSolver fallback for reCAPTCHA Enterprise tokens
-    capsolver_api_key: str | None
+    capsolver_api_key: str | None = field(repr=False)
     capsolver_timeout_seconds: float
     capsolver_poll_seconds: float
     capsolver_min_score: float
@@ -110,6 +110,31 @@ class RegistrationSettings:
     headless: bool
     request_delay_seconds: float
 
+    # Activation inbox transport (any IMAP provider; see email_inbox).
+    imap_ssl: bool = True
+    imap_starttls: bool = False
+    imap_mailbox: str | None = None
+
+    # Phone: when true each account gets a fresh made-up number instead of the
+    # single fixed CBRS_REGISTRATION_CELULAR value.
+    randomize_celular: bool = False
+
+    # Opt-in visual diagnostics, saved only under this run's temporary profile.
+    capture_screenshots: bool = False
+
+    # A deliberate standalone CLI run may enable bounded paid fallback; this
+    # never changes the worker's manual/automatic solver preference.
+    external_captcha: bool = False
+    two_captcha_api_key: str | None = field(default=None, repr=False)
+    two_captcha_timeout_seconds: float = 120.0
+    two_captcha_poll_seconds: float = 5.0
+    captcha_daily_limit: int = 60
+    max_paid_solves: int = 4
+    route_candidates: int = 10
+    route_retry_seconds: float = 10.0
+    route_hourly_limit: int = 30
+    route_daily_submit_limit: int = 10
+
     def require_activation_inbox(self) -> None:
         missing = [
             name
@@ -124,7 +149,7 @@ class RegistrationSettings:
             raise RuntimeError(
                 "Registration needs a readable activation inbox. Set "
                 + ", ".join(missing)
-                + " in .env (catch-all domain forwarded to a Gmail read via IMAP)."
+                + " in .env (a catch-all domain forwarding to any IMAP mailbox)."
             )
 
     def require_proxy(self) -> None:
@@ -210,7 +235,13 @@ def load_registration_settings(dotenv_path: str | Path = ".env") -> Registration
             _empty_to_none(env.get("CBRS_REGISTRATION_ACCOUNTS_DB"))
             or "registered_accounts.db"
         ),
-        pool_state_path=Path(".cbrs") / "pool" / "pool.sqlite3",
+        # Same state DB the worker writes its live sticky routes to.  Pointing
+        # at a stale path silently disabled the port-collision guard, so a
+        # registration could have reused a production exit IP.
+        pool_state_path=Path(
+            _empty_to_none(env.get("CBRS_REGISTRATION_POOL_STATE_DB"))
+            or str(Path(".cbrs") / "runtime" / "pool" / "pool.sqlite3")
+        ),
         profile_root=Path(
             _empty_to_none(env.get("CBRS_REGISTRATION_PROFILE_ROOT"))
             or str(Path(".cbrs") / "registration-profiles")
@@ -220,4 +251,22 @@ def load_registration_settings(dotenv_path: str | Path = ".env") -> Registration
             env.get("CBRS_REGISTRATION_REQUEST_DELAY_SECONDS"),
             default=DEFAULT_REQUEST_DELAY_SECONDS,
         ),
+        imap_ssl=_bool(env.get("CBRS_ACTIVATION_IMAP_SSL"), default=True),
+        imap_starttls=_bool(env.get("CBRS_ACTIVATION_IMAP_STARTTLS"), default=False),
+        imap_mailbox=_empty_to_none(env.get("CBRS_ACTIVATION_IMAP_MAILBOX")),
+        randomize_celular=_bool(
+            env.get("CBRS_REGISTRATION_RANDOMIZE_CELULAR"), default=False
+        ),
+        two_captcha_api_key=_empty_to_none(env.get("CBRS_2CAPTCHA_API_KEY")),
+        two_captcha_timeout_seconds=_float(
+            env.get("CBRS_2CAPTCHA_TIMEOUT_SECONDS"), default=120.0
+        ),
+        two_captcha_poll_seconds=max(5.0, _float(
+            env.get("CBRS_2CAPTCHA_POLL_SECONDS"), default=5.0
+        )),
+        captcha_daily_limit=_int(env.get("CBRS_2CAPTCHA_DAILY_LIMIT"), default=60),
+        route_candidates=max(1, _int(env.get("CBRS_DATAIMPULSE_CANDIDATES_PER_RECOVERY"), default=10)),
+        route_retry_seconds=max(0.0, _float(env.get("CBRS_DATAIMPULSE_CANDIDATE_RETRY_SECONDS"), default=10.0)),
+        route_hourly_limit=max(1, _int(env.get("CBRS_DATAIMPULSE_MAX_ROTATIONS_PER_HOUR"), default=30)),
+        route_daily_submit_limit=max(1, _int(env.get("CBRS_DATAIMPULSE_MAX_CANDIDATE_LOGINS_PER_DAY"), default=10)),
     )

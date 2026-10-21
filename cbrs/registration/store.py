@@ -8,6 +8,7 @@ commit ``registered_accounts.db``.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -123,6 +124,26 @@ class AccountStore:
     def mark_activated(self, email: str) -> None:
         self._update(email, {"status": "activated", "activated_at": _now()})
 
+    def set_proxy_port(self, email: str, port: int) -> None:
+        """Track the current registration candidate without replacing credentials."""
+        self._update(email, {"proxy_port": port})
+
+    def registration_retry_for_rut(self, rut: str) -> AccountRecord | None:
+        """Reuse credentials after safe recovery/form failures or explicit CAPTCHA rejection.
+
+        Never reuse/retry a pending, activated, verified, or ambiguously
+        submitted record. These records are read internally, never dumped.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT email FROM registered_accounts WHERE rut=? AND status='failed' "
+                "AND (failed_stage IN ('route_recovery','form','captcha') OR "
+                "(failed_stage='create' AND failure_reason="
+                "'Portal stopped create: captcha_rejected (code captcha-rechazado).')) "
+                "ORDER BY id DESC LIMIT 1", (rut,)
+            ).fetchone()
+        return self.get(row[0]) if row else None
+
     def mark_verified(self, email: str, portal_user_id: Any = None) -> None:
         fields: dict[str, Any] = {"status": "verified", "verified_at": _now()}
         if portal_user_id is not None:
@@ -181,20 +202,45 @@ class AccountStore:
             ).fetchall()
         return {str(status): int(count) for status, count in rows}
 
-    def export_pool_entries(self) -> list[dict[str, Any]]:
-        """Verified accounts in the account-pool.json entry shape."""
+    def export_pool_entries(
+        self, *, prefix: str = "registro", start_index: int = 1
+    ) -> list[dict[str, Any]]:
+        """Verified accounts as worker-pool entries (never inline secrets).
 
-        entries = []
-        for record in self.list_by_status("verified"):
+        ``cbrs.account_pool.load_account_pool_config`` rejects pool entries
+        containing ``email``/``password``/``rut``; credentials must live in env
+        vars referenced by ``username_env``/``password_env``.  Entries start
+        disabled so merging the patch cannot disturb the live pool until the
+        operator enables the accounts that are ready to use.
+        """
+
+        env_prefix = re.sub(r"[^A-Z0-9_]+", "_", prefix.upper()).strip("_") or "REGISTRO"
+        entries: list[dict[str, Any]] = []
+        for offset, _record in enumerate(self.list_by_status("verified")):
+            number = start_index + offset
             entries.append(
                 {
-                    "email": record.email,
-                    "password": record.password,
-                    "provider": "cbrs-registration",
-                    "rut": record.rut,
+                    "id": f"{prefix}_{number}",
+                    "label": f"Registro {number}",
+                    "enabled": False,
+                    "username_env": f"CBRS_{env_prefix}_{number}_USERNAME",
+                    "password_env": f"CBRS_{env_prefix}_{number}_PASSWORD",
                 }
             )
         return entries
+
+    def export_env_assignments(
+        self, *, prefix: str = "registro", start_index: int = 1
+    ) -> list[str]:
+        """``NAME=value`` env lines matching :meth:`export_pool_entries`."""
+
+        env_prefix = re.sub(r"[^A-Z0-9_]+", "_", prefix.upper()).strip("_") or "REGISTRO"
+        lines: list[str] = []
+        for offset, record in enumerate(self.list_by_status("verified")):
+            number = start_index + offset
+            lines.append(f"CBRS_{env_prefix}_{number}_USERNAME={record.email}")
+            lines.append(f"CBRS_{env_prefix}_{number}_PASSWORD={record.password}")
+        return lines
 
     @staticmethod
     def _to_record(row: tuple) -> AccountRecord:
@@ -218,23 +264,31 @@ class AccountStore:
         )
 
 
-def append_to_account_pool(pool_path: str | Path, entries: list[dict[str, Any]]) -> int:
-    """Append verified accounts to .cbrs/account-pool.json without duplicates.
+def _pool_entry_key(entry: dict[str, Any]) -> str:
+    return str(entry.get("id") or entry.get("email") or "").strip().lower()
 
-    Executive accounts and existing entries are preserved exactly.
+
+def append_to_account_pool(pool_path: str | Path, entries: list[dict[str, Any]]) -> int:
+    """Merge pool entries into a pool JSON without duplicates.
+
+    Entries are matched by ``id`` (the worker-pool schema) and, for legacy
+    records, by ``email``.  Existing accounts and top-level settings are
+    preserved exactly.
     """
 
     path = Path(pool_path)
     pool = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
     accounts = pool.get("accounts", [])
-    known = {str(entry.get("email", "")).lower() for entry in accounts}
+    known = {_pool_entry_key(entry) for entry in accounts}
     added = 0
     for entry in entries:
-        if entry["email"].lower() in known:
+        key = _pool_entry_key(entry)
+        if key and key in known:
             continue
         accounts.append(entry)
-        known.add(entry["email"].lower())
+        known.add(key)
         added += 1
     pool["accounts"] = accounts
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(pool, indent=2, ensure_ascii=False), encoding="utf-8")
     return added

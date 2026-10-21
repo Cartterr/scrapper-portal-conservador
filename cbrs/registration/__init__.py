@@ -19,6 +19,7 @@ CLI::
 from .config import RegistrationSettings, load_registration_settings
 from .email_inbox import (
     ActivationEmailTimeout,
+    ActivationInbox,
     ActivationLink,
     ImapActivationInbox,
     build_activation_address,
@@ -27,6 +28,7 @@ from .email_inbox import (
 from .identity import (
     RegistrationIdentity,
     build_identity,
+    generate_celular,
     generate_password,
     password_meets_requirements,
 )
@@ -63,6 +65,7 @@ __all__ = [
     "AccountRecord",
     "AccountStore",
     "ActivationEmailTimeout",
+    "ActivationInbox",
     "ActivationLink",
     "ImapActivationInbox",
     "NoRutsAvailable",
@@ -79,6 +82,7 @@ __all__ = [
     "build_activation_address",
     "build_identity",
     "choose_sticky_port",
+    "generate_celular",
     "generate_password",
     "is_company_name",
     "load_registration_settings",

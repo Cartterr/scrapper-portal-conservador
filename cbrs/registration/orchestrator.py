@@ -28,6 +28,7 @@ from ..dataimpulse import build_dataimpulse_proxy_url, next_unused_sticky_port
 from .config import RegistrationSettings, load_registration_settings
 from .email_inbox import (
     ActivationEmailTimeout,
+    ActivationInbox,
     ActivationLink,
     ImapActivationInbox,
     build_activation_address,
@@ -45,6 +46,19 @@ from .store import AccountStore
 
 logger = logging.getLogger(__name__)
 
+# Human-pacing jitter: a short, randomized pause between page load, bootstrap
+# and the reCAPTCHA token so the run does not look like a script.  reCAPTCHA and
+# WAF scoring reward realistic cadence; a fixed, too-quick sequence can hurt
+# reputation.  Uniform in [base, base + spread] seconds.
+HUMAN_PAUSE_BASE = 1.5
+HUMAN_PAUSE_SPREAD = 2.5
+
+
+def human_delay(rng: random.Random) -> float:
+    """Return a jittered human-like delay in seconds (uniform)."""
+
+    return HUMAN_PAUSE_BASE + rng.random() * HUMAN_PAUSE_SPREAD
+
 
 @dataclass(frozen=True)
 class RegistrationResult:
@@ -61,6 +75,7 @@ class _PortalProtocol(Protocol):
     def close(self) -> None: ...
     def check_egress_country(self, expected: str) -> str: ...
     def bootstrap(self) -> None: ...
+    def prepare_registration_form(self, payload: dict[str, Any]) -> None: ...
     def recaptcha_token(self, action: str) -> str: ...
     def create_account(self, payload: dict[str, Any]) -> dict[str, Any]: ...
     def activate(self, email: str, token: str) -> dict[str, Any]: ...
@@ -69,30 +84,23 @@ class _PortalProtocol(Protocol):
     def fetch_me(self, jwt: str) -> dict[str, Any]: ...
 
 
-class _InboxProtocol(Protocol):
-    def wait_for_activation(
-        self,
-        address: str,
-        *,
-        not_before: datetime,
-        timeout_seconds: float,
-        poll_seconds: float,
-        sleep: Callable[[float], None] = ...,
-    ) -> ActivationLink: ...
+class _InboxProtocol(ActivationInbox, Protocol):
+    """Backwards-compatible alias for the public inbox contract."""
 
 
 def choose_sticky_port(
     settings: RegistrationSettings,
     store: AccountStore,
     rng: random.Random | None = None,
+    *, excluded_ports: set[int] | None = None,
 ) -> int:
     """Pick a DataImpulse sticky port that no production or past run uses."""
 
     rng = rng or random.Random()
-    used: set[int] = set()
+    used: set[int] = set(excluded_ports or ())
     if settings.pool_state_path.is_file():
         try:
-            with sqlite3.connect(settings.pool_state_path) as conn:
+            with sqlite3.connect(settings.pool_state_path.resolve().as_uri() + "?mode=ro", uri=True) as conn:
                 rows = conn.execute(
                     "SELECT active_port FROM account_proxy_routes "
                     "WHERE active_port IS NOT NULL"
@@ -100,7 +108,8 @@ def choose_sticky_port(
             used.update(int(row[0]) for row in rows if row[0] is not None)
         except sqlite3.Error:
             logger.warning(
-                "Could not read production proxy routes from %s; continuing",
+                "Could not read production proxy routes from %s; continuing "
+                "without collision avoidance.",
                 settings.pool_state_path,
             )
     try:
@@ -129,11 +138,19 @@ def _default_portal_factory(
 
 def _default_inbox_factory(settings: RegistrationSettings) -> _InboxProtocol:
     assert settings.imap_user and settings.imap_password
+    candidates = (
+        (settings.imap_mailbox, "INBOX")
+        if settings.imap_mailbox
+        else ("[Gmail]/All Mail", "INBOX")
+    )
     return ImapActivationInbox(
         settings.imap_host,
         settings.imap_port,
         settings.imap_user,
         settings.imap_password,
+        mailbox_candidates=candidates,
+        use_ssl=settings.imap_ssl,
+        starttls=settings.imap_starttls,
     )
 
 
@@ -201,14 +218,28 @@ class RegistrationOrchestrator:
             portal.open()
             portal.check_egress_country(self.settings.dataimpulse_country)
             portal.bootstrap()
+            self._human_pause()
             for index in range(count):
                 if index:
                     self._sleep(self.settings.request_delay_seconds)
-                if dry_run:
-                    results.append(self._dry_run_one(portal, port))
-                else:
-                    assert inbox is not None
-                    results.append(self._register_one(portal, inbox, port))
+                try:
+                    if dry_run:
+                        results.append(self._dry_run_one(portal, port))
+                    else:
+                        assert inbox is not None
+                        results.append(self._register_one(portal, inbox, port))
+                except NoRutsAvailable:
+                    # Fewer usable RUTs than requested: stop cleanly instead of
+                    # aborting after a partially created account.  Results for
+                    # the accounts already attempted stay available to the CLI.
+                    logger.warning(
+                        "RUT pool ran dry after %d/%d accounts; stopping this run.",
+                        len(results),
+                        count,
+                    )
+                    if not results:
+                        raise
+                    break
         finally:
             portal.close()
         return results
@@ -266,13 +297,19 @@ class RegistrationOrchestrator:
                 person,
                 email_address=address,
                 address_pool=self.settings.address_pool,
-                celular=self.settings.celular,
+                celular=self._celular(),
                 rng=self._rng,
             )
+            portal.prepare_registration_form(identity.create_payload(""))
+            self._human_pause()
             token = portal.recaptcha_token("signup")
             payload = identity.create_payload(token)
-            masked = {**payload, "recaptchaToken": f"<{len(token)} chars>",
-                      "password": "<masked>", "passwordConfirmar": "<masked>"}
+            masked = {
+                **payload,
+                "recaptchaToken": f"<{len(token)} chars>",
+                "password": "<masked>",
+                "passwordConfirmar": "<masked>",
+            }
             logger.info("Dry-run payload for %s: %s", record.rut, masked)
             return RegistrationResult(
                 rut=record.rut, email=address, status="dry_run"
@@ -293,7 +330,7 @@ class RegistrationOrchestrator:
             person,
             email_address=address,
             address_pool=self.settings.address_pool,
-            celular=self.settings.celular,
+            celular=self._celular(),
             rng=self._rng,
         )
         self.store.insert_created(
@@ -311,13 +348,19 @@ class RegistrationOrchestrator:
 
         # Stage: create
         try:
-            token = portal.recaptcha_token("signup")
-            portal.create_account(identity.create_payload(token))
+            self._human_pause()
+            # The visible SPA form generates its browser token when clicked.
+            portal.create_account(identity.create_payload(""))
         except PortalError as exc:
             return self._fail(record, identity, exc, consumed=not exc.retryable)
 
         # The portal accepted the RUT/email: the RUT is consumed from now on.
         self.rut_provider.mark_registered(record.rut)
+
+        return self._finish_created_registration(portal, inbox, record, identity, started)
+
+    def _finish_created_registration(self, portal, inbox, record, identity, started):
+        """Complete an accepted signup on its exact live candidate, without rotating."""
 
         # Stage: wait for the activation email
         try:
@@ -461,6 +504,16 @@ class RegistrationOrchestrator:
             stage_failed=exc.stage,
             reason=str(exc)[:300],
         )
+
+    def _celular(self) -> str | None:
+        """Fixed phone, or ``None`` so the identity makes one up per account."""
+
+        return None if self.settings.randomize_celular else self.settings.celular
+
+    def _human_pause(self) -> None:
+        """Sleep a short jittered interval to pace the run like a human."""
+
+        self._sleep(human_delay(self._rng))
 
     @staticmethod
     def _person(record: RutRecord) -> PersonIdentity:

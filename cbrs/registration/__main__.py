@@ -5,6 +5,7 @@ Usage::
     python -m cbrs.registration register --count 1 [--dry-run]
     python -m cbrs.registration resume-pending
     python -m cbrs.registration verify --email account@domain
+    python -m cbrs.registration check-inbox
     python -m cbrs.registration status
     python -m cbrs.registration export-pool
 """
@@ -15,8 +16,11 @@ import argparse
 import json
 import logging
 import sys
+from dataclasses import replace
+from pathlib import Path
 
 from .config import load_registration_settings
+from .email_inbox import ImapActivationInbox
 from .orchestrator import RegistrationOrchestrator, RegistrationResult
 from .portal import RegistrationPortal, PortalError
 from .rut_provider import NoRutsAvailable
@@ -35,13 +39,38 @@ def _print_results(results: list[RegistrationResult]) -> None:
 
 def _cmd_register(args: argparse.Namespace) -> int:
     settings = load_registration_settings()
+    if args.screenshots:
+        settings = replace(settings, capture_screenshots=True)
+    if args.external_captcha:
+        settings = replace(settings, external_captcha=True)
     orchestrator = RegistrationOrchestrator(settings)
     try:
-        results = orchestrator.register_accounts(count=args.count, dry_run=args.dry_run)
+        if args.recover_routes:
+            if args.count != 1:
+                print("Route recovery requires --count 1 to preserve one identity across candidates.", file=sys.stderr)
+                return 2
+            from .recovery import register_with_route_recovery
+            from .routes import RouteRecoveryStop
+            try:
+                results = register_with_route_recovery(orchestrator, dry_run=args.dry_run)
+            except RouteRecoveryStop as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+        else:
+            results = orchestrator.register_accounts(count=args.count, dry_run=args.dry_run)
     except NoRutsAvailable as exc:
         print(f"No RUTs available: {exc}", file=sys.stderr)
         return 2
+    except PortalError as exc:
+        print(f"Registration stopped at {exc.stage}: {exc}", file=sys.stderr)
+        return 1
     _print_results(results)
+    if len(results) < args.count:
+        print(
+            f"RUT pool ran dry: only {len(results)} of {args.count} accounts attempted; "
+            "add RUTs (see step 2) and rerun.",
+            file=sys.stderr,
+        )
     if args.dry_run:
         ok = all(item.status == "dry_run" for item in results)
         print("\nDry run complete: nothing was submitted; RUTs released." if ok
@@ -159,6 +188,50 @@ def _cmd_refill(args: argparse.Namespace) -> int:
     return 0 if report.inserted > 0 or not report.errors else 1
 
 
+def _cmd_check_inbox(_args: argparse.Namespace) -> int:
+    settings = load_registration_settings()
+    try:
+        settings.require_activation_inbox()
+    except RuntimeError as exc:
+        print(f"Activation inbox not configured: {exc}", file=sys.stderr)
+        return 2
+    candidates = (
+        (settings.imap_mailbox, "INBOX")
+        if settings.imap_mailbox
+        else ("[Gmail]/All Mail", "INBOX")
+    )
+    inbox = ImapActivationInbox(
+        settings.imap_host,
+        settings.imap_port,
+        settings.imap_user,
+        settings.imap_password,
+        mailbox_candidates=candidates,
+        use_ssl=settings.imap_ssl,
+        starttls=settings.imap_starttls,
+        timeout_seconds=30.0,
+    )
+    transport = "SSL" if settings.imap_ssl else ("STARTTLS" if settings.imap_starttls else "plain")
+    print(
+        f"Connecting to {settings.imap_host}:{settings.imap_port} "
+        f"({transport}) as {settings.imap_user}..."
+    )
+    try:
+        folders = inbox.list_folders()
+    except Exception as exc:
+        print(f"IMAP connection failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    print("IMAP OK. Folders:")
+    for folder in folders:
+        print(f"  {folder}")
+    present = [name for name in candidates if name in folders or name == "INBOX"]
+    print("Read folder: " + (present[0] if present else "INBOX (fallback)"))
+    print(
+        "Note: the activation address must be on "
+        f"{settings.activation_domain} with a catch-all forwarding to this mailbox."
+    )
+    return 0
+
+
 def _cmd_status(_args: argparse.Namespace) -> int:
     settings = load_registration_settings()
     store = AccountStore(settings.accounts_db_path)
@@ -186,16 +259,37 @@ def _cmd_status(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_export_pool(_args: argparse.Namespace) -> int:
+def _cmd_export_pool(args: argparse.Namespace) -> int:
     settings = load_registration_settings()
     store = AccountStore(settings.accounts_db_path)
     entries = store.export_pool_entries()
     if not entries:
         print("No verified accounts to export.")
         return 0
-    added = append_to_account_pool(".cbrs/account-pool.json", entries)
-    print(f"Exported {added} verified accounts to .cbrs/account-pool.json "
+    out_dir = settings.profile_root.parent / "registration"
+    pool_path = Path(args.pool) if args.pool else out_dir / "worker-pool.patch.json"
+    env_path = Path(args.env_file) if args.env_file else out_dir / "credentials.env"
+    added = append_to_account_pool(pool_path, entries)
+
+    lines = store.export_env_assignments()
+    existing = (
+        env_path.read_text(encoding="utf-8").splitlines() if env_path.is_file() else []
+    )
+    known = {line.split("=", 1)[0] for line in existing if "=" in line}
+    merged = existing + [line for line in lines if line.split("=", 1)[0] not in known]
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text("\n".join(merged).rstrip() + "\n", encoding="utf-8")
+
+    print(f"Exported {added} pool entries to {pool_path} "
           f"({len(entries) - added} already present).")
+    print(f"Credentials for {len(entries)} verified accounts written to {env_path} "
+          "(secret file; keep it out of git).")
+    print(
+        "Next: 1) add the CBRS_REGISTRO_* lines from that file to .env, "
+        "2) merge the patch accounts into the pool file the worker reads "
+        f"({settings.profile_root.parent / 'runtime' / 'account-pool.json'}), "
+        '3) set "enabled": true for the accounts the worker should use.'
+    )
     return 0
 
 
@@ -210,10 +304,23 @@ def main(argv: list[str] | None = None) -> int:
     register = sub.add_parser("register", help="register new accounts end to end")
     register.add_argument("--count", type=int, default=1)
     register.add_argument(
+        "--recover-routes", action="store_true",
+        help="test bounded, distinct DataImpulse candidates for one identity using the configured recovery allowances",
+    )
+    register.add_argument(
+        "--screenshots", action="store_true",
+        help="save masked screenshots at registration stages under the run's profile",
+    )
+    register.add_argument(
+        "--external-captcha", action="store_true",
+        help="allow bounded CapSolver then 2Captcha fallback after explicit CAPTCHA rejection "
+        "or browser token failure (at most four paid tasks per run)",
+    )
+    register.add_argument(
         "--dry-run",
         action="store_true",
-        help="everything except submitting: reserve RUT, open browser, "
-        "prove egress+bootstrap+signup captcha, then release the RUT",
+        help="reserve RUT, open browser, fill and verify the visible form, "
+        "prove egress+bootstrap+signup captcha, then release without submitting",
     )
     register.set_defaults(func=_cmd_register)
 
@@ -241,8 +348,23 @@ def main(argv: list[str] | None = None) -> int:
     status = sub.add_parser("status", help="show RUT pool and account counts")
     status.set_defaults(func=_cmd_status)
 
+    check_inbox = sub.add_parser(
+        "check-inbox",
+        help="verify the activation mailbox over IMAP (lists folders, reads no mail)",
+    )
+    check_inbox.set_defaults(func=_cmd_check_inbox)
+
     export = sub.add_parser(
-        "export-pool", help="append verified accounts to .cbrs/account-pool.json"
+        "export-pool",
+        help="write worker-pool entries + env credentials for verified accounts",
+    )
+    export.add_argument(
+        "--pool",
+        help="pool JSON to merge into (default: .cbrs/registration/worker-pool.patch.json)",
+    )
+    export.add_argument(
+        "--env-file",
+        help="env file for the generated credentials (default: .cbrs/registration/credentials.env)",
     )
     export.set_defaults(func=_cmd_export_pool)
 

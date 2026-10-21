@@ -165,7 +165,13 @@ def extract_pairs(rows: Iterable[Sequence[str]]) -> list[tuple[str, str]]:
 def insert_new_ruts(
     db_path: str | Path, pairs: Iterable[tuple[str, str]]
 ) -> tuple[int, int, int]:
-    """Validate + dedupe + insert.  Returns (inserted, duplicates, invalid)."""
+    """Validate + canonicalize + dedupe + insert.
+
+    Returns ``(inserted, duplicates, invalid)``.  Every stored RUT is written in
+    the canonical ``12.345.678-9`` form: the portal payload sends ``rutDv``
+    verbatim, and dedupe must not miss ``1000375-k`` just because
+    ``1.000.375-K`` is already in the pool.
+    """
 
     path = Path(db_path)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -177,19 +183,26 @@ def insert_new_ruts(
         }
         existing.discard(None)
         for name, rut in pairs:
-            if not validate_rut(rut):
+            normalized = normalize_rut(rut)
+            if normalized is None or not validate_rut(normalized):
                 invalid += 1
                 continue
-            if rut in existing:
+            if normalized in existing:
                 duplicates += 1
                 continue
             conn.execute(
                 "INSERT INTO ruts (id, rut, name, company, registration_date, "
                 "status, raw_html, created_at, updated_at) "
                 "VALUES (?, ?, ?, NULL, 'unknown', 'scraped', NULL, ?, ?)",
-                (str(uuid.uuid4()), rut, name, now, now),
+                (
+                    str(uuid.uuid4()),
+                    normalized,
+                    " ".join(str(name).split()),
+                    now,
+                    now,
+                ),
             )
-            existing.add(rut)
+            existing.add(normalized)
             inserted += 1
         conn.commit()
     return inserted, duplicates, invalid

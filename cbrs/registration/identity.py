@@ -50,6 +50,18 @@ class RegistrationIdentity:
         }
 
 
+def generate_celular(rng: random.Random | None = None) -> str:
+    """Make up a plausible Chilean mobile number for the form.
+
+    The portal never verifies the number; it only needs nine digits starting
+    with 9 (e.g. ``986552408``).  A fresh value per account avoids every
+    registration sharing one fixed number.
+    """
+
+    rng = rng or random.Random()
+    return "9" + "".join(rng.choices(string.digits, k=8))
+
+
 def generate_password(rng: random.Random | None = None) -> str:
     """Generate a password that satisfies every portal requirement."""
 
@@ -96,13 +108,20 @@ def build_identity(
     *,
     email_address: str,
     address_pool: tuple[str, ...],
-    celular: str,
+    celular: str | None = None,
     rng: random.Random | None = None,
 ) -> RegistrationIdentity:
+    """Assemble one registration identity.
+
+    ``celular`` fixes the phone number when given; when ``None`` a fresh made-up
+    number is generated (see :func:`generate_celular`).
+    """
+
+    rng = rng or random.Random()
     return RegistrationIdentity(
         person=person,
         email=email_address,
         password=generate_password(rng),
         direccion=choose_address(address_pool, person.rut),
-        celular=celular,
+        celular=celular or generate_celular(rng),
     )
